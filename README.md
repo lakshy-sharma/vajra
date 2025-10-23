@@ -1,4 +1,4 @@
-# Shakti
+# Atal
 
 An endpoint detection and response system which is engineered to be soft on your systems and your security teams.
 

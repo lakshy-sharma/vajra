@@ -6,4 +6,4 @@
 - Support for instant scanning
 - Support for filewatching and dynamic scanning
 - Support for yara scanning
-- Support for Linux amd64 debian builds
+- Support for debian amd64 builds

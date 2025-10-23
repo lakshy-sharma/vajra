@@ -1,5 +1,5 @@
 [Unit]
-Description=Shakti EDR service
+Description=Atal EDR service
 After=network.target
 
 [Service]
@@ -10,9 +10,9 @@ RestartSec=5
 StandardOutput=journal
 StandardError=journal
 NoNewPrivileges=yes
-ExecStart=/opt/shakti/shakti -c /etc/shakti/config.yaml
+ExecStart=/opt/atal/atal -c /etc/atal/config.yaml
 
 [Install]
 WantedBy=default.target
 RequiredBy=network.target
-Alias=shakti.service
+Alias=atal.service
