@@ -1,5 +1,5 @@
 [Unit]
-Description=Atal EDR service
+Description=Vajra EDR service
 After=network.target
 
 [Service]
@@ -9,10 +9,11 @@ Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
+AmbientCapabilities=CAP_BPF,CAP_PERFMON,CAP_NET_ADMIN
 NoNewPrivileges=yes
-ExecStart=/opt/atal/atal -c /etc/atal/config.yaml
+ExecStart=/opt/vajra/vajra -c /etc/vajra/config.yaml
 
 [Install]
 WantedBy=default.target
 RequiredBy=network.target
-Alias=atal.service
+Alias=vajra.service

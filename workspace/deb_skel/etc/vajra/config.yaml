@@ -2,9 +2,9 @@
 generic_settings:
   # Allowed modes are instant scan and daemon_mode
   operation_mode: "daemon_mode"
-  work_directory: "/tmp/atal"
+  work_directory: "/tmp/vajra"
   db_directory: "./database"
-  db_filename: "atal.db"
+  db_filename: "vajra.db"
 
 # Scan configurations
 scan_settings:
@@ -18,7 +18,7 @@ logging:
   use_json: True
   enable_file_logging: True
   log_directory: "./logs"
-  log_filename: "atal.log"
+  log_filename: "vajra.log"
   max_size_mb: 50
   max_age_days: 1
   max_backups: 5

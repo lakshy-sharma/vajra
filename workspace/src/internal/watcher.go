@@ -53,7 +53,7 @@ type FileEvent struct {
 // FileWatcher manages real-time filesystem monitoring and scanning
 type FileWatcher struct {
 	watcher *fsnotify.Watcher
-	scanner *YaraScanner
+	scanner *FileScanner
 	logger  *zerolog.Logger
 
 	// Debouncing mechanism
@@ -78,7 +78,7 @@ type FileWatcher struct {
 }
 
 // NewFileWatcher creates a new file watcher with integrated scanner
-func NewFileWatcher(scanner *YaraScanner, logger *zerolog.Logger) (*FileWatcher, error) {
+func NewFileWatcher(scanner *FileScanner, logger *zerolog.Logger) (*FileWatcher, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
@@ -476,7 +476,7 @@ func (fw *FileWatcher) Stop() error {
 // It monitors the filesystem for changes and scans new/modified files for threats.
 func startDaemon() {
 	// Create scanner
-	scanner, err := NewYaraScanner(
+	scanner, err := NewFileScanner(
 		GlobalConfig.ScanSettings.RulesFilepath,
 		filepath.Join(GlobalConfig.GenericSettings.WorkDirectory, "rules"),
 		DB,

@@ -56,7 +56,7 @@ type YaraScanResult struct {
 	Error    error           `json:"scanning_errors,omitempty"`
 }
 
-type YaraScanner struct {
+type FileScanner struct {
 	rules   *yara.Rules
 	db      *sql.DB
 	timeout time.Duration
@@ -209,7 +209,7 @@ func compileRules(rulesDir string) (*yara.Rules, error) {
 }
 
 // Generates a new yara scanner.
-func NewYaraScanner(rulesZipPath, extractPath string, db *sql.DB) (*YaraScanner, error) {
+func NewFileScanner(rulesZipPath, extractPath string, db *sql.DB) (*FileScanner, error) {
 	// Extract rules from zip file
 	if err := unzipRules(rulesZipPath, extractPath); err != nil {
 		return nil, err
@@ -221,7 +221,7 @@ func NewYaraScanner(rulesZipPath, extractPath string, db *sql.DB) (*YaraScanner,
 		return nil, err
 	}
 
-	return &YaraScanner{
+	return &FileScanner{
 		rules:   rules,
 		db:      db,
 		timeout: yaraScanTimeoutSeconds * time.Second,
@@ -229,7 +229,7 @@ func NewYaraScanner(rulesZipPath, extractPath string, db *sql.DB) (*YaraScanner,
 }
 
 // Closes the scanner by removing the resources.
-func (s *YaraScanner) Close() error {
+func (s *FileScanner) Close() error {
 	if s.rules != nil {
 		s.rules.Destroy()
 	}
@@ -237,7 +237,7 @@ func (s *YaraScanner) Close() error {
 }
 
 // This function walks the directory tree and send file into scanner channel
-func (s *YaraScanner) walkDirectory(ctx context.Context, dir string, fileChan chan<- fileToScan, stats *ScanStats) error {
+func (s *FileScanner) walkDirectory(ctx context.Context, dir string, fileChan chan<- fileToScan, stats *ScanStats) error {
 	return filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		// Check if context was cancelled
 		select {
@@ -275,7 +275,7 @@ func (s *YaraScanner) walkDirectory(ctx context.Context, dir string, fileChan ch
 }
 
 // scanWorker processes files from the channel and scans them
-func (s *YaraScanner) scanWorker(ctx context.Context, fileChan <-chan fileToScan, resultsChan chan<- YaraScanResult, wg *sync.WaitGroup, stats *ScanStats) {
+func (s *FileScanner) scanWorker(ctx context.Context, fileChan <-chan fileToScan, resultsChan chan<- YaraScanResult, wg *sync.WaitGroup, stats *ScanStats) {
 	defer wg.Done()
 
 	for {
@@ -317,7 +317,7 @@ func (s *YaraScanner) scanWorker(ctx context.Context, fileChan <-chan fileToScan
 }
 
 // scanFile scans a single file with YARA rules
-func (s *YaraScanner) scanFile(ctx context.Context, path string) YaraScanResult {
+func (s *FileScanner) scanFile(ctx context.Context, path string) YaraScanResult {
 	// Create a channel to receive scan completion
 	done := make(chan YaraScanResult, 1)
 
@@ -345,7 +345,7 @@ func (s *YaraScanner) scanFile(ctx context.Context, path string) YaraScanResult 
 }
 
 // resultCollector collects results and batches them for database insertion
-func (s *YaraScanner) resultCollector(ctx context.Context, resultsChan <-chan YaraScanResult, wg *sync.WaitGroup, stats *ScanStats) {
+func (s *FileScanner) resultCollector(ctx context.Context, resultsChan <-chan YaraScanResult, wg *sync.WaitGroup, stats *ScanStats) {
 	defer wg.Done()
 
 	batch := make([]YaraScanResult, 0, dbBatchSize)
@@ -398,7 +398,7 @@ func (s *YaraScanner) resultCollector(ctx context.Context, resultsChan <-chan Ya
 }
 
 // saveScanResults saves a batch of scan results to the database
-func (s *YaraScanner) saveScanResults(results []YaraScanResult) error {
+func (s *FileScanner) saveScanResults(results []YaraScanResult) error {
 	if len(results) == 0 {
 		return nil
 	}
@@ -452,7 +452,7 @@ func (s *YaraScanner) saveScanResults(results []YaraScanResult) error {
 }
 
 // ScanDirectory scans all files in a directory using YARA rules with concurrency.
-func (s *YaraScanner) ScanDirectory(ctx context.Context, dir string) error {
+func (s *FileScanner) ScanDirectory(ctx context.Context, dir string) error {
 	logger.Info().Str("directory", dir).Msg("starting directory scan")
 
 	// Setup variables and channels
@@ -516,7 +516,7 @@ func (s *YaraScanner) ScanDirectory(ctx context.Context, dir string) error {
 // Startscan is a entrypoint function which generates a new yara scanner and performs a full scan before closing the scan.
 func startScan() {
 	// Create scanner
-	scanner, err := NewYaraScanner(GlobalConfig.ScanSettings.RulesFilepath, filepath.Join(GlobalConfig.GenericSettings.WorkDirectory, "rules"), DB)
+	scanner, err := NewFileScanner(GlobalConfig.ScanSettings.RulesFilepath, filepath.Join(GlobalConfig.GenericSettings.WorkDirectory, "rules"), DB)
 	if err != nil {
 		logger.Fatal().Err(err).Msg("failed to create new scanner object")
 	}

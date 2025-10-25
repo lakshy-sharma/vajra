@@ -17,8 +17,8 @@ Copyright © 2025 Lakshy Sharma lakshy.d.sharma@gmail.com
 package cmd
 
 import (
-	"atal/internal"
 	"os"
+	"vajra/internal"
 
 	"github.com/spf13/cobra"
 )
@@ -29,7 +29,7 @@ var (
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
-	Use:   "atal",
+	Use:   "vajra",
 	Short: "A complete endpoint detection and response system",
 	Long:  ``,
 	Run: func(cmd *cobra.Command, args []string) {
