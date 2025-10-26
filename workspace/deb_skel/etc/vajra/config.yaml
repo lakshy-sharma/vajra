@@ -5,6 +5,21 @@ generic_settings:
   work_directory: "/tmp/vajra"
   db_directory: "./database"
   db_filename: "vajra.db"
+  monitoring_timer_sec: 30
+
+timing_settings:
+  shutdown_timeout_sec: 30
+  single_file_scan_timeout_sec: 60
+  single_process_scan_timeout_sec: 10
+  complete_file_scan_timeout_min: 30
+  complete_process_scan_timeout_min: 30
+
+performance_settings:
+  default_threads: 2
+  max_allowed_threads: 3 # Keep it lower than your cpu count.
+  file_scan_buffer_size: 100
+  process_scan_buffer_size: 50
+  db_insert_batch_size: 1000
 
 # Scan configurations
 scan_settings:

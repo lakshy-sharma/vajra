@@ -25,22 +25,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hillu/go-yara/v4"
 	"github.com/shirou/gopsutil/v3/process"
-)
-
-const (
-	processScanTimeoutSeconds = 30
-	processBufferSize         = 50
-	processBatchSize          = 100
-	yaraProcessTimeoutSeconds = 10
-	defaultProcessWorkers     = 4
-	maxProcessWorkers         = 8
 )
 
 // ProcessScanResult holds the matches found for a single process.
@@ -53,11 +44,11 @@ type ProcessScanResult struct {
 }
 
 type ProcessScanner struct {
-	rules       *yara.Rules
-	db          *sql.DB
-	timeout     time.Duration
-	scannedPIDs map[int32]time.Time
-	mu          sync.RWMutex
+	rules             *yara.Rules
+	db                *sql.DB
+	singleProcTimeout time.Duration
+	scannedPIDs       map[int32]time.Time
+	mu                sync.RWMutex
 }
 
 type ProcessScanStats struct {
@@ -83,10 +74,10 @@ func NewProcessScanner(rulesZipPath, extractPath string, db *sql.DB) (*ProcessSc
 	}
 
 	return &ProcessScanner{
-		rules:       rules,
-		db:          db,
-		timeout:     yaraProcessTimeoutSeconds * time.Second,
-		scannedPIDs: make(map[int32]time.Time),
+		rules:             rules,
+		db:                db,
+		singleProcTimeout: time.Duration(GlobalConfig.TimingSettings.SingleProcessScanTimeoutSec) * time.Second,
+		scannedPIDs:       make(map[int32]time.Time),
 	}, nil
 }
 
@@ -151,8 +142,110 @@ func shouldSkipProcess(proc *process.Process) (bool, string) {
 	return false, ""
 }
 
+// saveProcessScanResults saves batch results to database.
+func (ps *ProcessScanner) saveProcessScanResults(results []ProcessScanResult) error {
+	if len(results) == 0 {
+		return nil
+	}
+
+	scanTime := time.Now().Unix()
+	tx, err := ps.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO process_scan_results (lastscan_time, pid, process_name, cmdline, yara_results)
+		VALUES (?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare stmt: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, r := range results {
+		yaraJSON, err := json.Marshal(r.Matches)
+		if err != nil {
+			logger.Error().
+				Err(err).
+				Int32("pid", r.PID).
+				Msg("failed to marshal yara results, skipping")
+			continue
+		}
+
+		if _, err := stmt.Exec(scanTime, r.PID, r.Name, r.Cmdline, yaraJSON); err != nil {
+			logger.Error().
+				Err(err).
+				Int32("pid", r.PID).
+				Msg("failed to insert scan result")
+			continue
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+
+	return nil
+}
+
+// resultCollector collects and batches results for database insertion.
+func (ps *ProcessScanner) resultCollector(ctx context.Context, resultsChan <-chan ProcessScanResult, wg *sync.WaitGroup, stats *ProcessScanStats) {
+	defer wg.Done()
+
+	batchSize := GlobalConfig.PerformanceSettings.DBInsertBatchSize
+	batch := make([]ProcessScanResult, 0, batchSize)
+
+	saveBatch := func() {
+		if len(batch) == 0 {
+			return
+		}
+
+		if err := ps.saveProcessScanResults(batch); err != nil {
+			logger.Error().Err(err).
+				Int("batch_size", len(batch)).
+				Msg("failed to save process scan results")
+		} else {
+			logger.Debug().Int("batch_size", len(batch)).Msg("saved process results batch")
+		}
+
+		batch = batch[:0]
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			saveBatch()
+			return
+
+		case result, ok := <-resultsChan:
+			if !ok {
+				saveBatch()
+				return
+			}
+
+			// Only save results with matches (reduce DB noise)
+			if len(result.Matches) == 0 {
+				continue
+			}
+
+			batch = append(batch, result)
+			if len(batch) >= batchSize {
+				saveBatch()
+			}
+
+		case <-time.After(5 * time.Second):
+			saveBatch()
+		}
+	}
+}
+
 // scanProcess scans a single process with YARA rules.
 func (ps *ProcessScanner) scanProcess(ctx context.Context, pid int32) ProcessScanResult {
+	ctx, cancel := context.WithTimeout(ctx, ps.singleProcTimeout)
+	defer cancel()
+
 	result := ProcessScanResult{PID: pid}
 
 	// Create process handle
@@ -172,92 +265,61 @@ func (ps *ProcessScanner) scanProcess(ctx context.Context, pid int32) ProcessSca
 		return result
 	}
 
-	// Scan process memory with timeout
-	done := make(chan ProcessScanResult, 1)
+	// Scan process memory
+	var matches yara.MatchRules
+	err = ps.rules.ScanProc(int(pid), 0, ps.singleProcTimeout, &matches)
 
-	go func() {
-		var matches yara.MatchRules
-		err := ps.rules.ScanProc(int(pid), 0, ps.timeout, &matches)
+	result.Matches = matches
+	result.Error = err
 
-		done <- ProcessScanResult{
-			PID:     pid,
-			Name:    result.Name,
-			Cmdline: result.Cmdline,
-			Matches: matches,
-			Error:   err,
+	return result
+}
+
+// updateStats updates process scan stats after a scan is complete.
+func (ps *ProcessScanner) updateStats(stats *ProcessScanStats, result *ProcessScanResult) {
+	atomic.AddInt64(&stats.ScannedProcesses, 1)
+
+	if result.Error != nil {
+		if !strings.Contains(result.Error.Error(), "skipped:") {
+			atomic.AddInt64(&stats.ErrorProcesses, 1)
+		} else {
+			atomic.AddInt64(&stats.SkippedProcesses, 1)
 		}
-	}()
+		return
+	}
 
-	// Wait for scan completion or context cancellation
-	select {
-	case scanResult := <-done:
-		return scanResult
-	case <-ctx.Done():
-		result.Error = fmt.Errorf("scan cancelled: %w", ctx.Err())
-		return result
+	if len(result.Matches) > 0 {
+		atomic.AddInt64(&stats.MatchedProcesses, 1)
+		logger.Warn().
+			Int32("pid", result.PID).
+			Str("name", result.Name).
+			Int("matches", len(result.Matches)).
+			Msg("YARA matches found in process")
 	}
 }
 
-// getAllProcesses retrieves all running process PIDs.
-func (ps *ProcessScanner) getAllProcesses() ([]int32, error) {
-	pids, err := process.Pids()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get process list: %w", err)
-	}
-	return pids, nil
-}
-
-// getNewProcesses returns PIDs that haven't been scanned recently.
-func (ps *ProcessScanner) getNewProcesses() ([]int32, error) {
-	allPIDs, err := ps.getAllProcesses()
-	if err != nil {
-		return nil, err
-	}
-
-	newPIDs := make([]int32, 0)
-	for _, pid := range allPIDs {
-		if !ps.isRecentlyScanned(pid) {
-			newPIDs = append(newPIDs, pid)
-		}
-	}
-
-	return newPIDs, nil
-}
-
-// processScanWorker scans processes from the channel.
-func (ps *ProcessScanner) processScanWorker(ctx context.Context, pidChan <-chan int32, resultsChan chan<- ProcessScanResult, wg *sync.WaitGroup, stats *ProcessScanStats) {
+// scanWorker captures PIDs from pidChan and scans them one by one.
+func (ps *ProcessScanner) scanWorker(ctx context.Context, pidChan <-chan int32, resultsChan chan<- ProcessScanResult, wg *sync.WaitGroup, stats *ProcessScanStats) {
 	defer wg.Done()
 
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Debug().Msg("process scan worker stopping due to context cancellation")
+			logger.Debug().Msg("worker: context cancelled")
 			return
+
 		case pid, ok := <-pidChan:
 			if !ok {
+				logger.Debug().Msg("worker: PID channel closed")
 				return
 			}
 
 			// Scan the process
 			result := ps.scanProcess(ctx, pid)
 			ps.markScanned(pid)
+			ps.updateStats(stats, &result)
 
-			// Update stats
-			if result.Error != nil {
-				if !strings.Contains(result.Error.Error(), "skipped:") {
-					logger.Debug().Err(result.Error).Int32("pid", pid).Msg("process scan error")
-				}
-			} else {
-				if len(result.Matches) > 0 {
-					logger.Warn().
-						Int32("pid", result.PID).
-						Str("name", result.Name).
-						Int("matches", len(result.Matches)).
-						Msg("YARA matches found in process")
-				}
-			}
-
-			// Send result to collector
+			// Try to send result unless context is done
 			select {
 			case resultsChan <- result:
 			case <-ctx.Done():
@@ -267,96 +329,21 @@ func (ps *ProcessScanner) processScanWorker(ctx context.Context, pidChan <-chan 
 	}
 }
 
-// processResultCollector collects and batches results for database insertion.
-func (ps *ProcessScanner) processResultCollector(ctx context.Context, resultsChan <-chan ProcessScanResult, wg *sync.WaitGroup, stats *ProcessScanStats) {
-	defer wg.Done()
-
-	batch := make([]ProcessScanResult, 0, processBatchSize)
-
-	flush := func() {
-		if len(batch) == 0 {
-			return
-		}
-
-		if err := ps.saveProcessScanResults(batch); err != nil {
-			logger.Error().Err(err).Int("batch_size", len(batch)).Msg("failed to save process scan results")
-		} else {
-			logger.Debug().Int("batch_size", len(batch)).Msg("saved process results batch")
-		}
-
-		batch = batch[:0]
-	}
-
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			flush()
-			return
-		case result, ok := <-resultsChan:
-			if !ok {
-				flush()
-				return
-			}
-
-			// Only save results with matches or critical errors
-			if len(result.Matches) > 0 {
-				batch = append(batch, result)
-				if len(batch) >= processBatchSize {
-					flush()
-				}
-			}
-		case <-ticker.C:
-			flush()
-		}
-	}
-}
-
-// saveProcessScanResults saves batch results to database.
-func (ps *ProcessScanner) saveProcessScanResults(results []ProcessScanResult) error {
-	if len(results) == 0 {
-		return nil
-	}
-
-	scanTime := time.Now().Unix()
-
-	tx, err := ps.db.Begin()
+// getAllProcesses retrieves all running process PIDs.
+func (ps *ProcessScanner) getAllProcesses(ctx context.Context, pidChan chan<- int32, stats *ProcessScanStats) error {
+	pids, err := process.Pids()
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
+		return fmt.Errorf("failed to get process list: %w", err)
 	}
-	defer tx.Rollback()
 
-	valueStrings := make([]string, 0, len(results))
-	valueArgs := make([]interface{}, 0, len(results)*5)
+	stats.TotalProcesses = int64(len(pids))
 
-	for _, result := range results {
-		yaraResultsJSON, err := json.Marshal(result.Matches)
-		if err != nil {
-			logger.Error().Err(err).Int32("pid", result.PID).Msg("failed to marshal yara results")
-			continue
+	for _, pid := range pids {
+		select {
+		case pidChan <- pid:
+		case <-ctx.Done():
+			return ctx.Err()
 		}
-
-		valueStrings = append(valueStrings, "(?, ?, ?, ?, ?)")
-		valueArgs = append(valueArgs, scanTime, result.PID, result.Name, result.Cmdline, yaraResultsJSON)
-	}
-
-	if len(valueStrings) == 0 {
-		return nil
-	}
-
-	query := fmt.Sprintf(
-		"INSERT INTO process_scan_results (lastscan_time, pid, process_name, cmdline, yara_results) VALUES %s",
-		strings.Join(valueStrings, ","),
-	)
-
-	if _, err := tx.Exec(query, valueArgs...); err != nil {
-		return fmt.Errorf("failed to execute bulk insert: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	return nil
@@ -364,65 +351,55 @@ func (ps *ProcessScanner) saveProcessScanResults(results []ProcessScanResult) er
 
 // scanAllProcesses performs a one-time scan of all running processes.
 func (ps *ProcessScanner) scanAllProcesses(ctx context.Context) error {
-	logger.Info().Msg("starting process scan")
+	logger.Info().Msg("scanning all processes")
 
 	startTime := time.Now()
 	stats := &ProcessScanStats{}
-
-	// Get all processes
-	pids, err := ps.getAllProcesses()
-	if err != nil {
-		return err
-	}
-	stats.TotalProcesses = int64(len(pids))
-
-	// Setup channels
-	pidChan := make(chan int32, processBufferSize)
-	resultsChan := make(chan ProcessScanResult, processBufferSize)
+	pidChan := make(chan int32, GlobalConfig.PerformanceSettings.ProcessScanBufferSize)
+	resultsChan := make(chan ProcessScanResult, GlobalConfig.PerformanceSettings.ProcessScanBufferSize)
 
 	var scanWG sync.WaitGroup
 	var saveWG sync.WaitGroup
 
 	// Start result collector
 	saveWG.Add(1)
-	go ps.processResultCollector(ctx, resultsChan, &saveWG, stats)
+	go ps.resultCollector(ctx, resultsChan, &saveWG, stats)
 
 	// Start scan workers
-	numWorkers := defaultProcessWorkers
-	if maxWorkers := runtime.NumCPU() / 2; maxWorkers > 0 && numWorkers > maxWorkers {
-		numWorkers = maxWorkers
-	}
-	if numWorkers > maxProcessWorkers {
-		numWorkers = maxProcessWorkers
-	}
-
+	numWorkers := getMaxWorkers()
 	logger.Info().Int("workers", numWorkers).Msg("starting process scan workers")
-	for i := 0; i < numWorkers; i++ {
+	for range numWorkers {
 		scanWG.Add(1)
-		go ps.processScanWorker(ctx, pidChan, resultsChan, &scanWG, stats)
+		go ps.scanWorker(ctx, pidChan, resultsChan, &scanWG, stats)
 	}
 
-	// Send PIDs to workers
-	for _, pid := range pids {
-		select {
-		case pidChan <- pid:
-		case <-ctx.Done():
-			break
-		}
-	}
+	// Get all processes and send to workers
+	enumErr := ps.getAllProcesses(ctx, pidChan, stats)
 
-	// Cleanup
+	// Closure code
+	//==============
+
+	// Close scanners
 	close(pidChan)
 	scanWG.Wait()
+
+	// Close result savers
 	close(resultsChan)
 	saveWG.Wait()
 
 	stats.DurationSec = int64(time.Since(startTime).Seconds())
 	logger.Info().
 		Int64("total_processes", stats.TotalProcesses).
+		Int64("scanned", stats.ScannedProcesses).
+		Int64("matched", stats.MatchedProcesses).
+		Int64("errors", stats.ErrorProcesses).
+		Int64("skipped", stats.SkippedProcesses).
 		Int64("duration_sec", stats.DurationSec).
 		Msg("process scan completed")
 
+	if enumErr != nil {
+		return fmt.Errorf("error enumerating processes: %w", enumErr)
+	}
 	return nil
 }
 
@@ -438,7 +415,7 @@ func startProcessScan() {
 	}
 	defer scanner.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), processScanTimeoutSeconds*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(GlobalConfig.TimingSettings.CompleteProcessScanTimeoutMin)*time.Minute)
 	defer cancel()
 
 	if err := scanner.scanAllProcesses(ctx); err != nil {

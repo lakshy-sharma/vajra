@@ -1,18 +1,18 @@
 /*
 Copyright © 2025 Lakshy Sharma lakshy.d.sharma@gmail.com
 
-	This program is free software: you can redistribute it and/or modify
-	it under the terms of the GNU Affero General Public License as
-	published by the Free Software Foundation, either version 3 of the
-	License, or (at your option) any later version.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
 
-	This program is distributed in the hope that it will be useful,
-	but WITHOUT ANY WARRANTY; without even the implied warranty of
-	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-	GNU Affero General Public License for more details.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
 
-	You should have received a copy of the GNU Affero General Public License
-	along with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 package internal
 
@@ -23,22 +23,11 @@ import (
 	"fmt"
 	"io/fs"
 	"path/filepath"
-	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/hillu/go-yara/v4"
-)
-
-const (
-	scanTimeoutMinutes     = 30
-	bufferSize             = 100
-	dbBatchSize            = 1000
-	yaraScanTimeoutSeconds = 60
-	defaultWorkers         = 2
-	maxWorkers             = 4
 )
 
 type fileToScan struct {
@@ -54,9 +43,9 @@ type YaraScanResult struct {
 }
 
 type FileScanner struct {
-	rules   *yara.Rules
-	db      *sql.DB
-	timeout time.Duration
+	rules             *yara.Rules
+	db                *sql.DB
+	singleFileTimeout time.Duration
 }
 
 type ScanStats struct {
@@ -82,13 +71,13 @@ func NewFileScanner(rulesZipPath, extractPath string, db *sql.DB) (*FileScanner,
 	}
 
 	return &FileScanner{
-		rules:   rules,
-		db:      db,
-		timeout: yaraScanTimeoutSeconds * time.Second,
+		rules:             rules,
+		db:                db,
+		singleFileTimeout: time.Duration(GlobalConfig.TimingSettings.SingleFileScanTimeoutSec) * time.Second,
 	}, nil
 }
 
-// Closes the scanner by removing the resources.
+// Close function closes the scanner by removing the resources.
 func (s *FileScanner) Close() error {
 	if s.rules != nil {
 		s.rules.Destroy()
@@ -96,21 +85,187 @@ func (s *FileScanner) Close() error {
 	return nil
 }
 
-// This function walks the directory tree and send file into scanner channel
-func (s *FileScanner) walkDirectory(ctx context.Context, dir string, fileChan chan<- fileToScan, stats *ScanStats) error {
-	return filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-		// Check if context was cancelled
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
+// saveFileScanResults saves a batch of scan results to the database
+func (s *FileScanner) saveFileScanResults(results []YaraScanResult) error {
+	if len(results) == 0 {
+		return nil
+	}
+
+	// Set scan time and create a transaction.
+	scanTime := time.Now().Unix()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Generate prepared statement for insert
+	stmt, err := tx.Prepare(`
+		INSERT INTO file_scan_results (lastscan_time, filepath, yara_results)
+		VALUES (?, ?, ?)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare stmt: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, r := range results {
+		// Serialize results
+		yaraJSON, err := json.Marshal(r.Matches)
+		if err != nil {
+			logger.Error().
+				Err(err).
+				Str("file", r.FilePath).
+				Msg("failed to marshal yara results, skipping")
+			continue
 		}
 
-		// Handle access errors
+		// Execute each result.
+		if _, err := stmt.Exec(scanTime, r.FilePath, yaraJSON); err != nil {
+			logger.Error().
+				Err(err).
+				Str("file", r.FilePath).
+				Msg("failed to insert scan result")
+			continue
+		}
+	}
+
+	// Commit all executions
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+
+	return nil
+}
+
+// resultCollector collects results and batches them for database insertion
+func (s *FileScanner) resultCollector(ctx context.Context, resultsChan <-chan YaraScanResult, wg *sync.WaitGroup, stats *ScanStats) {
+	defer wg.Done()
+
+	batchSize := GlobalConfig.PerformanceSettings.DBInsertBatchSize
+	batch := make([]YaraScanResult, 0, batchSize)
+
+	// Save batch function to save results of a batch
+	saveBatch := func() {
+		if len(batch) == 0 {
+			return
+		}
+
+		if err := s.saveFileScanResults(batch); err != nil {
+			logger.Error().Err(err).
+				Int("batch_size", len(batch)).
+				Msg("failed to save scan results batch")
+		} else {
+			logger.Debug().Int("batch_size", len(batch)).Msg("saved results batch")
+		}
+
+		batch = batch[:0]
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			saveBatch()
+			return
+
+		case result, ok := <-resultsChan:
+			if !ok {
+				saveBatch()
+				return
+			}
+
+			// Skip clean results to reduce DB noise
+			if len(result.Matches) == 0 && result.Error == nil {
+				continue
+			}
+
+			batch = append(batch, result)
+			if len(batch) >= batchSize {
+				saveBatch()
+			}
+
+		case <-time.After(5 * time.Second):
+			saveBatch()
+		}
+	}
+}
+
+// scanFile scans a single file with YARA rules
+func (s *FileScanner) scanFile(ctx context.Context, path string) YaraScanResult {
+	ctx, cancel := context.WithTimeout(ctx, s.singleFileTimeout)
+	defer cancel()
+
+	var matches yara.MatchRules
+	err := s.rules.ScanFile(path, 0, s.singleFileTimeout, &matches)
+
+	return YaraScanResult{
+		FilePath: path,
+		Matches:  matches,
+		Error:    err,
+	}
+}
+
+// updateStats is used for updating filescan stats after a scan is complete.
+// It takes a stats object and a yara scan result.
+func (s *FileScanner) updateStats(stats *ScanStats, result *YaraScanResult) {
+	atomic.AddInt64(&stats.ScannedFiles, 1)
+
+	if result.Error != nil {
+		atomic.AddInt64(&stats.ErrorFiles, 1)
+		return
+	}
+
+	if len(result.Matches) > 0 {
+		atomic.AddInt64(&stats.MatchedFiles, 1)
+		logger.Debug().
+			Str("file", result.FilePath).
+			Int("matches", len(result.Matches)).
+			Msg("YARA matches found")
+	}
+}
+
+// scanWorker captures files from fileChan and scans them one by one.
+func (s *FileScanner) scanWorker(ctx context.Context, fileChan <-chan fileToScan, resultsChan chan<- YaraScanResult, wg *sync.WaitGroup, stats *ScanStats) {
+	defer wg.Done()
+
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Debug().Msg("worker: context cancelled")
+			return
+
+		case file, ok := <-fileChan:
+			if !ok {
+				logger.Debug().Msg("worker: file channel closed")
+				return
+			}
+
+			// Scan the file
+			result := s.scanFile(ctx, file.path)
+			s.updateStats(stats, &result)
+
+			// Try to send result unless context is done
+			select {
+			case resultsChan <- result:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+// This function walks the directory tree and sends files into scanner channel
+func (s *FileScanner) walkDirectory(ctx context.Context, dir string, fileChan chan<- fileToScan, stats *ScanStats) error {
+	return filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		// Exit if context was cancelled
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		// Handle access errors and continue walking
 		if err != nil {
 			logger.Error().Err(err).Str("path", path).Msg("error accessing path")
 			atomic.AddInt64(&stats.ErrorFiles, 1)
-			// Continue walking despite errors
 			return nil
 		}
 
@@ -125,190 +280,12 @@ func (s *FileScanner) walkDirectory(ctx context.Context, dir string, fileChan ch
 		// Send file to scan workers
 		select {
 		case fileChan <- fileToScan{path: path, info: d}:
-			// Successfully sent
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 
 		return nil
 	})
-}
-
-// scanWorker processes files from the channel and scans them
-func (s *FileScanner) scanWorker(ctx context.Context, fileChan <-chan fileToScan, resultsChan chan<- YaraScanResult, wg *sync.WaitGroup, stats *ScanStats) {
-	defer wg.Done()
-
-	for {
-		select {
-		case <-ctx.Done():
-			logger.Debug().Msg("scan worker stopping due to context cancellation")
-			return
-		case file, ok := <-fileChan:
-			if !ok {
-				// Channel closed, worker should exit
-				return
-			}
-
-			// Scan the file
-			result := s.scanFile(ctx, file.path)
-
-			// Update stats
-			atomic.AddInt64(&stats.ScannedFiles, 1)
-			if result.Error != nil {
-				atomic.AddInt64(&stats.ErrorFiles, 1)
-			}
-			if len(result.Matches) > 0 {
-				atomic.AddInt64(&stats.MatchedFiles, 1)
-				logger.Debug().
-					Str("file", result.FilePath).
-					Int("matches", len(result.Matches)).
-					Msg("YARA matches found")
-			}
-
-			// Send result to collector
-			select {
-			case resultsChan <- result:
-				// Successfully sent
-			case <-ctx.Done():
-				return
-			}
-		}
-	}
-}
-
-// scanFile scans a single file with YARA rules
-func (s *FileScanner) scanFile(ctx context.Context, path string) YaraScanResult {
-	// Create a channel to receive scan completion
-	done := make(chan YaraScanResult, 1)
-
-	go func() {
-		var matches yara.MatchRules
-		err := s.rules.ScanFile(path, 0, time.Duration(s.timeout.Seconds()), &matches)
-
-		done <- YaraScanResult{
-			FilePath: path,
-			Matches:  matches,
-			Error:    err,
-		}
-	}()
-
-	// Wait for scan to complete or context cancellation
-	select {
-	case result := <-done:
-		return result
-	case <-ctx.Done():
-		return YaraScanResult{
-			FilePath: path,
-			Error:    fmt.Errorf("scan cancelled: %w", ctx.Err()),
-		}
-	}
-}
-
-// resultCollector collects results and batches them for database insertion
-func (s *FileScanner) resultCollector(ctx context.Context, resultsChan <-chan YaraScanResult, wg *sync.WaitGroup, stats *ScanStats) {
-	defer wg.Done()
-
-	batch := make([]YaraScanResult, 0, dbBatchSize)
-
-	// Flush function to save accumulated results
-	flush := func() {
-		if len(batch) == 0 {
-			return
-		}
-
-		if err := s.saveFileScanResults(batch); err != nil {
-			logger.Error().Err(err).Int("batch_size", len(batch)).Msg("failed to save scan results batch")
-		} else {
-			logger.Debug().Int("batch_size", len(batch)).Msg("saved results batch")
-		}
-
-		// Clear batch
-		batch = batch[:0]
-	}
-
-	// Timer for periodic flushes (every 5 seconds)
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			flush()
-			return
-		case result, ok := <-resultsChan:
-			if !ok {
-				// Channel closed, flush remaining results and exit
-				flush()
-				return
-			}
-
-			// Check if any detections were found before appending to batch.
-			if len(result.Matches) > 0 || result.Error != nil {
-				batch = append(batch, result)
-
-				if len(batch) >= dbBatchSize {
-					flush()
-				}
-			}
-		case <-ticker.C:
-			// Periodic flush to avoid holding results too long
-			flush()
-		}
-	}
-}
-
-// saveFileScanResults saves a batch of scan results to the database
-func (s *FileScanner) saveFileScanResults(results []YaraScanResult) error {
-	if len(results) == 0 {
-		return nil
-	}
-
-	// Get current timestamp
-	scanTime := time.Now().Unix()
-
-	// Begin transaction
-	tx, err := s.db.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	// Build bulk insert query
-	valueStrings := make([]string, 0, len(results))
-	valueArgs := make([]interface{}, 0, len(results)*3)
-
-	for _, result := range results {
-		// Marshal YARA matches to JSON
-		yaraResultsJSON, err := json.Marshal(result.Matches)
-		if err != nil {
-			logger.Error().Err(err).Str("filepath", result.FilePath).Msg("failed to marshal yara results, skipping")
-			continue
-		}
-
-		valueStrings = append(valueStrings, "(?, ?, ?)")
-		valueArgs = append(valueArgs, scanTime, result.FilePath, yaraResultsJSON)
-	}
-
-	if len(valueStrings) == 0 {
-		return nil
-	}
-
-	// Execute bulk insert
-	query := fmt.Sprintf(
-		"INSERT INTO file_scan_results (lastscan_time, filepath, yara_results) VALUES %s",
-		strings.Join(valueStrings, ","),
-	)
-
-	if _, err := tx.Exec(query, valueArgs...); err != nil {
-		return fmt.Errorf("failed to execute bulk insert: %w", err)
-	}
-
-	// Commit transaction
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	return nil
 }
 
 // ScanDirectory scans all files in a directory using YARA rules with concurrency.
@@ -318,10 +295,10 @@ func (s *FileScanner) scanDirectory(ctx context.Context, dir string) error {
 	// Setup variables and channels
 	startTime := time.Now()
 	stats := &ScanStats{}
-	fileChan := make(chan fileToScan, bufferSize)
-	resultsChan := make(chan YaraScanResult, bufferSize)
+	fileChan := make(chan fileToScan, GlobalConfig.PerformanceSettings.FileScanBufferSize)
+	resultsChan := make(chan YaraScanResult, GlobalConfig.PerformanceSettings.FileScanBufferSize)
 
-	// WaitGroups for synchronization
+	// Create wait groups to synchronize closing saver and processors.
 	var scanWG sync.WaitGroup
 	var saveWG sync.WaitGroup
 
@@ -329,29 +306,24 @@ func (s *FileScanner) scanDirectory(ctx context.Context, dir string) error {
 	saveWG.Add(1)
 	go s.resultCollector(ctx, resultsChan, &saveWG, stats)
 
-	// Determine required workers and start scanners.
-	numWorkers := defaultWorkers
-	if maxWorkers := runtime.NumCPU() / 2; maxWorkers > 0 && numWorkers > maxWorkers {
-		numWorkers = maxWorkers
-	}
-	if numWorkers > maxWorkers {
-		numWorkers = maxWorkers
-	}
+	numWorkers := getMaxWorkers()
 	logger.Info().Int("workers", numWorkers).Msg("starting scan workers")
-	for i := 0; i < numWorkers; i++ {
+	for range numWorkers {
 		scanWG.Add(1)
 		go s.scanWorker(ctx, fileChan, resultsChan, &scanWG, stats)
 	}
 
-	// Walk the compleyte directory and send files for scanning into scanners.
+	// Start walking the target directory and send files for scanning.
 	walkErr := s.walkDirectory(ctx, dir, fileChan, stats)
 
-	// When files are completed simply close the file channel to signal other workers to stop.
-	// Wait for the workers to finish.
+	// Closure code
+	//==============
+
+	// Close scanners
 	close(fileChan)
 	scanWG.Wait()
 
-	// When scanners are completed then close our result collector.
+	// Close result savers
 	close(resultsChan)
 	saveWG.Wait()
 
@@ -366,14 +338,13 @@ func (s *FileScanner) scanDirectory(ctx context.Context, dir string) error {
 		Int64("duration_sec", stats.DurationSec).
 		Msg("directory scan completed")
 
-		// Return walk error if it occurred
 	if walkErr != nil {
 		return fmt.Errorf("error walking directory: %w", walkErr)
 	}
 	return nil
 }
 
-// Startscan is a entrypoint function which generates a new yara scanner and performs a full scan before closing the scan.
+// startFileScan is an entrypoint function which generates a new yara scanner and performs a full scan before closing the scan.
 func startFileScan() {
 	// Create scanner
 	scanner, err := NewFileScanner(GlobalConfig.ScanSettings.RulesFilepath, filepath.Join(GlobalConfig.GenericSettings.WorkDirectory, "rules"), DB)
@@ -383,7 +354,7 @@ func startFileScan() {
 	defer scanner.Close()
 
 	// Create context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), scanTimeoutMinutes*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(GlobalConfig.TimingSettings.CompleteFileScanTimeoutMin)*time.Minute)
 	defer cancel()
 
 	// Scan directory

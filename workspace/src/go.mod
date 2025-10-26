@@ -17,6 +17,7 @@ require (
 	github.com/botherder/go-savetime v0.0.0-20201230153911-102454c6e533 // indirect
 	github.com/capnspacehook/taskmaster v0.0.0-20201022195506-c2d8b114cec0 // indirect
 	github.com/cilium/ebpf v0.19.0 // indirect
+	github.com/common-nighthawk/go-figure v0.0.0-20210622060536-734e95fb86be // indirect
 	github.com/go-ole/go-ole v1.2.6 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect

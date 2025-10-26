@@ -7,10 +7,24 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/hillu/go-yara/v4"
 )
+
+func getMaxWorkers() int {
+	// Determine required workers and start scanners.
+	numWorkers := GlobalConfig.PerformanceSettings.DefaultThreads
+	maxWorkers := runtime.NumCPU() / 2
+	// Limit max workers to max allowed for any system.
+	if maxWorkers > GlobalConfig.PerformanceSettings.MaxAllowedThreads {
+		maxWorkers = GlobalConfig.PerformanceSettings.MaxAllowedThreads
+	}
+	// Set workers to max allowed workers.
+	numWorkers = maxWorkers
+	return numWorkers
+}
 
 // Extracts all rules into designated directory.
 func unzipRules(zipPath string, extractionPath string) error {

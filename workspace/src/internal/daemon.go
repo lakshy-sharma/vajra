@@ -29,7 +29,7 @@ import (
 )
 
 // runFileWatcher starts the file watcher in a goroutine-safe way.
-func runFileWatcher(ctx context.Context, wg *sync.WaitGroup, errChan chan<- error) {
+func runFileWatcher(ctx context.Context, cancel context.CancelFunc, wg *sync.WaitGroup, errChan chan<- error) {
 	defer wg.Done()
 
 	// Create scanner
@@ -45,15 +45,14 @@ func runFileWatcher(ctx context.Context, wg *sync.WaitGroup, errChan chan<- erro
 	defer scanner.Close()
 
 	// Create file watcher
-	fileWatcher, err := NewFileWatcher(scanner, logger.Logger)
+	fileWatcher, err := NewFileWatcher(ctx, cancel, scanner, logger.Logger)
 	if err != nil {
 		errChan <- err
 		return
 	}
 	defer fileWatcher.Stop()
 
-	logger.Info().Msg("file watcher started")
-
+	logger.Info().Msg("starting filesystem monitor")
 	// Start watching (blocks until stopped)
 	if err := fileWatcher.Start(GlobalConfig.ScanSettings.TargetDirectory); err != nil {
 		if ctx.Err() == nil {
@@ -64,14 +63,8 @@ func runFileWatcher(ctx context.Context, wg *sync.WaitGroup, errChan chan<- erro
 }
 
 // runProcessMonitor starts the process monitor in a goroutine-safe way.
-func runProcessMonitor(ctx context.Context, wg *sync.WaitGroup, errChan chan<- error) {
+func runProcessMonitor(ctx context.Context, cancel context.CancelFunc, wg *sync.WaitGroup, errChan chan<- error) {
 	defer wg.Done()
-
-	// Check platform
-	if runtime.GOOS != "linux" {
-		logger.Warn().Msg("eBPF process monitoring only supported on Linux")
-		return
-	}
 
 	// Create scanner
 	scanner, err := NewProcessScanner(
@@ -86,19 +79,16 @@ func runProcessMonitor(ctx context.Context, wg *sync.WaitGroup, errChan chan<- e
 	defer scanner.Close()
 
 	// Create process monitor
-	monitor, err := NewProcessMonitor(scanner, logger.Logger)
+	monitor, err := NewProcessMonitor(ctx, cancel, scanner, logger.Logger)
 	if err != nil {
 		errChan <- err
 		return
 	}
 	defer monitor.Stop()
 
-	logger.Info().Msg("process monitor started")
-
-	// Start monitoring (blocks until stopped)
+	logger.Info().Msg("starting process monitor")
 	if err := monitor.Start(); err != nil {
 		if ctx.Err() == nil {
-			// Only report error if not from graceful shutdown
 			errChan <- err
 		}
 	}
@@ -106,18 +96,20 @@ func runProcessMonitor(ctx context.Context, wg *sync.WaitGroup, errChan chan<- e
 
 // startDaemonMode runs both file and process monitoring with coordinated shutdown.
 func startDaemonMode() {
-	logger.Info().Msg("starting daemon mode - combined file and process monitoring")
+	// Startup code
+	//===============================
+	logger.Info().Msg("starting daemon mode")
 
 	// Check privileges
 	if runtime.GOOS == "linux" && os.Geteuid() != 0 {
-		logger.Warn().Msg("running without root privileges - process monitoring may be limited")
+		logger.Warn().Msg("running without root privileges. process scanning will be limited to polling mode")
 	}
 
-	// Setup context for coordinated shutdown
+	// Define wait groups and context for clean shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	// WaitGroup to track monitoring goroutines
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	var wg sync.WaitGroup
 
 	// Error channel for fatal errors
@@ -125,19 +117,16 @@ func startDaemonMode() {
 
 	// Start file watcher
 	wg.Add(1)
-	go runFileWatcher(ctx, &wg, errChan)
+	go runFileWatcher(ctx, cancel, &wg, errChan)
 
 	// Start process monitor
 	wg.Add(1)
-	go runProcessMonitor(ctx, &wg, errChan)
+	go runProcessMonitor(ctx, cancel, &wg, errChan)
 
-	// Setup signal handling
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	logger.Info().Msg("daemon mode started, press Ctrl+C to stop")
-
+	// Closure code
+	//============================
 	// Wait for shutdown signal or error
+	logger.Info().Msg("daemon mode started, press Ctrl+C to stop")
 	select {
 	case sig := <-sigChan:
 		logger.Info().
@@ -149,11 +138,9 @@ func startDaemonMode() {
 			Msg("critical error occurred, initiating shutdown")
 	}
 
-	// Initiate graceful shutdown
-	logger.Info().Msg("shutting down daemon...")
+	// Remove context and wait for daemons to close
+	logger.Info().Msg("shutting down daemons...")
 	cancel()
-
-	// Wait for goroutines with timeout
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
@@ -162,8 +149,8 @@ func startDaemonMode() {
 
 	select {
 	case <-done:
-		logger.Info().Msg("daemon stopped successfully")
-	case <-time.After(30 * time.Second):
-		logger.Warn().Msg("shutdown timeout reached, forcing exit")
+		logger.Info().Msg("all daemons exited successfully")
+	case <-time.After(time.Duration(GlobalConfig.TimingSettings.ShutdownTimeoutSec) * time.Second):
+		logger.Warn().Msg("daemons crossed shutdown timeout, forcing exit")
 	}
 }
