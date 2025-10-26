@@ -4,6 +4,7 @@
 
 ### Added
 - Support for process scanning and monitoring through eBPF
+- Added a logging metrics module to include metrics in application logs.
 
 ## [0.1.0] - 2025-10-15
 
