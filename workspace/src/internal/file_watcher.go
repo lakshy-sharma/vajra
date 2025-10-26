@@ -1,16 +1,16 @@
 /*
 Copyright © 2025 Lakshy Sharma lakshy.d.sharma@gmail.com
 
-	This program is free software: you can redistribute it and/or modify
-	it under the terms of the GNU Affero General Public License as
-	published by the Free Software Foundation, either version 3 of the
-	License, or (at your option) any later version.
-	This program is distributed in the hope that it will be useful,
-	but WITHOUT ANY WARRANTY; without even the implied warranty of
-	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-	GNU Affero General Public License for more details.
-	You should have received a copy of the GNU Affero General Public License
-	along with this program. If not, see <https://www.gnu.org/licenses/>.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
 */
 package internal
 
@@ -282,7 +282,7 @@ func (fw *FileWatcher) processEvent(event FileEvent) {
 		}
 
 		// Save to database
-		if err := fw.scanner.saveScanResults([]YaraScanResult{result}); err != nil {
+		if err := fw.scanner.saveFileScanResults([]YaraScanResult{result}); err != nil {
 			fw.logger.Error().Err(err).Msg("failed to save scan result")
 		}
 
@@ -470,42 +470,4 @@ func (fw *FileWatcher) Stop() error {
 
 	fw.logger.Info().Msg("file watcher stopped")
 	return nil
-}
-
-// startDaemon is called when the application needs to be run continuously in background.
-// It monitors the filesystem for changes and scans new/modified files for threats.
-func startDaemon() {
-	// Create scanner
-	scanner, err := NewFileScanner(
-		GlobalConfig.ScanSettings.RulesFilepath,
-		filepath.Join(GlobalConfig.GenericSettings.WorkDirectory, "rules"),
-		DB,
-	)
-	if err != nil {
-		logger.Fatal().Err(err).Msg("failed to create YARA scanner")
-	}
-	defer scanner.Close()
-
-	// Create file watcher
-	fileWatcher, err := NewFileWatcher(scanner, logger.Logger)
-	if err != nil {
-		logger.Fatal().Err(err).Msg("failed to create file watcher")
-	}
-	defer fileWatcher.Stop()
-
-	// Handle graceful shutdown
-	// TODO: Add signal handling for SIGINT/SIGTERM
-	// sigChan := make(chan os.Signal, 1)
-	// signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	// go func() {
-	//     <-sigChan
-	//     logger.Info().Msg("received shutdown signal")
-	//     fileWatcher.Stop()
-	//     os.Exit(0)
-	// }()
-
-	// Start watching
-	if err := fileWatcher.Start(GlobalConfig.ScanSettings.TargetDirectory); err != nil {
-		logger.Fatal().Err(err).Msg("file watcher failed")
-	}
 }

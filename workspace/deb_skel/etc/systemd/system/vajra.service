@@ -3,6 +3,8 @@ Description=Vajra EDR service
 After=network.target
 
 [Service]
+User=vajra
+Group=vajra
 Type=exec
 LimitNOFILE=16384
 Restart=always

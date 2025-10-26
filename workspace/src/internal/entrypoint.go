@@ -53,9 +53,19 @@ func Entrypoint(config_path string) {
 
 	switch GlobalConfig.GenericSettings.OperationMode {
 	case "instant_scan":
-		startScan()
+		// Perform full scan of targets and quit.
+		logger.Info().Msg("starting file scan")
+		startFileScan()
+		logger.Info().Msg("starting process scan")
+		startProcessScan()
 	case "daemon_mode":
-		startScan()
-		startDaemon()
+		// Perform full scan of specified targets.
+		logger.Info().Msg("starting file scan")
+		startFileScan()
+		logger.Info().Msg("starting process scan")
+		startProcessScan()
+
+		// Start all daemons together and wait for signal to stop.
+		startDaemonMode()
 	}
 }

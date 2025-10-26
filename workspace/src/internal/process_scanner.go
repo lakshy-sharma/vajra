@@ -1,112 +1,122 @@
+/*
+Copyright © 2025 Lakshy Sharma lakshy.d.sharma@gmail.com
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+*/
+
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall" bpf process_monitor.c
+
 package internal
 
 import (
-	"bytes"
 	"context"
-	"encoding/binary"
-	"errors"
+	"database/sql"
+	"encoding/json"
 	"fmt"
-	"log"
-	"os"
-	"os/signal"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
-	"syscall"
 	"time"
 
-	"github.com/cilium/ebpf/link"
-	"github.com/cilium/ebpf/perf"
-	"github.com/cilium/ebpf/rlimit"
 	"github.com/hillu/go-yara/v4"
 	"github.com/shirou/gopsutil/v3/process"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall" bpf process_monitor.c
+const (
+	processScanTimeoutSeconds = 30
+	processBufferSize         = 50
+	processBatchSize          = 100
+	yaraProcessTimeoutSeconds = 10
+	defaultProcessWorkers     = 4
+	maxProcessWorkers         = 8
+)
+
+// ProcessScanResult holds the matches found for a single process.
+type ProcessScanResult struct {
+	PID     int32           `json:"pid"`
+	Name    string          `json:"process_name"`
+	Cmdline string          `json:"cmdline,omitempty"`
+	Matches yara.MatchRules `json:"yara_matches"`
+	Error   error           `json:"scanning_errors,omitempty"`
+}
 
 type ProcessScanner struct {
 	rules       *yara.Rules
+	db          *sql.DB
+	timeout     time.Duration
 	scannedPIDs map[int32]time.Time
 	mu          sync.RWMutex
-	ctx         context.Context
-	cancel      context.CancelFunc
 }
 
-type ProcessEvent struct {
-	PID       uint32
-	PPID      uint32
-	Comm      [16]byte
-	EventType uint32 // 0=fork, 1=exec, 2=exit
+type ProcessScanStats struct {
+	TotalProcesses   int64
+	ScannedProcesses int64
+	MatchedProcesses int64
+	ErrorProcesses   int64
+	SkippedProcesses int64
+	DurationSec      int64
 }
 
-type ProcessScanResult struct {
-	PID     int32
-	Name    string
-	Matches []yara.MatchRule
-	Error   error
-}
+// NewProcessScanner creates a new process scanner with YARA rules.
+func NewProcessScanner(rulesZipPath, extractPath string, db *sql.DB) (*ProcessScanner, error) {
+	// Extract rules from zip file
+	if err := unzipRules(rulesZipPath, extractPath); err != nil {
+		return nil, err
+	}
 
-// NewProcessScanner generates a Yara rules object containing compiled yara rules and returns an instance of a scanner.
-func NewProcessScanner(rulesPath string) (*ProcessScanner, error) {
-	compiler, err := yara.NewCompiler()
+	// Compile rules
+	rules, err := compileRules(extractPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create YARA compiler: %w", err)
+		return nil, err
 	}
-
-	file, err := os.Open(rulesPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open rules file: %w", err)
-	}
-	defer file.Close()
-
-	if err := compiler.AddFile(file, ""); err != nil {
-		return nil, fmt.Errorf("failed to add rules: %w", err)
-	}
-
-	rules, err := compiler.GetRules()
-	if err != nil {
-		return nil, fmt.Errorf("failed to compile rules: %w", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
 
 	return &ProcessScanner{
 		rules:       rules,
+		db:          db,
+		timeout:     yaraProcessTimeoutSeconds * time.Second,
 		scannedPIDs: make(map[int32]time.Time),
-		ctx:         ctx,
-		cancel:      cancel,
 	}, nil
 }
 
-// This function takes a PID and scans the process with compiled yara rules.
-func (ps *ProcessScanner) scanProcess(pid int32) *ProcessScanResult {
-	result := &ProcessScanResult{PID: pid}
-
-	proc, err := process.NewProcess(pid)
-	if err != nil {
-		result.Error = fmt.Errorf("failed to access process: %w", err)
-		return result
+// Close releases scanner resources.
+func (ps *ProcessScanner) Close() error {
+	if ps.rules != nil {
+		ps.rules.Destroy()
 	}
-
-	name, _ := proc.Name()
-	result.Name = name
-
-	var matches yara.MatchRules
-	err = ps.rules.ScanProc(int(pid), 0, 0, &matches)
-	if err != nil {
-		result.Error = fmt.Errorf("scan failed: %w", err)
-		return result
-	}
-
-	result.Matches = matches
-	return result
+	return nil
 }
 
+// isRecentlyScanned checks if a process was scanned within the last 30 seconds.
+func (ps *ProcessScanner) isRecentlyScanned(pid int32) bool {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+
+	if scanTime, exists := ps.scannedPIDs[pid]; exists {
+		return time.Since(scanTime) < 30*time.Second
+	}
+	return false
+}
+
+// markScanned records that a process has been scanned.
 func (ps *ProcessScanner) markScanned(pid int32) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 	ps.scannedPIDs[pid] = time.Now()
 }
 
+// cleanupOldEntries removes scan records older than 5 minutes.
 func (ps *ProcessScanner) cleanupOldEntries() {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
@@ -119,267 +129,319 @@ func (ps *ProcessScanner) cleanupOldEntries() {
 	}
 }
 
-// eBPF-based monitoring for Linux
-func (ps *ProcessScanner) ProcessMonitoringEBPF(callback func(*ProcessScanResult)) error {
-	logger.Info().Msg("starting process monitor")
-
-	// Remove resource limits for eBPF
-	if err := rlimit.RemoveMemlock(); err != nil {
-		return fmt.Errorf("failed to remove memlock limit: %w", err)
+// shouldSkipProcess determines if a process should be skipped.
+func shouldSkipProcess(proc *process.Process) (bool, string) {
+	// Skip kernel threads (PID 0, 1, 2, kthreadd children)
+	pid := proc.Pid
+	if pid <= 2 {
+		return true, "kernel thread"
 	}
 
-	// Load eBPF program
-	spec, err := loadBpf()
+	// Get process name
+	name, err := proc.Name()
 	if err != nil {
-		return fmt.Errorf("failed to load eBPF spec: %w", err)
+		return true, "cannot get process name"
 	}
 
-	objs := bpfObjects{}
-	if err := spec.LoadAndAssign(&objs, nil); err != nil {
-		return fmt.Errorf("failed to load eBPF objects: %w", err)
+	// Skip kernel threads (usually in brackets)
+	if strings.HasPrefix(name, "[") && strings.HasSuffix(name, "]") {
+		return true, "kernel thread"
 	}
-	defer objs.Close()
 
-	// Attach to tracepoints
-	tpFork, err := link.Tracepoint("sched", "sched_process_fork", objs.TracepointSchedSchedProcessFork, nil)
+	return false, ""
+}
+
+// scanProcess scans a single process with YARA rules.
+func (ps *ProcessScanner) scanProcess(ctx context.Context, pid int32) ProcessScanResult {
+	result := ProcessScanResult{PID: pid}
+
+	// Create process handle
+	proc, err := process.NewProcess(pid)
 	if err != nil {
-		return fmt.Errorf("failed to attach fork tracepoint: %w", err)
+		result.Error = fmt.Errorf("failed to access process: %w", err)
+		return result
 	}
-	defer tpFork.Close()
 
-	tpExec, err := link.Tracepoint("sched", "sched_process_exec", objs.TracepointSchedSchedProcessExec, nil)
-	if err != nil {
-		return fmt.Errorf("failed to attach exec tracepoint: %w", err)
+	// Get process information
+	result.Name, _ = proc.Name()
+	result.Cmdline, _ = proc.Cmdline()
+
+	// Check if we should skip this process
+	if skip, reason := shouldSkipProcess(proc); skip {
+		result.Error = fmt.Errorf("skipped: %s", reason)
+		return result
 	}
-	defer tpExec.Close()
-	logger.Info().Msg("attached to kernel successfully")
 
-	// Scan existing processes first
-	logger.Info().Msg("finding existing processes")
-	ps.scanExistingProcesses(callback)
+	// Scan process memory with timeout
+	done := make(chan ProcessScanResult, 1)
 
-	// Read events from perf buffer
-	rd, err := perf.NewReader(objs.Events, os.Getpagesize()*16)
-	if err != nil {
-		return fmt.Errorf("failed to create perf reader: %w", err)
-	}
-	defer rd.Close()
+	go func() {
+		var matches yara.MatchRules
+		err := ps.rules.ScanProc(int(pid), 0, ps.timeout, &matches)
 
-	logger.Info().Msg("started monitoring for new processes")
-
-	// Cleanup ticker
-	cleanupTicker := time.NewTicker(1 * time.Minute)
-	defer cleanupTicker.Stop()
-
-	for {
-		select {
-		case <-ps.ctx.Done():
-			return nil
-		case <-cleanupTicker.C:
-			ps.cleanupOldEntries()
-		default:
-			record, err := rd.Read()
-			if err != nil {
-				if errors.Is(err, perf.ErrClosed) {
-					return nil
-				}
-				log.Printf("Error reading from perf buffer: %v", err)
-				continue
-			}
-
-			if record.LostSamples > 0 {
-				log.Printf("Warning: Lost %d samples", record.LostSamples)
-				continue
-			}
-
-			var event ProcessEvent
-			if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &event); err != nil {
-				log.Printf("Error parsing event: %v", err)
-				continue
-			}
-
-			comm := string(bytes.TrimRight(event.Comm[:], "\x00"))
-
-			switch event.EventType {
-			case 0: // fork
-				log.Printf("[FORK] PID: %d, PPID: %d, Comm: %s", event.PID, event.PPID, comm)
-			case 1: // exec
-				log.Printf("[EXEC] PID: %d, PPID: %d, Comm: %s", event.PID, event.PPID, comm)
-				// Scan the process after exec
-				go func(pid int32) {
-					time.Sleep(100 * time.Millisecond) // Give process time to initialize
-					result := ps.scanProcess(pid)
-					ps.markScanned(pid)
-					if len(result.Matches) > 0 || shouldReportError(result.Error) {
-						callback(result)
-					}
-				}(int32(event.PID))
-			}
+		done <- ProcessScanResult{
+			PID:     pid,
+			Name:    result.Name,
+			Cmdline: result.Cmdline,
+			Matches: matches,
+			Error:   err,
 		}
+	}()
+
+	// Wait for scan completion or context cancellation
+	select {
+	case scanResult := <-done:
+		return scanResult
+	case <-ctx.Done():
+		result.Error = fmt.Errorf("scan cancelled: %w", ctx.Err())
+		return result
 	}
 }
 
-func (ps *ProcessScanner) scanExistingProcesses(callback func(*ProcessScanResult)) {
+// getAllProcesses retrieves all running process PIDs.
+func (ps *ProcessScanner) getAllProcesses() ([]int32, error) {
 	pids, err := process.Pids()
 	if err != nil {
-		log.Printf("Failed to get process list: %v", err)
-		return
+		return nil, fmt.Errorf("failed to get process list: %w", err)
 	}
-
-	var wg sync.WaitGroup
-	semaphore := make(chan struct{}, 10)
-
-	for _, pid := range pids {
-		wg.Add(1)
-		go func(p int32) {
-			defer wg.Done()
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
-
-			result := ps.scanProcess(p)
-			ps.markScanned(p)
-
-			if len(result.Matches) > 0 || shouldReportError(result.Error) {
-				callback(result)
-			}
-		}(pid)
-	}
-
-	wg.Wait()
-	log.Printf("Initial scan complete. Scanned %d processes.", len(pids))
+	return pids, nil
 }
 
-func shouldReportError(err error) bool {
-	if err == nil {
-		return false
+// getNewProcesses returns PIDs that haven't been scanned recently.
+func (ps *ProcessScanner) getNewProcesses() ([]int32, error) {
+	allPIDs, err := ps.getAllProcesses()
+	if err != nil {
+		return nil, err
 	}
-	errStr := err.Error()
-	return errStr != "failed to access process: process does not exist" &&
-		errStr != "scan failed: could not attach to process"
+
+	newPIDs := make([]int32, 0)
+	for _, pid := range allPIDs {
+		if !ps.isRecentlyScanned(pid) {
+			newPIDs = append(newPIDs, pid)
+		}
+	}
+
+	return newPIDs, nil
 }
 
-// Fallback polling for non-Linux systems
-func (ps *ProcessScanner) ProcessMonitoringPolling(interval time.Duration, callback func(*ProcessScanResult)) {
-	log.Printf("Starting poll-based process monitoring (interval: %v)", interval)
-
-	// Initial scan
-	log.Println("Performing initial scan of all processes...")
-	ps.scanExistingProcesses(callback)
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	cleanupTicker := time.NewTicker(1 * time.Minute)
-	defer cleanupTicker.Stop()
-
-	seenPIDs := make(map[int32]bool)
+// processScanWorker scans processes from the channel.
+func (ps *ProcessScanner) processScanWorker(ctx context.Context, pidChan <-chan int32, resultsChan chan<- ProcessScanResult, wg *sync.WaitGroup, stats *ProcessScanStats) {
+	defer wg.Done()
 
 	for {
 		select {
-		case <-ps.ctx.Done():
-			log.Println("Stopping process monitoring")
+		case <-ctx.Done():
+			logger.Debug().Msg("process scan worker stopping due to context cancellation")
 			return
+		case pid, ok := <-pidChan:
+			if !ok {
+				return
+			}
+
+			// Scan the process
+			result := ps.scanProcess(ctx, pid)
+			ps.markScanned(pid)
+
+			// Update stats
+			if result.Error != nil {
+				if !strings.Contains(result.Error.Error(), "skipped:") {
+					logger.Debug().Err(result.Error).Int32("pid", pid).Msg("process scan error")
+				}
+			} else {
+				if len(result.Matches) > 0 {
+					logger.Warn().
+						Int32("pid", result.PID).
+						Str("name", result.Name).
+						Int("matches", len(result.Matches)).
+						Msg("YARA matches found in process")
+				}
+			}
+
+			// Send result to collector
+			select {
+			case resultsChan <- result:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+// processResultCollector collects and batches results for database insertion.
+func (ps *ProcessScanner) processResultCollector(ctx context.Context, resultsChan <-chan ProcessScanResult, wg *sync.WaitGroup, stats *ProcessScanStats) {
+	defer wg.Done()
+
+	batch := make([]ProcessScanResult, 0, processBatchSize)
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+
+		if err := ps.saveProcessScanResults(batch); err != nil {
+			logger.Error().Err(err).Int("batch_size", len(batch)).Msg("failed to save process scan results")
+		} else {
+			logger.Debug().Int("batch_size", len(batch)).Msg("saved process results batch")
+		}
+
+		batch = batch[:0]
+	}
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			flush()
+			return
+		case result, ok := <-resultsChan:
+			if !ok {
+				flush()
+				return
+			}
+
+			// Only save results with matches or critical errors
+			if len(result.Matches) > 0 {
+				batch = append(batch, result)
+				if len(batch) >= processBatchSize {
+					flush()
+				}
+			}
 		case <-ticker.C:
-			currentPIDs, err := process.Pids()
-			if err != nil {
-				log.Printf("Failed to get process list: %v", err)
-				continue
-			}
-
-			for _, pid := range currentPIDs {
-				if !seenPIDs[pid] {
-					seenPIDs[pid] = true
-					go func(p int32) {
-						result := ps.scanProcess(p)
-						ps.markScanned(p)
-						if len(result.Matches) > 0 || shouldReportError(result.Error) {
-							callback(result)
-						}
-					}(pid)
-				}
-			}
-		case <-cleanupTicker.C:
-			ps.cleanupOldEntries()
+			flush()
 		}
 	}
 }
 
-func (ps *ProcessScanner) Stop() {
-	ps.cancel()
-}
-
-func (ps *ProcessScanner) Close() {
-	ps.rules.Destroy()
-}
-
-func printResult(result *ProcessScanResult) {
-	if result.Error != nil {
-		log.Printf("[ERROR] PID %d (%s): %v", result.PID, result.Name, result.Error)
-		return
+// saveProcessScanResults saves batch results to database.
+func (ps *ProcessScanner) saveProcessScanResults(results []ProcessScanResult) error {
+	if len(results) == 0 {
+		return nil
 	}
 
-	if len(result.Matches) > 0 {
-		fmt.Printf("\n[ALERT] Match found in process: %s (PID: %d)\n", result.Name, result.PID)
-		for _, match := range result.Matches {
-			fmt.Printf("  Rule: %s\n", match.Rule)
-			fmt.Printf("  Namespace: %s\n", match.Namespace)
-			if len(match.Strings) > 0 {
-				fmt.Println("  Matched strings:")
-				for _, str := range match.Strings {
-					fmt.Printf("    - %s at offset %d\n", str.Name, str.Offset)
-				}
-			}
-		}
-	}
-}
+	scanTime := time.Now().Unix()
 
-func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("Usage: scanner <yara_rules_file> [mode]")
-		fmt.Println("Modes:")
-		fmt.Println("  ebpf   - Use eBPF-based monitoring (Linux only, default)")
-		fmt.Println("  poll   - Use polling-based monitoring (fallback)")
-		fmt.Println("\nExample: scanner rules.yar ebpf")
-		os.Exit(1)
-	}
-
-	rulesPath := os.Args[1]
-	mode := "ebpf"
-	if len(os.Args) > 2 {
-		mode = os.Args[2]
-	}
-
-	if runtime.GOOS == "linux" && os.Geteuid() != 0 {
-		log.Println("WARNING: Running without root privileges. eBPF and full process access require root.")
-	}
-
-	scanner, err := NewProcessScanner(rulesPath)
+	tx, err := ps.db.Begin()
 	if err != nil {
-		log.Fatalf("Failed to create scanner: %v", err)
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	valueStrings := make([]string, 0, len(results))
+	valueArgs := make([]interface{}, 0, len(results)*5)
+
+	for _, result := range results {
+		yaraResultsJSON, err := json.Marshal(result.Matches)
+		if err != nil {
+			logger.Error().Err(err).Int32("pid", result.PID).Msg("failed to marshal yara results")
+			continue
+		}
+
+		valueStrings = append(valueStrings, "(?, ?, ?, ?, ?)")
+		valueArgs = append(valueArgs, scanTime, result.PID, result.Name, result.Cmdline, yaraResultsJSON)
+	}
+
+	if len(valueStrings) == 0 {
+		return nil
+	}
+
+	query := fmt.Sprintf(
+		"INSERT INTO process_scan_results (lastscan_time, pid, process_name, cmdline, yara_results) VALUES %s",
+		strings.Join(valueStrings, ","),
+	)
+
+	if _, err := tx.Exec(query, valueArgs...); err != nil {
+		return fmt.Errorf("failed to execute bulk insert: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+// scanAllProcesses performs a one-time scan of all running processes.
+func (ps *ProcessScanner) scanAllProcesses(ctx context.Context) error {
+	logger.Info().Msg("starting process scan")
+
+	startTime := time.Now()
+	stats := &ProcessScanStats{}
+
+	// Get all processes
+	pids, err := ps.getAllProcesses()
+	if err != nil {
+		return err
+	}
+	stats.TotalProcesses = int64(len(pids))
+
+	// Setup channels
+	pidChan := make(chan int32, processBufferSize)
+	resultsChan := make(chan ProcessScanResult, processBufferSize)
+
+	var scanWG sync.WaitGroup
+	var saveWG sync.WaitGroup
+
+	// Start result collector
+	saveWG.Add(1)
+	go ps.processResultCollector(ctx, resultsChan, &saveWG, stats)
+
+	// Start scan workers
+	numWorkers := defaultProcessWorkers
+	if maxWorkers := runtime.NumCPU() / 2; maxWorkers > 0 && numWorkers > maxWorkers {
+		numWorkers = maxWorkers
+	}
+	if numWorkers > maxProcessWorkers {
+		numWorkers = maxProcessWorkers
+	}
+
+	logger.Info().Int("workers", numWorkers).Msg("starting process scan workers")
+	for i := 0; i < numWorkers; i++ {
+		scanWG.Add(1)
+		go ps.processScanWorker(ctx, pidChan, resultsChan, &scanWG, stats)
+	}
+
+	// Send PIDs to workers
+	for _, pid := range pids {
+		select {
+		case pidChan <- pid:
+		case <-ctx.Done():
+			break
+		}
+	}
+
+	// Cleanup
+	close(pidChan)
+	scanWG.Wait()
+	close(resultsChan)
+	saveWG.Wait()
+
+	stats.DurationSec = int64(time.Since(startTime).Seconds())
+	logger.Info().
+		Int64("total_processes", stats.TotalProcesses).
+		Int64("duration_sec", stats.DurationSec).
+		Msg("process scan completed")
+
+	return nil
+}
+
+// startProcessScan is the entry point for one-time process scanning.
+func startProcessScan() {
+	scanner, err := NewProcessScanner(
+		GlobalConfig.ScanSettings.RulesFilepath,
+		filepath.Join(GlobalConfig.GenericSettings.WorkDirectory, "rules"),
+		DB,
+	)
+	if err != nil {
+		logger.Fatal().Err(err).Msg("failed to create process scanner")
 	}
 	defer scanner.Close()
 
-	// Handle graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigChan
-		log.Println("\nReceived interrupt signal, shutting down...")
-		scanner.Stop()
-	}()
+	ctx, cancel := context.WithTimeout(context.Background(), processScanTimeoutSeconds*time.Minute)
+	defer cancel()
 
-	// Start monitoring based on mode
-	switch mode {
-	case "ebpf":
-		if runtime.GOOS != "linux" {
-			log.Fatalf("eBPF monitoring is only available on Linux")
-		}
-		if err := scanner.ProcessMonitoringEBPF(printResult); err != nil {
-			log.Fatalf("eBPF monitoring failed: %v", err)
-		}
-	case "poll":
-		scanner.ProcessMonitoringPolling(2*time.Second, printResult)
-	default:
-		log.Fatalf("Unknown mode: %s", mode)
+	if err := scanner.scanAllProcesses(ctx); err != nil {
+		logger.Error().Err(err).Msg("process scan failed")
 	}
 }

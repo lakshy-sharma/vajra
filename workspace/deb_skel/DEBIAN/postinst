@@ -1,0 +1,23 @@
+#!/bin/bash
+
+set -e
+
+setup_user_and_group() {
+    groupadd vajra &&
+    useradd -M -s /usr/sbin/nologin vajra &&
+    usermod -aG vajra vajra;
+}
+
+transfer_ownership() {
+    chown -R vajra:vajra /etc/vajra &&
+    chown -R vajra:vajra /opt/vajra &&
+    chown -R vajra:vajra /var/log/vajra;
+}
+
+enable_service() {
+    systemctl enable vajra
+}
+
+setup_user_and_group &&
+transfer_ownership &&
+enable_service
