@@ -4,4 +4,4 @@ Architecture: <ARCH>
 Depends: libyara-dev
 Maintainer: lakshy.d.sharma@gmail.com
 Priority: optional
-Description: Atal is an EDR tool for monitoring local filesystems and detecting data leaks.
+Description: Vajra is an EDR tool for monitoring local filesystems and detecting data leaks.

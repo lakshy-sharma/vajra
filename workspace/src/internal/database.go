@@ -56,12 +56,27 @@ func createTables() {
 
 	// Setup local tables
 	createTableSQL := `
-	CREATE TABLE IF NOT EXISTS scan_results (
+	CREATE TABLE IF NOT EXISTS file_scan_results (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		lastscan_time INTEGER NOT NULL,
 		filepath TEXT NOT NULL,
 		yara_results BLOB
-	);`
+	);
+	CREATE TABLE IF NOT EXISTS process_scan_results (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		lastscan_time INTEGER NOT NULL,
+		pid INTEGER NOT NULL,
+		process_name TEXT NOT NULL,
+		cmdline TEXT,
+		yara_results TEXT NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE INDEX idx_file_scan_time ON file_scan_results(lastscan_time);
+	CREATE INDEX idx_file_path ON file_scan_results(filepath);
+	CREATE INDEX idx_process_scan_time ON process_scan_results(lastscan_time);
+	CREATE INDEX idx_process_pid ON process_scan_results(pid);
+	`
 	_, err := DB.Exec(createTableSQL)
 	if err != nil {
 		logger.Fatal().Err(err).Msg("failed to create tables in our database")

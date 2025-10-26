@@ -1,0 +1,16 @@
+#!/bin/bash
+
+set -e
+
+remove_user() {
+    groupdel vajra
+    userdel -r vajra
+}
+
+
+disable_service() {
+    systemctl disable --now vajra
+}
+
+remove_user &&
+disable_service

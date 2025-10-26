@@ -80,8 +80,7 @@ func getLogger(config Config) *Logger {
 		zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	}
 
-	logger := zerolog.New(mw).With().Timestamp().Logger()
-
+	logger := zerolog.New(mw).With().Timestamp().Caller().Stack().Logger()
 	logger.Info().
 		Bool("file_logging", config.Logging.EnableFileLogging).
 		Bool("json_output", config.Logging.UseJSON).

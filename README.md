@@ -1,4 +1,4 @@
-# Atal
+# Vajra
 
 An endpoint detection and response system which is engineered to be soft on your systems and your security teams.
 
@@ -14,36 +14,68 @@ The goal here is to build a modern endpoint detection and response system which 
 2. The fact that we pay extra attention to minimizing alert fatigue.
 3. We utilize a coarse AI system *(fine tuning is pending)* for scanning files just to ensure that the system doesnt miss files not in strict yara rules.
 
-The project is a gift from a developer for other developers. I know we all hate alerts which seem to never stop and I have paid special care to avoid reporting unwanted things.
+For roadmap and feature dvelopment plans please refer to TODO.md
 
-### Roadmap
+## Current Features
 
-1. **Phase 1: Build a Detection System**
-    1. Build a file scanner
-    2. Build a process scanner
-    3. Build a autorun scanner
-    4. Achieve cross platform support.
-    5. Add local persistence through sqlite.
-    6. Add automated password management for local system users.
-    7. Add automated lynis like system auditing.
+1. Runs as a non-root user in your system which defined set of capabilities.
+2. File scanning and filesystem monitoring
+3. Locally persistent storage for detections
 
-2. **Phase 2: Sync with Remote Server**
-    1. Build a Remote server capable of storing data collected.
-    2. Build a feature to sync local data routinely.
-    2. Build a feature for remote configurations and software updates.
+## Platform Support Matrix
 
-3. **Phase 3: Build a Response System**
-    1. Build quanratining feature.
-    2. Build automated response feature.
-    3. Build a feature to fetch virus samples from remote servers on demand.
+|OS|amd64|arm64
+|-|-|-|
+|Ubuntu 24.04+|Yes|Planned|
+|Debian Trixie+|Yes|Planned|
+|Fedora 42+|Planned|Planned|
+|Windows 11|Not Started|Not Started|
+|MacOS|Not Started|Not Started|
 
-4. **Phase 4: Build a Network Monitoring System**
-    1. Add feature for controlling local firewalls remotely
-    2. Add feature for logging network activity and scan it in runtime
+## Contributing
 
-5. **Phase 5: Add a feature to monitor log files**
-    1. Monitor local system log files and scan them for any malicious activities by provided user rules.
-    2. Become a full fledged Mitre attack scanner for the filesystem.
+Before you begin contributing. You need to know how to make a build setup.
 
-6. **Phase 6: Research and Development**
-    1. Develop a data leak detection and stopping system
+### Build Dependencies
+
+*Because every chef needs to get his ingredients correct.*
+
+**Debian**
+```
+build-essential
+clang
+llvm
+libbpf-dev
+linux-headers-$(uname -r)
+libyara-dev
+linux-tools-$(uname -r)
+```
+
+**RHEL**
+```
+clang
+llvm
+libbpf-devel
+kernel-devel
+yara-devel
+```
+
+### Build Your Own Binary
+
+To trigger a build run this command
+
+On a Linux machine with amd64 architecture
+```
+make linux_amd64
+```
+
+On a Linux machine with arn64 architecture
+```
+make linux_arm64
+```
+
+## Security
+
+If you spot any security issues please let me know in personal at lakshy.d.sharma@gmail.com.
+I shall make best effort to understand your concerns and fix them quickly.
+Thank you for your awareness and concern in advance.
