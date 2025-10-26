@@ -22,6 +22,11 @@ For roadmap and feature dvelopment plans please refer to TODO.md
 2. File scanning and filesystem monitoring
 3. Locally persistent storage for detections
 
+## Resources Required
+
+1. **CPUs**: 3 *(Can be configured to go lower if you are comfortable with going slower)*
+2. **RAM**: 100 mb
+
 ## Platform Support Matrix
 
 |OS|amd64|arm64
