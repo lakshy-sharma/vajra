@@ -7,6 +7,10 @@ generic_settings:
   db_filename: "vajra.db"
   monitoring_timer_sec: 30
 
+api_settings:
+  host: localhost
+  port: 8086
+
 timing_settings:
   shutdown_timeout_sec: 30
   single_file_scan_timeout_sec: 60
@@ -23,7 +27,7 @@ performance_settings:
 
 # Scan configurations
 scan_settings:
-  target_directory: "/home/lakshy/Citadel/Library"
+  target_directory: "/home/lakshy/Citadel/Filling Cabinet/"
   # Allows only zip files. Pack your rules into a zip file.
   rules_filepath: "../rules.zip"
 

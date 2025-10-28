@@ -25,10 +25,16 @@ import (
 
 type Config struct {
 	GenericSettings     GenericSettings     `yaml:"generic_settings"`
+	APIServerSettings   APIServerSettings   `yaml:"api_settings"`
 	TimingSettings      TimingSettings      `yaml:"timing_settings"`
 	PerformanceSettings PerformanceSettings `yaml:"performance_settings"`
 	ScanSettings        ScanSettings        `yaml:"scan_settings"`
 	Logging             LoggingSettings     `yaml:"logging"`
+}
+
+type APIServerSettings struct {
+	Host string `yaml:"host"`
+	Port int    `yaml:"port"`
 }
 
 type GenericSettings struct {

@@ -19,6 +19,8 @@ package internal
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -94,6 +96,31 @@ func runProcessMonitor(ctx context.Context, cancel context.CancelFunc, wg *sync.
 	}
 }
 
+// runAPIServer starts the API server in a goroutine-safe way
+func runAPIServer(ctx context.Context, cancel context.CancelFunc, wg *sync.WaitGroup, errChan chan<- error) {
+	defer wg.Done()
+
+	server := NewAPIServer(ctx, cancel, DB)
+
+	// Start server in goroutine
+	go func() {
+		address := fmt.Sprintf("%s:%d",
+			GlobalConfig.APIServerSettings.Host,
+			GlobalConfig.APIServerSettings.Port)
+		if err := server.Start(address); err != nil && err != http.ErrServerClosed {
+			errChan <- fmt.Errorf("API server error: %w", err)
+		}
+	}()
+
+	// Wait for shutdown signal
+	<-ctx.Done()
+
+	// Graceful shutdown
+	if err := server.Stop(); err != nil {
+		logger.Error().Err(err).Msg("error stopping API server")
+	}
+}
+
 // startDaemonMode runs both file and process monitoring with coordinated shutdown.
 func startDaemonMode() {
 	// Startup code
@@ -122,6 +149,10 @@ func startDaemonMode() {
 	// Start process monitor
 	wg.Add(1)
 	go runProcessMonitor(ctx, cancel, &wg, errChan)
+
+	// Start the api server
+	wg.Add(1)
+	go runAPIServer(ctx, cancel, &wg, errChan)
 
 	// Closure code
 	//============================

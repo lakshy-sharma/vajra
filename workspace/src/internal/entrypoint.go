@@ -27,33 +27,40 @@ import (
 )
 
 // Captures logs routinely and adds into logs for enhanced vision
+
 func logMetrics() {
-	// System CPU usage
-	cpuPercent, err := cpu.Percent(0, false)
-	if err != nil || len(cpuPercent) == 0 {
-		cpuPercent = []float64{0} // fallback
+	// --- System CPU usage (over 100ms interval) ---
+	cpuPercents, err := cpu.Percent(100*time.Millisecond, false)
+	systemCPU := 0.0
+	if err == nil && len(cpuPercents) > 0 {
+		systemCPU = cpuPercents[0] // total across all cores
 	}
 
-	// Process CPU usage
-	procCPUPercent := 0.0
+	// --- Current process ---
 	p, err := process.NewProcess(int32(os.Getpid()))
+	procCPU := 0.0
+	procRSS := uint64(0)
 	if err == nil {
-		if procCPU, err := p.CPUPercent(); err == nil {
-			procCPUPercent = procCPU
+		if c, err := p.CPUPercent(); err == nil {
+			procCPU = c // process CPU %
+		}
+		if m, err := p.MemoryInfo(); err == nil {
+			procRSS = m.RSS // resident memory in bytes
 		}
 	}
 
-	// Memory stats
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
+	// --- Go runtime memory stats ---
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
 
-	logger.Info().
-		Uint64("current_heap_mb", m.Alloc/1024/1024).
-		Uint64("total_heap_mb", m.TotalAlloc/1024/1024).
-		Uint64("allocated_system_memory_mb", m.Sys/1024/1024).
-		Uint32("garbage_cycle_count", m.NumGC).
-		Float64("system_cpu_percent", cpuPercent[0]).
-		Float64("process_cpu_percent", procCPUPercent).
+	log.Info().
+		Float64("system_cpu_percent", systemCPU).
+		Float64("process_cpu_percent", procCPU).
+		Uint64("process_rss_mb", procRSS/1024/1024). // closer to htop RES
+		Uint64("current_heap_mb", mem.Alloc/1024/1024).
+		Uint64("total_heap_mb", mem.TotalAlloc/1024/1024).
+		Uint64("allocated_system_memory_mb", mem.Sys/1024/1024).
+		Uint32("garbage_cycle_count", mem.NumGC).
 		Msg("process stats")
 }
 
