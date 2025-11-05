@@ -1,7 +1,7 @@
 # Generic settings used across our module.
 generic_settings:
   # Allowed modes are instant scan and daemon_mode
-  operation_mode: "daemon_mode"
+  operation_mode: "service_mode"
   work_directory: "/tmp/vajra"
   db_directory: "./database"
   db_filename: "vajra.db"

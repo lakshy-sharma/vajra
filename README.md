@@ -2,7 +2,9 @@
 
 An endpoint detection and response system which is engineered to be soft on your systems and your security teams.
 
-A huge shoutout to [Kraken](https://github.com/botherder/kraken) which is my original inspiration to start this project.
+A huge shoutout to [Kraken](https://github.com/botherder/kraken) which is my inspiration to start this project.
+
+Made with :heart: in India
 
 ## Goals
 
@@ -18,9 +20,9 @@ For roadmap and feature dvelopment plans please refer to TODO.md
 
 ## Current Features
 
-1. Runs as a non-root user in your system which defined set of capabilities.
-2. File scanning and filesystem monitoring
-3. Locally persistent storage for detections
+1. File scanning and filesystem monitoring.
+2. Process scanning and process monitoring.
+3. Locally persistent storage for detections.
 
 ## Resources Required
 

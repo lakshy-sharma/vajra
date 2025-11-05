@@ -36,4 +36,3 @@ workspace/release
 workspace/database
 workspace/logs
 **.db
-docs
