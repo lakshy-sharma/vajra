@@ -1,10 +1,12 @@
 # Changelogs
 
-## [0.0.1] - 2025-10-15
+## [0.0.1] - 2025-11-09
 
 ### Added
-- Instant scanning mode
-- Service mode with periodic full scans using yara rules for processes and files.
-- Debian amd64 builds
-- Process and Filesystem monitoring through eBPF
+- Service mode with eBPF based listeners for scanning files and processes.
+- Debian amd64 builds.
 - Added a logging metrics module to include metrics in application logs.
+- Autorun detection and scanning.
+
+### Removed
+- Partially removed the full file scanning system to replace it with periodic and efficient scans
