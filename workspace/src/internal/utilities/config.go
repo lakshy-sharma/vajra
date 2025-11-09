@@ -66,10 +66,18 @@ type PerformanceSettings struct {
 }
 
 type ScanSettings struct {
-	TargetDirectory           string `yaml:"target_directory"`
-	RulesFilepath             string `yaml:"rules_filepath"`
-	EnablePeriodicScan        bool   `yaml:"enable_periodic_scan"`
-	PeriodicScanIntervalHours int    `yaml:"periodic_scan_interval_hr"`
+	TargetDirectory           string         `yaml:"target_directory"`
+	RulesFilepath             string         `yaml:"rules_filepath"`
+	EnablePeriodicScan        bool           `yaml:"enable_periodic_scan"`
+	PeriodicScanIntervalHours int            `yaml:"periodic_scan_interval_hr"`
+	ExclusionRules            ExclusionRules `yaml:"exclusion_rules"`
+}
+
+type ExclusionRules struct {
+	ExcludePaths      []string `yaml:"exclude_paths"`
+	ExcludeExtensions []string `yaml:"exclude_extensions"`
+	ExcludePatterns   []string `yaml:"exclude_patterns"`
+	ExcludeProcesses  []string `yaml:"exclude_processes"`
 }
 
 type LoggingSettings struct {
