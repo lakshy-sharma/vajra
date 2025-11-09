@@ -35,6 +35,29 @@ scan_settings:
   # Allows only zip files. Pack your rules into a zip file.
   rules_filepath: "../rules.zip"
 
+  # WARNING: Use carefully.
+  # These are Exclusion rules to avoid scanning trusted paths. 
+  # Use them very carefully since files inside these paths / extensions are skipped automatically by scanner.
+  # When in doubt its best to leave them empty.
+  exclusion_rules:
+    exclude_paths:
+    exclude_extensions:
+      - swp
+      - lock
+      - pid
+      - socket
+    exclude_patterns:
+    exclude_processes: 
+      - gopls
+      - pylsp
+      - rust-analyzer
+      - typescript-language-server
+      - clangd
+      - code
+      - systemd
+      - dbus-daemon
+      - pulseaudio
+
 # Logging configuration
 logging:
   enable_console: True

@@ -18,10 +18,10 @@ package eBPFHandlers
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"time"
 	"vajra/internal/eBPFListeners"
 	"vajra/internal/utilities"
@@ -56,88 +56,179 @@ func (eh *EventHandler) handleMaliciousFile(result ScanResult) {
 	// Implement based on your security policy
 }
 
-// calculateFileHash calculates SHA256 hash of a file
-func calculateFileHash(filePath string) (string, error) {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
-}
-
-// shouldScanFile determines if a file should be scanned based on path/extension
-func (eh *EventHandler) shouldScanFile(filename string) bool {
-	if filename == "" {
-		return false
-	}
-
-	// Skip system directories that are typically safe
-	skipPrefixes := []string{
-		"/proc/",
-		"/sys/",
-		"/dev/",
-	}
-
-	for _, prefix := range skipPrefixes {
-		if len(filename) >= len(prefix) && filename[:len(prefix)] == prefix {
-			return false
-		}
-	}
-
-	// Scan executables and scripts
-	ext := filepath.Ext(filename)
-	scanExtensions := []string{
-		"", ".exe", ".elf", ".so", ".ko", // Executables and libraries
-		".sh", ".py", ".pl", ".rb", ".js", // Scripts
-		".jar", ".class", // Java
-	}
-
-	for _, scanExt := range scanExtensions {
-		if ext == scanExt {
-			return true
-		}
-	}
-
-	// Scan files in sensitive directories
-	sensitiveDirs := []string{
-		"/tmp/",
-		"/var/tmp/",
-		"/home/",
-		"/root/",
-	}
-
-	for _, dir := range sensitiveDirs {
-		if len(filename) >= len(dir) && filename[:len(dir)] == dir {
-			return true
-		}
+// isExecutableFile checks if a file is likely an executable based on permissions and magic bytes
+func isExecutableFile(filePath string, fileInfo os.FileInfo) bool {
+	// Check if executable bit is set
+	if fileInfo.Mode()&0111 != 0 {
+		// Verify with magic bytes to confirm it's actually executable
+		return hasExecutableMagic(filePath)
 	}
 
 	return false
 }
 
-// handleFileEvent handles file creation/open events
-func (eh *EventHandler) handleFileEvent(event EventContext) {
-	fileEvent := event.EventData.(eBPFListeners.FileEvent)
-	filename := utilities.ConvertCStringToGo(fileEvent.Filename[:])
-	comm := utilities.ConvertCStringToGo(fileEvent.Comm[:])
-
-	// Only scan files in sensitive locations or with suspicious extensions
-	if eh.shouldScanFile(filename) {
-		eh.logger.Info().
-			Uint32("pid", fileEvent.PID).
-			Str("file", filename).
-			Str("comm", comm).
-			Msg("scanning file event")
-
-		eh.scanFile(filename, event.EventType, fileEvent.PID, fileEvent.UID, comm)
+// hasExecutableMagic checks file magic bytes to determine if it's executable
+func hasExecutableMagic(filePath string) bool {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return false
 	}
+	defer file.Close()
+
+	// Read first 4 bytes (magic number)
+	magic := make([]byte, 4)
+	n, err := file.Read(magic)
+	if err != nil || n < 4 {
+		return false
+	}
+
+	// ELF (Linux/Unix executables): 0x7f 'E' 'L' 'F'
+	if magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F' {
+		return true
+	}
+
+	// PE (Windows executables): 'M' 'Z'
+	if magic[0] == 'M' && magic[1] == 'Z' {
+		return true
+	}
+
+	// Mach-O (macOS executables): Various formats
+	// 32-bit: 0xfeedface, 0xcefaedfe
+	// 64-bit: 0xfeedfacf, 0xcffaedfe
+	if (magic[0] == 0xfe && magic[1] == 0xed && magic[2] == 0xfa && (magic[3] == 0xce || magic[3] == 0xcf)) ||
+		(magic[0] == 0xce && magic[1] == 0xfa && magic[2] == 0xed && magic[3] == 0xfe) ||
+		(magic[0] == 0xcf && magic[1] == 0xfa && magic[2] == 0xed && magic[3] == 0xfe) {
+		return true
+	}
+
+	// Shebang scripts: #!
+	if magic[0] == '#' && magic[1] == '!' {
+		return true
+	}
+
+	return false
+}
+
+// quickFileHash generates a quick hash of a file for deduplication
+func quickFileHash(filePath string) string {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+
+	hash := sha256.New()
+	// Only hash first 8KB for speed
+	buffer := make([]byte, 8192)
+	n, _ := file.Read(buffer)
+	if n > 0 {
+		hash.Write(buffer[:n])
+	}
+
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+// calculateFileHash calculates full SHA256 hash
+func calculateFileHash(filePath string) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// shouldScanFile determines if a file should be scanned based on multiple criteria
+func (eh *EventHandler) shouldScanFile(filePath string, processName string, eventType uint32) (bool, string) {
+	// Check if path should be excluded
+	if !eh.exclusionFilter.ShouldScan(filePath) {
+		return false, "path_excluded"
+	}
+
+	// Check if file exists and is accessible
+	fileInfo, err := os.Stat(filePath)
+	if err != nil {
+		return false, "file_not_accessible"
+	}
+
+	// Skip directories
+	if fileInfo.IsDir() {
+		return false, "is_directory"
+	}
+
+	// Skip very small files (likely temp/cache)
+	if fileInfo.Size() < 10 {
+		return false, "too_small"
+	}
+
+	// Skip very large files (> 100MB) for performance
+	if fileInfo.Size() > 100*1024*1024 {
+		return false, "too_large"
+	}
+
+	// For trusted processes, only scan files with executable permissions and magic bytes
+	if eh.processFilter.ShouldReduceMonitoring(processName) {
+		if !isExecutableFile(filePath, fileInfo) {
+			return false, "trusted_process_non_executable"
+		}
+	}
+
+	// For all other files, check if they're executable before scanning
+	// This prevents scanning random data files, text files, etc.
+	if !isExecutableFile(filePath, fileInfo) {
+		// Only scan non-executables if they're in suspicious locations or from untrusted processes
+		if eh.processFilter.IsTrusted(processName) {
+			return false, "non_executable_trusted_source"
+		}
+	}
+
+	// Check if recently scanned
+	fileHash := quickFileHash(filePath)
+	if eh.recentScans.WasRecentlyScanned(filePath, fileHash) {
+		return false, "recently_scanned"
+	}
+
+	return true, ""
+}
+
+// handleFileEvent processes file open/create events with intelligent filtering
+func (eh *EventHandler) handleFileEvent(event EventContext) {
+	fileEvent, ok := event.EventData.(eBPFListeners.FileEvent)
+	if !ok {
+		return
+	}
+
+	filePath := utilities.ConvertCStringToGo(fileEvent.Filename[:])
+	processName := utilities.ConvertCStringToGo(fileEvent.Comm[:])
+
+	// Apply intelligent filtering
+	shouldScan, reason := eh.shouldScanFile(filePath, processName, event.EventType)
+	if !shouldScan {
+		eh.logger.Debug().
+			Str("file", filePath).
+			Str("process_name", processName).
+			Str("rejection_reason", reason).
+			Msg("file scan skipped")
+		return
+	}
+
+	eh.logger.Info().
+		Str("file", filePath).
+		Str("process_name", processName).
+		Uint32("pid", fileEvent.PID).
+		Msg("scanning file event")
+
+	// Rate limiting
+	<-eh.rateLimiter.C
+
+	// Perform YARA scan
+	eh.scanFile(filePath, event.EventType, fileEvent.PID, fileEvent.UID, processName)
 }
 
 // scanFile performs YARA scanning on a file

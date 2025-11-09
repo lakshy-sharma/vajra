@@ -32,16 +32,19 @@ import (
 
 // EventHandler manages the processing of eBPF events with YARA scanning
 type EventHandler struct {
-	logger      *zerolog.Logger
-	yaraRules   *yara.Rules
-	eventQueue  chan EventContext
-	ctx         context.Context
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
-	config      *utilities.Config
-	dbHandler   *database.DBHandler
-	scanCache   *sync.Map // Cache to avoid duplicate scans
-	rateLimiter *time.Ticker
+	logger          *zerolog.Logger
+	yaraRules       *yara.Rules
+	eventQueue      chan EventContext
+	ctx             context.Context
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
+	config          *utilities.Config
+	dbHandler       *database.DBHandler
+	scanCache       *sync.Map // Cache to avoid duplicate scans
+	rateLimiter     *time.Ticker
+	recentScans     *RecentScanTracker
+	processFilter   *ProcessFilter
+	exclusionFilter *ExclusionFilter
 }
 
 // EventContext wraps event data with metadata for processing
@@ -65,20 +68,22 @@ type ScanResult struct {
 	RiskLevel   string
 }
 
-// NewEventHandler creates a new event handler with YARA integration.
-// It initializes the yara rules for scanning new events.
+// NewEventHandler creates a new event handler with YARA integration
 func NewEventHandler(logger *zerolog.Logger, config *utilities.Config, dbHandler *database.DBHandler) (*EventHandler, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	eh := &EventHandler{
-		logger:      logger,
-		eventQueue:  make(chan EventContext, 10000), // Large buffer for high-volume events
-		ctx:         ctx,
-		cancel:      cancel,
-		config:      config,
-		dbHandler:   dbHandler,
-		scanCache:   &sync.Map{},
-		rateLimiter: time.NewTicker(10 * time.Millisecond), // Rate limit scans
+		logger:          logger,
+		eventQueue:      make(chan EventContext, 10000),
+		ctx:             ctx,
+		cancel:          cancel,
+		config:          config,
+		dbHandler:       dbHandler,
+		scanCache:       &sync.Map{},
+		rateLimiter:     time.NewTicker(10 * time.Millisecond),
+		exclusionFilter: NewExclusionFilter(config),
+		recentScans:     NewRecentScanTracker(5 * time.Minute), // Don't rescan same file within 5 min
+		processFilter:   NewProcessFilter(config),
 	}
 
 	// Load Yara Rules
@@ -93,19 +98,43 @@ func NewEventHandler(logger *zerolog.Logger, config *utilities.Config, dbHandler
 		logger.Error().Err(err).Msg("failed to compile rules")
 	}
 
-	// Start worker pool for processing events
-	eh.startWorkers(2)
+	// Start worker pool
+	eh.startWorkers(4) // Increased workers for better throughput
 	return eh, nil
 }
 
-// EventListener is the main callback function for eBPF events.
-// It captures the eventType and eventData from eBPF and sends it into eventQueue.
-// The eventQueue is processed by workers.
+// EventListener is the main callback function for eBPF events
 func (eh *EventHandler) EventListener(eventType uint32, eventData interface{}) {
-	// Determine priority based on event type
+	// Early filtering for high-volume events
+	if eventType == eBPFListeners.EventTypeFileOpen || eventType == eBPFListeners.EventTypeFileCreate {
+		// Apply quick filtering before queuing
+		var filePath string
+		var processName string
+
+		switch data := eventData.(type) {
+		case eBPFListeners.FileEvent:
+			filePath = utilities.ConvertCStringToGo(data.Filename[:])
+			processName = utilities.ConvertCStringToGo(data.Comm[:])
+		default:
+			return
+		}
+
+		// Quick path check
+		if !eh.exclusionFilter.ShouldScan(filePath) {
+			return
+		}
+
+		// Reduce monitoring for trusted processes
+		if eh.processFilter.IsTrusted(processName) {
+			// Only queue exec events for trusted processes
+			if eventType != eBPFListeners.EventTypeProcessExec {
+				return
+			}
+		}
+	}
+
 	priority := eh.getEventPriority(eventType)
 
-	// Create event context
 	ctx := EventContext{
 		EventType: eventType,
 		EventData: eventData,
@@ -113,7 +142,6 @@ func (eh *EventHandler) EventListener(eventType uint32, eventData interface{}) {
 		Priority:  priority,
 	}
 
-	// Non-blocking send to queue
 	select {
 	case eh.eventQueue <- ctx:
 	default:
@@ -178,7 +206,6 @@ func (eh *EventHandler) worker(id int) {
 // processEvent handles individual events and dispatches to appropriate handlers
 func (eh *EventHandler) processEvent(event EventContext) {
 	switch event.EventType {
-	// Process events that need file scanning
 	case eBPFListeners.EventTypeProcessExec:
 		eh.handleProcessExec(event)
 
@@ -188,12 +215,10 @@ func (eh *EventHandler) processEvent(event EventContext) {
 	case eBPFListeners.EventTypeProcessMmap:
 		eh.handleMmap(event)
 
-	// File events that need scanning
 	case eBPFListeners.EventTypeFileOpen,
 		eBPFListeners.EventTypeFileCreate:
 		eh.handleFileEvent(event)
 
-	// Security-critical events
 	case eBPFListeners.EventTypeProcessPtrace:
 		eh.handlePtrace(event)
 
@@ -203,14 +228,12 @@ func (eh *EventHandler) processEvent(event EventContext) {
 	case eBPFListeners.EventTypeBPFLoad:
 		eh.handleBPFLoad(event)
 
-	// Network events
 	case eBPFListeners.EventTypeNetConnect,
 		eBPFListeners.EventTypeNetBind,
 		eBPFListeners.EventTypeNetListen:
 		eh.handleNetworkEvent(event)
 
 	default:
-		// Log other events without scanning
 		eh.logEvent(event)
 	}
 }
@@ -229,10 +252,8 @@ func (eh *EventHandler) calculateRiskLevel(matches yara.MatchRules) string {
 		return "CLEAN"
 	}
 
-	// Check for high-severity rule matches
 	for _, match := range matches {
 		ruleName := match.Rule
-		// Customize based on your YARA rule naming conventions
 		if len(ruleName) >= 4 && ruleName[:4] == "APT_" {
 			return "CRITICAL"
 		}
@@ -253,16 +274,13 @@ func (eh *EventHandler) calculateRiskLevel(matches yara.MatchRules) string {
 
 // storeScanResult stores scan results in the database
 func (eh *EventHandler) storeScanResult(result ScanResult) {
-	// Convert YARA matches to database records
 	yaraRecords := database.ConvertYaraMatchRulesToRecords(result.Matches)
 
-	// Determine severity
 	severity := database.EventSeverity(result.RiskLevel)
 	if severity == "" {
 		severity = database.SeverityLow
 	}
 
-	// Create file scan result
 	fileScanResult := &database.FileScanResult{
 		ScanTime:    result.ScanTime.Unix(),
 		FilePath:    result.FilePath,
@@ -275,16 +293,13 @@ func (eh *EventHandler) storeScanResult(result ScanResult) {
 		TriggerComm: result.Comm,
 	}
 
-	// Calculate file hash and size if needed
 	if fileInfo, err := os.Stat(result.FilePath); err == nil {
 		fileScanResult.FileSize = fileInfo.Size()
-		// Calculate SHA256 hash
 		if hash, err := calculateFileHash(result.FilePath); err == nil {
 			fileScanResult.FileHash = hash
 		}
 	}
 
-	// Insert into database
 	if err := eh.dbHandler.InsertFileScanResult(fileScanResult); err != nil {
 		eh.logger.Error().
 			Err(err).
@@ -299,7 +314,6 @@ func (eh *EventHandler) Stop() {
 	eh.cancel()
 	eh.rateLimiter.Stop()
 
-	// Wait for workers with timeout
 	done := make(chan struct{})
 	go func() {
 		eh.wg.Wait()
