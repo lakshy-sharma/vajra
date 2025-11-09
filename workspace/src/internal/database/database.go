@@ -1,3 +1,19 @@
+/*
+Copyright © 2025 Lakshy Sharma lakshy.d.sharma@gmail.com
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+*/
 package database
 
 import (
@@ -286,6 +302,24 @@ func (db *DBHandler) initializeDB() {
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
+	-- Autoruns table
+	CREATE TABLE IF NOT EXISTS autoruns (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		type TEXT NOT NULL,
+		location TEXT NOT NULL,
+		image_path TEXT,
+		image_name TEXT,
+		arguments TEXT,
+		md5 TEXT,
+		sha1 TEXT,
+		sha256 TEXT,
+		is_active BOOLEAN DEFAULT 1,
+		first_seen INTEGER NOT NULL,
+		last_seen INTEGER NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
 	-- Indexes for file_scan_results
 	CREATE INDEX IF NOT EXISTS idx_file_scan_time ON file_scan_results(scan_time);
 	CREATE INDEX IF NOT EXISTS idx_file_path ON file_scan_results(file_path);
@@ -323,6 +357,16 @@ func (db *DBHandler) initializeDB() {
 	CREATE INDEX IF NOT EXISTS idx_quarantine_time ON quarantined_files(quarantine_time);
 	CREATE INDEX IF NOT EXISTS idx_quarantine_hash ON quarantined_files(file_hash);
 	CREATE INDEX IF NOT EXISTS idx_quarantine_severity ON quarantined_files(severity);
+
+	-- Indexes for autoruns
+	CREATE INDEX IF NOT EXISTS idx_autoruns_type ON autoruns(type);
+	CREATE INDEX IF NOT EXISTS idx_autoruns_location ON autoruns(location);
+	CREATE INDEX IF NOT EXISTS idx_autoruns_image_path ON autoruns(image_path);
+	CREATE INDEX IF NOT EXISTS idx_autoruns_md5 ON autoruns(md5);
+	CREATE INDEX IF NOT EXISTS idx_autoruns_sha256 ON autoruns(sha256);
+	CREATE INDEX IF NOT EXISTS idx_autoruns_is_active ON autoruns(is_active);
+	CREATE INDEX IF NOT EXISTS idx_autoruns_first_seen ON autoruns(first_seen);
+	CREATE INDEX IF NOT EXISTS idx_autoruns_last_seen ON autoruns(last_seen);
 	`
 	_, err := db.DB.Exec(createTableSQL)
 	if err != nil {

@@ -12,6 +12,10 @@ api_settings:
   port: 8086
 
 timing_settings:
+  autorun_scan_time_min: 30 
+  database_cleanup_time_hour: 24
+  full_filesystem_scan_time_hour: 24
+  full_process_scan_time_hour: 24
   shutdown_timeout_sec: 30
   single_file_scan_timeout_sec: 60
   single_process_scan_timeout_sec: 10

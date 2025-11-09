@@ -36,3 +36,4 @@ workspace/release
 workspace/database
 workspace/logs
 **.db
+**.o

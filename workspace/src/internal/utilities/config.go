@@ -46,6 +46,10 @@ type GenericSettings struct {
 }
 
 type TimingSettings struct {
+	AutorunScanTimeMin            int `yaml:"autorun_scan_time_min"`
+	DatabaseCleanupTimeHour       int `yaml:"database_cleanup_time_hour"`
+	FullFilesystemScanTimeHour    int `yaml:"full_filesystem_scan_time_hour"`
+	FullProcessScanTimeHour       int `yaml:"full_process_scan_time_hour"`
 	ShutdownTimeoutSec            int `yaml:"shutdown_timeout_sec"`
 	SingleFileScanTimeoutSec      int `yaml:"single_file_scan_timeout_sec"`
 	SingleProcessScanTimeoutSec   int `yaml:"single_process_scan_timeout_sec"`

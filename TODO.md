@@ -8,24 +8,23 @@
 ## Project Roadmap
 
 1. **Phase 1: Build a Detection System**
-    1. Build a file scanner **(Done for Yara / STIX pending)**
-    2. Build a running process scanner
-    3. Build a autorun scanner
-    4. Achieve cross platform support.
-    5. Add local persistence through sqlite. **(Done)**
-    6. Add automated password management for local system users.
-    7. Add automated lynis like system auditing.
-    8. Add eBPF based syscall monitoring.
+    1. Build a yara file scanner **(Done)**
+    2. Build a yara based process scanner **(Done)**
+    3. Build a autorun scanner to fid auto start services on any system. **(Done)**
+    4. Add local persistence through sqlite. **(Done)**
+    5. Add automated password management for local system users.
+    6. Add automated lynis like system auditing.
+    7. Add eBPF based syscall monitoring. **(Partially Done)**
 
 2. **Phase 2: Sync with Remote Server**
-    1. Build a Remote server capable of storing data collected.
+    1. Build a remote server capable of storing data collected.
     2. Build a feature to sync local data routinely.
     2. Build a feature for remote configurations and software updates.
 
 3. **Phase 3: Build a Response System**
-    1. Build quanratining feature.
+    1. Build a quarantining feature.
     2. Build automated response feature.
-    3. Build a feature to fetch virus samples from remote servers on demand.
+    3. Build a feature to fetch malicious samples from remote servers on demand.
 
 4. **Phase 4: Build a Network Monitoring System**
     1. Add feature for controlling local firewalls remotely
