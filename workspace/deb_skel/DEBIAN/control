@@ -1,7 +1,9 @@
 Package: <PACKAGE_NAME>
 Version: <VERSION>
 Architecture: <ARCH>
-Depends: libyara-dev
+Depends: libyara-dev, systemd
 Maintainer: lakshy.d.sharma@gmail.com
 Priority: optional
-Description: Vajra is an EDR tool for monitoring local filesystems and detecting data leaks.
+Description: Vajra EDR — endpoint detection and response for Linux.
+ eBPF-based monitoring with YARA scanning, persistence detection,
+ and behavioral analysis. Supports amd64 and arm64.

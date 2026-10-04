@@ -5,7 +5,6 @@
 
 package models
 
-// EventSeverity represents the severity level of a security event.
 type EventSeverity string
 
 const (
@@ -16,7 +15,6 @@ const (
 	SeverityCritical EventSeverity = "CRITICAL"
 )
 
-// EventStatus represents the handling status of an event.
 type EventStatus string
 
 const (
@@ -26,10 +24,8 @@ const (
 	StatusIgnored    EventStatus = "IGNORED"
 )
 
-// AutorunCategory represents the persistence mechanism type.
 type AutorunCategory string
 
-// Add these category constants — sources_linux.go uses all of them
 const (
 	CategorySystemdSystem AutorunCategory = "systemd_system"
 	CategorySystemdUser   AutorunCategory = "systemd_user"
@@ -46,8 +42,6 @@ const (
 	CategoryPAM           AutorunCategory = "pam"
 )
 
-// UniqueKey returns a stable string key for deduplication.
-// Prefers SHA256 when available; falls back to composite key.
 func (e *AutorunEntry) UniqueKey() string {
 	if e.SHA256 != "" {
 		return e.SHA256
@@ -55,7 +49,6 @@ func (e *AutorunEntry) UniqueKey() string {
 	return string(e.Category) + "|" + e.Location + "|" + e.ImagePath
 }
 
-// YaraMatch represents a single YARA rule match.
 type YaraMatch struct {
 	Rule      string   `json:"rule"`
 	Namespace string   `json:"namespace"`
@@ -63,9 +56,9 @@ type YaraMatch struct {
 	Strings   []string `json:"strings,omitempty"`
 }
 
-// FileScanResult represents a file scan result.
 type FileScanResult struct {
 	ID          int64
+	MachineID   string
 	ScanTime    int64
 	FilePath    string
 	FileSize    int64
@@ -77,14 +70,15 @@ type FileScanResult struct {
 	TriggerPID  uint32
 	TriggerUID  uint32
 	TriggerComm string
+	DedupCount  uint64
 	Notes       string
 	CreatedAt   string
 	UpdatedAt   string
 }
 
-// ProcessScanResult represents a process scan result.
 type ProcessScanResult struct {
 	ID          int64
+	MachineID   string
 	ScanTime    int64
 	PID         uint32
 	PPID        uint32
@@ -96,18 +90,20 @@ type ProcessScanResult struct {
 	ExePath     string
 	CmdLine     string
 	CWD         string
+	FileHash    string
 	YaraMatches []YaraMatch
 	Severity    EventSeverity
 	Status      EventStatus
 	EventType   uint32
+	DedupCount  uint64
 	Notes       string
 	CreatedAt   string
 	UpdatedAt   string
 }
 
-// NetworkEvent replaces NetworkEventRecord
 type NetworkEvent struct {
 	ID          int64
+	MachineID   string
 	EventTime   int64
 	EventType   uint32
 	PID         uint32
@@ -124,9 +120,9 @@ type NetworkEvent struct {
 	CreatedAt   string
 }
 
-// MemoryEvent replaces MemoryEventRecord
 type MemoryEvent struct {
 	ID          int64
+	MachineID   string
 	EventTime   int64
 	EventType   uint32
 	PID         uint32
@@ -143,9 +139,9 @@ type MemoryEvent struct {
 	CreatedAt   string
 }
 
-// SecurityEvent replaces SecurityEventRecord
 type SecurityEvent struct {
 	ID          int64
+	MachineID   string
 	EventTime   int64
 	EventType   uint32
 	EventName   string
@@ -164,7 +160,6 @@ type SecurityEvent struct {
 	UpdatedAt   string
 }
 
-// AutorunEntry represents a single persistence/autorun record.
 type AutorunEntry struct {
 	ID        int64
 	Category  AutorunCategory
@@ -182,7 +177,6 @@ type AutorunEntry struct {
 	UpdatedAt string
 }
 
-// QuarantinedFile represents a file that has been quarantined.
 type QuarantinedFile struct {
 	ID             int64
 	OriginalPath   string
@@ -199,10 +193,9 @@ type QuarantinedFile struct {
 	CreatedAt      string
 }
 
-// EventStatistic represents aggregated daily event counts.
 type EventStatistic struct {
 	ID             int64
-	Date           string // YYYY-MM-DD
+	Date           string
 	EventType      uint32
 	EventName      string
 	TotalCount     int64

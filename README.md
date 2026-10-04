@@ -16,16 +16,33 @@ Build a modern endpoint detection and response system capable of routine system 
 2. Extra attention to minimizing alert fatigue through intelligent filtering and deduplication.
 3. eBPF-based monitoring — no kernel modules, no polling, no missed events.
 4. Single self-contained binary with embedded YARA rules and SQLite persistence.
+5. Analyzer pipeline architecture — YARA, hash lookup, LD_PRELOAD, reverse shell, and capability abuse checks run as composable stages.
 
 For roadmap and feature development plans refer to TODO.md.
 
 ## Current Features
 
-1. eBPF syscall monitoring — file creation, process execution, network connections, memory events, namespace operations.
-2. YARA file and process scanning via an autotuning worker pool.
-3. Autorun/persistence scanner covering all major Linux persistence categories (systemd, cron, shell profiles, PAM, LD_PRELOAD, XDG, D-Bus, at jobs, anacron, SysV init).
-4. SQLite-backed event storage with retention-based cleanup.
-5. Intelligent deduplication via TTL-based scan cache and magic-byte file filtering.
+1. eBPF syscall monitoring — file creation, process execution, network connections, memory events, namespace operations, kernel module loads.
+2. YARA file and process scanning via an autotuning worker pool with load-average awareness.
+3. Analyzer pipeline — pluggable detection stages with result caching, short-circuit on CRITICAL, and separate content vs runtime pipelines for process events.
+4. Runtime process analysis — LD_PRELOAD injection detection, reverse shell detection via stdio fd inspection, dangerous capability detection.
+5. Autorun/persistence scanner covering all major Linux persistence categories (systemd, cron, shell profiles, PAM, LD_PRELOAD, XDG, D-Bus, at jobs, anacron, SysV init).
+6. SQLite-backed event storage with retention-based cleanup and alert deduplication.
+7. Intelligent deduplication — TTL-based scan cache, magic-byte file filtering, head+tail+mtime QuickHash, alert-level dedup with count tracking.
+8. Automatic YARA rule updates from YARA Forge with 7-generation archive rotation.
+9. Network, memory, security, and module event persistence with severity classification.
+
+## Architecture
+
+eBPF Kernel Events
+│
+▼
+Listener → Dispatcher (fan-out)
+│
+├── File channel → FileScanner → Analyzer Pipeline → DB
+├── Process channel → ProcessScanner → Content Pipeline + Runtime Pipeline → DB
+├── Network/Memory/Security/Module channels → EventSink → DB
+└── Autorun scanner (periodic) → DB
 
 ## Resources Required
 
@@ -43,50 +60,56 @@ For roadmap and feature development plans refer to TODO.md.
 | Windows 11 | Not Started | Not Started |
 | macOS | Not Started | Not Started |
 
+## Installation
+
+Download the latest `.deb` package from releases and install:
+
+```bash
+sudo dpkg -i vajra_<version>_amd64.deb
+sudo systemctl start vajra
+sudo systemctl status vajra
+```
+
+Configuration lives at `/etc/vajra/config.yaml`. Logs at `/var/log/vajra/`. Database at `/var/lib/vajra/`.
+
+## CLI
+
+```bash
+vajra -c /etc/vajra/config.yaml          # start in monitor mode
+vajra rules update                        # check and download updated YARA rules
+vajra rules status                        # show current rules version and archive count
+```
+
 ## Contributing
 
 ### Build Dependencies
 
 **Debian/Ubuntu**
 
-build-essential
-clang
-llvm
-libbpf-dev
-linux-headers-$(uname -r)
-linux-tools-$(uname -r)
-libyara-dev
-bpftool
+build-essential clang llvm libbpf-dev
+linux-headers-$(uname -r) linux-tools-$(uname -r)
+libyara-dev bpftool
 
 **RHEL/Fedora**
 
-clang
-llvm
-libbpf-devel
-kernel-devel
-bpftool
-yara-devel
+clang llvm libbpf-devel kernel-devel bpftool yara-devel
 
 ### First-time setup
 
-Generate `vmlinux.h` and compile the eBPF program. This requires a running kernel
-with BTF enabled and only needs to be done once, or whenever `ebpf_events.c` changes.
+```bash
+make generate-ebpf   # generate vmlinux.h and compile BPF program
+```
 
-make generate-ebpf
+Only needed once, or when `ebpf_events.c` changes.
 
 ### Build
 
-Linux amd64
-
+```bash
 make linux_amd64
-
-Linux arm64
-
 make linux_arm64
+```
 
 ### Configuration
-
-Copy and edit the example config before running:
 
 ```yaml
 generic_settings:
@@ -95,16 +118,23 @@ generic_settings:
   db_directory: /var/lib/vajra
   db_filename: vajra.db
 
+rules_settings:
+  rules_filepath: /opt/vajra/rules.zip
+  rules_archive_dir: /var/lib/vajra/rules-archive
+  rules_remote_url: https://github.com/YARAHQ/yara-forge/releases/latest/download/yara-forge-rules-core.zip
+  rules_sync_interval_hour: 24
+  rules_archive_count: 7
+
 scan_settings:
   target_directory: /
-  rules_filepath: /opt/vajra/rules.zip
   exclusion_rules:
     exclude_paths:
       - /proc
       - /sys
       - /dev
-    exclude_extensions: []
-    exclude_patterns: []
+    exclude_extensions:
+      - .swp
+      - .lock
     exclude_processes:
       - systemd-journal
       - systemd-udevd
@@ -115,6 +145,7 @@ timing_settings:
   database_retention_days: 90
   shutdown_timeout_sec: 30
   single_file_scan_timeout_sec: 30
+  dedup_window_min: 5
 
 performance_settings:
   default_threads: 2

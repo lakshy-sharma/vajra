@@ -1,4 +1,4 @@
-// internal/db/queries/files.go
+// internal/db/queries/processes.go
 //
 // Copyright © 2025 Lakshy Sharma lakshy.d.sharma@gmail.com
 // AGPL-3.0 License
@@ -15,8 +15,6 @@ import (
 	"vajra/shared/models"
 )
 
-// FileQueries holds the DB handle and exposes all
-// file-scan-result operations.
 type FileQueries struct {
 	db *db.DB
 }
@@ -25,37 +23,43 @@ func NewFileQueries(d *db.DB) *FileQueries {
 	return &FileQueries{db: d}
 }
 
-// Insert writes a single FileScanResult row.
 func (q *FileQueries) Insert(r *models.FileScanResult) error {
 	yaraJSON, err := json.Marshal(r.YaraMatches)
 	if err != nil {
 		return fmt.Errorf("files.Insert: marshal yara: %w", err)
 	}
 
-	sql, args, err := sq.
+	sqlStr, args, err := sq.
 		Insert("file_scan_results").
 		Columns(
-			"scan_time", "file_path", "file_size", "file_hash",
+			"machine_id", "scan_time", "file_path", "file_size", "file_hash",
 			"yara_matches", "severity", "status",
 			"event_type", "trigger_pid", "trigger_uid", "trigger_comm",
-			"notes",
+			"dedup_count", "notes",
 		).
 		Values(
-			r.ScanTime, r.FilePath, r.FileSize, r.FileHash,
+			r.MachineID, r.ScanTime, r.FilePath, r.FileSize, r.FileHash,
 			string(yaraJSON), string(r.Severity), string(r.Status),
 			r.EventType, r.TriggerPID, r.TriggerUID, r.TriggerComm,
-			r.Notes,
+			r.DedupCount, r.Notes,
 		).
 		ToSql()
 	if err != nil {
 		return fmt.Errorf("files.Insert: build query: %w", err)
 	}
 
-	_, err = q.db.SQL().Exec(sql, args...)
-	return err
+	res, err := q.db.SQL().Exec(sqlStr, args...)
+	if err != nil {
+		return err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return fmt.Errorf("files.Insert: last insert id: %w", err)
+	}
+	r.ID = id
+	return nil
 }
 
-// BatchInsert wraps multiple inserts in a single transaction.
 func (q *FileQueries) BatchInsert(results []models.FileScanResult) error {
 	if len(results) == 0 {
 		return nil
@@ -77,16 +81,16 @@ func (q *FileQueries) BatchInsert(results []models.FileScanResult) error {
 		sqlStr, args, err := sq.
 			Insert("file_scan_results").
 			Columns(
-				"scan_time", "file_path", "file_size", "file_hash",
+				"machine_id", "scan_time", "file_path", "file_size", "file_hash",
 				"yara_matches", "severity", "status",
 				"event_type", "trigger_pid", "trigger_uid", "trigger_comm",
-				"notes",
+				"dedup_count", "notes",
 			).
 			Values(
-				r.ScanTime, r.FilePath, r.FileSize, r.FileHash,
+				r.MachineID, r.ScanTime, r.FilePath, r.FileSize, r.FileHash,
 				string(yaraJSON), string(r.Severity), string(r.Status),
 				r.EventType, r.TriggerPID, r.TriggerUID, r.TriggerComm,
-				r.Notes,
+				r.DedupCount, r.Notes,
 			).
 			ToSql()
 		if err != nil {
@@ -101,7 +105,20 @@ func (q *FileQueries) BatchInsert(results []models.FileScanResult) error {
 	return tx.Commit()
 }
 
-// UpdateStatus changes the status and optionally appends a note.
+func (q *FileQueries) IncrementDedupCount(id int64) error {
+	sqlStr, args, err := sq.
+		Update("file_scan_results").
+		Set("dedup_count", sq.Expr("dedup_count + 1")).
+		Set("updated_at", time.Now().UTC()).
+		Where(sq.Eq{"id": id}).
+		ToSql()
+	if err != nil {
+		return fmt.Errorf("files.IncrementDedupCount: build query: %w", err)
+	}
+	_, err = q.db.SQL().Exec(sqlStr, args...)
+	return err
+}
+
 func (q *FileQueries) UpdateStatus(id int64, status models.EventStatus, notes string) error {
 	sqlStr, args, err := sq.
 		Update("file_scan_results").
@@ -113,13 +130,10 @@ func (q *FileQueries) UpdateStatus(id int64, status models.EventStatus, notes st
 	if err != nil {
 		return fmt.Errorf("files.UpdateStatus: build query: %w", err)
 	}
-
 	_, err = q.db.SQL().Exec(sqlStr, args...)
 	return err
 }
 
-// ListBySeverity returns results filtered by one or more severity levels,
-// ordered newest-first, with an optional row limit.
 func (q *FileQueries) ListBySeverity(limit uint64, severities ...models.EventSeverity) ([]models.FileScanResult, error) {
 	vals := make([]interface{}, len(severities))
 	for i, s := range severities {
@@ -128,10 +142,10 @@ func (q *FileQueries) ListBySeverity(limit uint64, severities ...models.EventSev
 
 	builder := sq.
 		Select(
-			"id", "scan_time", "file_path", "file_size", "file_hash",
+			"id", "machine_id", "scan_time", "file_path", "file_size", "file_hash",
 			"yara_matches", "severity", "status",
 			"event_type", "trigger_pid", "trigger_uid", "trigger_comm",
-			"notes", "created_at", "updated_at",
+			"dedup_count", "notes", "created_at", "updated_at",
 		).
 		From("file_scan_results").
 		Where(sq.Eq{"severity": vals}).
@@ -149,14 +163,13 @@ func (q *FileQueries) ListBySeverity(limit uint64, severities ...models.EventSev
 	return q.scanRows(sqlStr, args...)
 }
 
-// ListByTimeRange returns results between two Unix timestamps.
 func (q *FileQueries) ListByTimeRange(start, end int64) ([]models.FileScanResult, error) {
 	sqlStr, args, err := sq.
 		Select(
-			"id", "scan_time", "file_path", "file_size", "file_hash",
+			"id", "machine_id", "scan_time", "file_path", "file_size", "file_hash",
 			"yara_matches", "severity", "status",
 			"event_type", "trigger_pid", "trigger_uid", "trigger_comm",
-			"notes", "created_at", "updated_at",
+			"dedup_count", "notes", "created_at", "updated_at",
 		).
 		From("file_scan_results").
 		Where(sq.And{
@@ -172,14 +185,13 @@ func (q *FileQueries) ListByTimeRange(start, end int64) ([]models.FileScanResult
 	return q.scanRows(sqlStr, args...)
 }
 
-// GetByHash returns all results matching a SHA256 hash.
 func (q *FileQueries) GetByHash(hash string) ([]models.FileScanResult, error) {
 	sqlStr, args, err := sq.
 		Select(
-			"id", "scan_time", "file_path", "file_size", "file_hash",
+			"id", "machine_id", "scan_time", "file_path", "file_size", "file_hash",
 			"yara_matches", "severity", "status",
 			"event_type", "trigger_pid", "trigger_uid", "trigger_comm",
-			"notes", "created_at", "updated_at",
+			"dedup_count", "notes", "created_at", "updated_at",
 		).
 		From("file_scan_results").
 		Where(sq.Eq{"file_hash": hash}).
@@ -192,8 +204,6 @@ func (q *FileQueries) GetByHash(hash string) ([]models.FileScanResult, error) {
 	return q.scanRows(sqlStr, args...)
 }
 
-// DeleteResolvedBefore removes RESOLVED rows older than the
-// given Unix timestamp. Called by the cleanup job.
 func (q *FileQueries) DeleteResolvedBefore(cutoff int64) (int64, error) {
 	sqlStr, args, err := sq.
 		Delete("file_scan_results").
@@ -210,11 +220,9 @@ func (q *FileQueries) DeleteResolvedBefore(cutoff int64) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-
 	return res.RowsAffected()
 }
 
-// scanRows is a shared row scanner for all SELECT helpers.
 func (q *FileQueries) scanRows(sqlStr string, args ...interface{}) ([]models.FileScanResult, error) {
 	rows, err := q.db.SQL().Query(sqlStr, args...)
 	if err != nil {
@@ -229,10 +237,10 @@ func (q *FileQueries) scanRows(sqlStr string, args ...interface{}) ([]models.Fil
 		var createdAt, updatedAt string
 
 		if err := rows.Scan(
-			&r.ID, &r.ScanTime, &r.FilePath, &r.FileSize, &r.FileHash,
+			&r.ID, &r.MachineID, &r.ScanTime, &r.FilePath, &r.FileSize, &r.FileHash,
 			&yaraJSON, &r.Severity, &r.Status,
 			&r.EventType, &r.TriggerPID, &r.TriggerUID, &r.TriggerComm,
-			&r.Notes, &createdAt, &updatedAt,
+			&r.DedupCount, &r.Notes, &createdAt, &updatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("files.scanRows: scan: %w", err)
 		}

@@ -32,13 +32,13 @@ func (q *SecurityQueries) Insert(e *models.SecurityEvent) error {
 	sqlStr, args, err := sq.
 		Insert("security_events").
 		Columns(
-			"event_time", "event_type", "event_name",
+			"machine_id", "event_time", "event_type", "event_name",
 			"pid", "uid", "process_name",
 			"target_pid", "target_path", "details",
 			"severity", "status", "yara_matches", "action_taken", "notes",
 		).
 		Values(
-			e.EventTime, e.EventType, e.EventName,
+			e.MachineID, e.EventTime, e.EventType, e.EventName,
 			e.PID, e.UID, e.ProcessName,
 			e.TargetPID, e.TargetPath, e.Details,
 			string(e.Severity), string(e.Status), string(yaraJSON), e.ActionTaken, e.Notes,
@@ -63,7 +63,6 @@ func (q *SecurityQueries) UpdateStatus(id int64, status models.EventStatus, note
 	if err != nil {
 		return fmt.Errorf("security.UpdateStatus: build query: %w", err)
 	}
-
 	_, err = q.db.SQL().Exec(sqlStr, args...)
 	return err
 }
@@ -71,7 +70,7 @@ func (q *SecurityQueries) UpdateStatus(id int64, status models.EventStatus, note
 func (q *SecurityQueries) ListCritical(limit uint64) ([]models.SecurityEvent, error) {
 	builder := sq.
 		Select(
-			"id", "event_time", "event_type", "event_name",
+			"id", "machine_id", "event_time", "event_type", "event_name",
 			"pid", "uid", "process_name",
 			"target_pid", "target_path", "details",
 			"severity", "status", "yara_matches", "action_taken", "notes",
@@ -107,7 +106,7 @@ func (q *SecurityQueries) scanRows(sqlStr string, args ...interface{}) ([]models
 		var createdAt, updatedAt string
 
 		if err := rows.Scan(
-			&e.ID, &e.EventTime, &e.EventType, &e.EventName,
+			&e.ID, &e.MachineID, &e.EventTime, &e.EventType, &e.EventName,
 			&e.PID, &e.UID, &e.ProcessName,
 			&e.TargetPID, &e.TargetPath, &e.Details,
 			&e.Severity, &e.Status, &yaraJSON, &e.ActionTaken, &e.Notes,

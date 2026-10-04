@@ -32,20 +32,44 @@ func (q *ProcessQueries) Insert(r *models.ProcessScanResult) error {
 	sqlStr, args, err := sq.
 		Insert("process_scan_results").
 		Columns(
-			"scan_time", "pid", "ppid", "uid", "gid", "euid", "egid",
+			"machine_id", "scan_time", "pid", "ppid", "uid", "gid", "euid", "egid",
 			"process_name", "exe_path", "cmdline", "cwd",
-			"yara_matches", "severity", "status", "event_type", "notes",
+			"file_hash", "yara_matches", "severity", "status",
+			"event_type", "dedup_count", "notes",
 		).
 		Values(
-			r.ScanTime, r.PID, r.PPID, r.UID, r.GID, r.EUID, r.EGID,
+			r.MachineID, r.ScanTime, r.PID, r.PPID, r.UID, r.GID, r.EUID, r.EGID,
 			r.ProcessName, r.ExePath, r.CmdLine, r.CWD,
-			string(yaraJSON), string(r.Severity), string(r.Status), r.EventType, r.Notes,
+			r.FileHash, string(yaraJSON), string(r.Severity), string(r.Status),
+			r.EventType, r.DedupCount, r.Notes,
 		).
 		ToSql()
 	if err != nil {
 		return fmt.Errorf("processes.Insert: build query: %w", err)
 	}
 
+	res, err := q.db.SQL().Exec(sqlStr, args...)
+	if err != nil {
+		return err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return fmt.Errorf("processes.Insert: last insert id: %w", err)
+	}
+	r.ID = id
+	return nil
+}
+
+func (q *ProcessQueries) IncrementDedupCount(id int64) error {
+	sqlStr, args, err := sq.
+		Update("process_scan_results").
+		Set("dedup_count", sq.Expr("dedup_count + 1")).
+		Set("updated_at", time.Now().UTC()).
+		Where(sq.Eq{"id": id}).
+		ToSql()
+	if err != nil {
+		return fmt.Errorf("processes.IncrementDedupCount: build query: %w", err)
+	}
 	_, err = q.db.SQL().Exec(sqlStr, args...)
 	return err
 }
@@ -61,7 +85,6 @@ func (q *ProcessQueries) UpdateStatus(id int64, status models.EventStatus, notes
 	if err != nil {
 		return fmt.Errorf("processes.UpdateStatus: build query: %w", err)
 	}
-
 	_, err = q.db.SQL().Exec(sqlStr, args...)
 	return err
 }
@@ -69,10 +92,10 @@ func (q *ProcessQueries) UpdateStatus(id int64, status models.EventStatus, notes
 func (q *ProcessQueries) ListByPID(pid uint32) ([]models.ProcessScanResult, error) {
 	sqlStr, args, err := sq.
 		Select(
-			"id", "scan_time", "pid", "ppid", "uid", "gid", "euid", "egid",
+			"id", "machine_id", "scan_time", "pid", "ppid", "uid", "gid", "euid", "egid",
 			"process_name", "exe_path", "cmdline", "cwd",
-			"yara_matches", "severity", "status", "event_type", "notes",
-			"created_at", "updated_at",
+			"file_hash", "yara_matches", "severity", "status",
+			"event_type", "dedup_count", "notes", "created_at", "updated_at",
 		).
 		From("process_scan_results").
 		Where(sq.Eq{"pid": pid}).
@@ -93,10 +116,10 @@ func (q *ProcessQueries) ListBySeverity(limit uint64, severities ...models.Event
 
 	builder := sq.
 		Select(
-			"id", "scan_time", "pid", "ppid", "uid", "gid", "euid", "egid",
+			"id", "machine_id", "scan_time", "pid", "ppid", "uid", "gid", "euid", "egid",
 			"process_name", "exe_path", "cmdline", "cwd",
-			"yara_matches", "severity", "status", "event_type", "notes",
-			"created_at", "updated_at",
+			"file_hash", "yara_matches", "severity", "status",
+			"event_type", "dedup_count", "notes", "created_at", "updated_at",
 		).
 		From("process_scan_results").
 		Where(sq.Eq{"severity": vals}).
@@ -130,7 +153,6 @@ func (q *ProcessQueries) DeleteResolvedBefore(cutoff int64) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-
 	return res.RowsAffected()
 }
 
@@ -148,10 +170,10 @@ func (q *ProcessQueries) scanRows(sqlStr string, args ...interface{}) ([]models.
 		var createdAt, updatedAt string
 
 		if err := rows.Scan(
-			&r.ID, &r.ScanTime, &r.PID, &r.PPID, &r.UID, &r.GID, &r.EUID, &r.EGID,
+			&r.ID, &r.MachineID, &r.ScanTime, &r.PID, &r.PPID, &r.UID, &r.GID, &r.EUID, &r.EGID,
 			&r.ProcessName, &r.ExePath, &r.CmdLine, &r.CWD,
-			&yaraJSON, &r.Severity, &r.Status, &r.EventType, &r.Notes,
-			&createdAt, &updatedAt,
+			&r.FileHash, &yaraJSON, &r.Severity, &r.Status,
+			&r.EventType, &r.DedupCount, &r.Notes, &createdAt, &updatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("processes.scanRows: scan: %w", err)
 		}

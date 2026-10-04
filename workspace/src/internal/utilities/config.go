@@ -13,6 +13,7 @@ type Config struct {
 	APIServerSettings   APIServerSettings   `yaml:"api_settings"`
 	TimingSettings      TimingSettings      `yaml:"timing_settings"`
 	PerformanceSettings PerformanceSettings `yaml:"performance_settings"`
+	RulesSettings       RulesSettings       `yaml:"rules_settings"`
 	ScanSettings        ScanSettings        `yaml:"scan_settings"`
 	Logging             LoggingSettings     `yaml:"logging"`
 }
@@ -32,21 +33,45 @@ type GenericSettings struct {
 type TimingSettings struct {
 	AutorunScanTimeMin       int `yaml:"autorun_scan_time_min"`
 	DatabaseCleanupTimeHour  int `yaml:"database_cleanup_time_hour"`
-	DatabaseRetentionDays    int `yaml:"database_retention_days"` // NEW: was hardcoded 90
+	DatabaseRetentionDays    int `yaml:"database_retention_days"`
 	ShutdownTimeoutSec       int `yaml:"shutdown_timeout_sec"`
 	SingleFileScanTimeoutSec int `yaml:"single_file_scan_timeout_sec"`
+	DedupWindowMin           int `yaml:"dedup_window_min"`
 }
 
 type PerformanceSettings struct {
 	DefaultThreads     int `yaml:"default_threads"`
 	MaxAllowedThreads  int `yaml:"max_allowed_threads"`
-	ScanQueueSize      int `yaml:"scan_queue_size"` // NEW: pool queue depth
+	ScanQueueSize      int `yaml:"scan_queue_size"`
 	FileScanBufferSize int `yaml:"file_scan_buffer_size"`
+}
+
+// RulesSettings controls YARA rule storage and remote sync.
+type RulesSettings struct {
+	// RulesFilepath is the active rules archive loaded on startup.
+	RulesFilepath string `yaml:"rules_filepath"`
+
+	// RulesArchiveDir holds the previous N rule archives for audit.
+	RulesArchiveDir string `yaml:"rules_archive_dir"`
+
+	// RulesRemoteURL is the download URL for the latest rules zip.
+	RulesRemoteURL string `yaml:"rules_remote_url"`
+
+	// RulesRemoteHashURL is the URL of the SHA256 manifest file.
+	// Used to check whether a download is needed before fetching
+	// the full archive.
+	RulesRemoteHashURL string `yaml:"rules_remote_hash_url"`
+
+	// RulesSyncIntervalHour is how often the sync job runs.
+	RulesSyncIntervalHour int `yaml:"rules_sync_interval_hour"`
+
+	// RulesArchiveCount is how many old archives to retain.
+	// Oldest archives are deleted when count is exceeded.
+	RulesArchiveCount int `yaml:"rules_archive_count"`
 }
 
 type ScanSettings struct {
 	TargetDirectory string         `yaml:"target_directory"`
-	RulesFilepath   string         `yaml:"rules_filepath"`
 	ExclusionRules  ExclusionRules `yaml:"exclusion_rules"`
 }
 
@@ -83,8 +108,6 @@ func LoadConfig(configPath string) (Config, error) {
 	return config, nil
 }
 
-// applyDefaults fills in zero values with sane starting points.
-// This prevents panics when fields are omitted from the YAML.
 func applyDefaults(c *Config) {
 	if c.TimingSettings.AutorunScanTimeMin == 0 {
 		c.TimingSettings.AutorunScanTimeMin = 30
@@ -101,6 +124,9 @@ func applyDefaults(c *Config) {
 	if c.TimingSettings.SingleFileScanTimeoutSec == 0 {
 		c.TimingSettings.SingleFileScanTimeoutSec = 30
 	}
+	if c.TimingSettings.DedupWindowMin == 0 {
+		c.TimingSettings.DedupWindowMin = 5
+	}
 	if c.PerformanceSettings.DefaultThreads == 0 {
 		c.PerformanceSettings.DefaultThreads = 2
 	}
@@ -109,5 +135,23 @@ func applyDefaults(c *Config) {
 	}
 	if c.PerformanceSettings.ScanQueueSize == 0 {
 		c.PerformanceSettings.ScanQueueSize = 1000
+	}
+	if c.RulesSettings.RulesFilepath == "" {
+		c.RulesSettings.RulesFilepath = "/opt/vajra/rules.zip"
+	}
+	if c.RulesSettings.RulesArchiveDir == "" {
+		c.RulesSettings.RulesArchiveDir = "/opt/vajra/rules-archive"
+	}
+	if c.RulesSettings.RulesRemoteURL == "" {
+		c.RulesSettings.RulesRemoteURL = "https://github.com/YARAHQ/yara-forge/releases/latest/download/yara-forge-rules-core.zip"
+	}
+	if c.RulesSettings.RulesRemoteHashURL == "" {
+		c.RulesSettings.RulesRemoteHashURL = "https://github.com/YARAHQ/yara-forge/releases/latest/download/yara-forge-rules-core.zip.sha256"
+	}
+	if c.RulesSettings.RulesSyncIntervalHour == 0 {
+		c.RulesSettings.RulesSyncIntervalHour = 24
+	}
+	if c.RulesSettings.RulesArchiveCount == 0 {
+		c.RulesSettings.RulesArchiveCount = 7
 	}
 }

@@ -25,12 +25,12 @@ func (q *NetworkQueries) Insert(e *models.NetworkEvent) error {
 	sqlStr, args, err := sq.
 		Insert("network_events").
 		Columns(
-			"event_time", "event_type", "pid", "uid", "process_name",
+			"machine_id", "event_time", "event_type", "pid", "uid", "process_name",
 			"src_addr", "dst_addr", "src_port", "dst_port", "protocol",
 			"severity", "status", "notes",
 		).
 		Values(
-			e.EventTime, e.EventType, e.PID, e.UID, e.ProcessName,
+			e.MachineID, e.EventTime, e.EventType, e.PID, e.UID, e.ProcessName,
 			e.SrcAddr, e.DstAddr, e.SrcPort, e.DstPort, e.Protocol,
 			string(e.Severity), string(e.Status), e.Notes,
 		).
@@ -46,7 +46,7 @@ func (q *NetworkQueries) Insert(e *models.NetworkEvent) error {
 func (q *NetworkQueries) ListByDstPort(port uint16, limit uint64) ([]models.NetworkEvent, error) {
 	builder := sq.
 		Select(
-			"id", "event_time", "event_type", "pid", "uid", "process_name",
+			"id", "machine_id", "event_time", "event_type", "pid", "uid", "process_name",
 			"src_addr", "dst_addr", "src_port", "dst_port", "protocol",
 			"severity", "status", "notes", "created_at",
 		).
@@ -69,7 +69,7 @@ func (q *NetworkQueries) ListByDstPort(port uint16, limit uint64) ([]models.Netw
 func (q *NetworkQueries) ListByTimeRange(start, end int64) ([]models.NetworkEvent, error) {
 	sqlStr, args, err := sq.
 		Select(
-			"id", "event_time", "event_type", "pid", "uid", "process_name",
+			"id", "machine_id", "event_time", "event_type", "pid", "uid", "process_name",
 			"src_addr", "dst_addr", "src_port", "dst_port", "protocol",
 			"severity", "status", "notes", "created_at",
 		).
@@ -87,7 +87,6 @@ func (q *NetworkQueries) ListByTimeRange(start, end int64) ([]models.NetworkEven
 	return q.scanRows(sqlStr, args...)
 }
 
-// DeleteLowSeverityBefore removes LOW severity rows older than cutoff.
 func (q *NetworkQueries) DeleteLowSeverityBefore(cutoff int64) (int64, error) {
 	sqlStr, args, err := sq.
 		Delete("network_events").
@@ -104,7 +103,6 @@ func (q *NetworkQueries) DeleteLowSeverityBefore(cutoff int64) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-
 	return res.RowsAffected()
 }
 
@@ -121,7 +119,7 @@ func (q *NetworkQueries) scanRows(sqlStr string, args ...interface{}) ([]models.
 		var createdAt string
 
 		if err := rows.Scan(
-			&e.ID, &e.EventTime, &e.EventType, &e.PID, &e.UID, &e.ProcessName,
+			&e.ID, &e.MachineID, &e.EventTime, &e.EventType, &e.PID, &e.UID, &e.ProcessName,
 			&e.SrcAddr, &e.DstAddr, &e.SrcPort, &e.DstPort, &e.Protocol,
 			&e.Severity, &e.Status, &e.Notes, &createdAt,
 		); err != nil {

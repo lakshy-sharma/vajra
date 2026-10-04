@@ -2,15 +2,23 @@
 
 set -e
 
-remove_user() {
-    groupdel vajra
-    userdel -r vajra
-}
-
-
 disable_service() {
-    systemctl disable --now vajra
+  systemctl disable --now vajra || true
+  systemctl daemon-reload
 }
 
-remove_user &&
+remove_user() {
+  if getent passwd vajra >/dev/null 2>&1; then
+    userdel vajra
+  fi
+  if getent group vajra >/dev/null 2>&1; then
+    groupdel vajra
+  fi
+}
+
+# Service must be stopped before user is removed.
 disable_service
+remove_user
+
+echo "Vajra removed."
+

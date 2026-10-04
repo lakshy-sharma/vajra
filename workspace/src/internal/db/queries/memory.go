@@ -25,12 +25,12 @@ func (q *MemoryQueries) Insert(e *models.MemoryEvent) error {
 	sqlStr, args, err := sq.
 		Insert("memory_events").
 		Columns(
-			"event_time", "event_type", "pid", "uid", "process_name",
+			"machine_id", "event_time", "event_type", "pid", "uid", "process_name",
 			"address", "length", "protection", "flags", "file_path",
 			"severity", "status", "notes",
 		).
 		Values(
-			e.EventTime, e.EventType, e.PID, e.UID, e.ProcessName,
+			e.MachineID, e.EventTime, e.EventType, e.PID, e.UID, e.ProcessName,
 			e.Address, e.Length, e.Protection, e.Flags, e.FilePath,
 			string(e.Severity), string(e.Status), e.Notes,
 		).
@@ -46,7 +46,7 @@ func (q *MemoryQueries) Insert(e *models.MemoryEvent) error {
 func (q *MemoryQueries) ListByPID(pid uint32, limit uint64) ([]models.MemoryEvent, error) {
 	builder := sq.
 		Select(
-			"id", "event_time", "event_type", "pid", "uid", "process_name",
+			"id", "machine_id", "event_time", "event_type", "pid", "uid", "process_name",
 			"address", "length", "protection", "flags", "file_path",
 			"severity", "status", "notes", "created_at",
 		).
@@ -79,7 +79,6 @@ func (q *MemoryQueries) DeleteBefore(cutoff int64) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-
 	return res.RowsAffected()
 }
 
@@ -96,7 +95,7 @@ func (q *MemoryQueries) scanRows(sqlStr string, args ...interface{}) ([]models.M
 		var createdAt string
 
 		if err := rows.Scan(
-			&e.ID, &e.EventTime, &e.EventType, &e.PID, &e.UID, &e.ProcessName,
+			&e.ID, &e.MachineID, &e.EventTime, &e.EventType, &e.PID, &e.UID, &e.ProcessName,
 			&e.Address, &e.Length, &e.Protection, &e.Flags, &e.FilePath,
 			&e.Severity, &e.Status, &e.Notes, &createdAt,
 		); err != nil {

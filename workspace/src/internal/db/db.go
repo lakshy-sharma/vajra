@@ -15,18 +15,13 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// DB is the package-level handle passed to all query helpers.
 type DB struct {
 	sql    *sql.DB
 	logger *zerolog.Logger
 }
 
-// SQL returns the underlying *sql.DB for use in query files.
 func (d *DB) SQL() *sql.DB { return d.sql }
 
-// Open opens (or creates) the SQLite database at path,
-// applies performance pragmas, runs migrations, and returns
-// a ready-to-use *DB.
 func Open(path string, logger *zerolog.Logger) (*DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, fmt.Errorf("db: create directory: %w", err)
@@ -37,7 +32,6 @@ func Open(path string, logger *zerolog.Logger) (*DB, error) {
 		return nil, fmt.Errorf("db: open: %w", err)
 	}
 
-	// Single writer; WAL lets readers proceed concurrently.
 	sqlDB.SetMaxOpenConns(1)
 
 	d := &DB{sql: sqlDB, logger: logger}
@@ -56,8 +50,6 @@ func Open(path string, logger *zerolog.Logger) (*DB, error) {
 	return d, nil
 }
 
-// OpenReadOnly opens an existing database in read-only mode.
-// Intended for the Wails UI binary or any read-only consumer.
 func OpenReadOnly(path string, logger *zerolog.Logger) (*DB, error) {
 	dsn := fmt.Sprintf("file:%s?mode=ro&_journal_mode=WAL", path)
 	sqlDB, err := sql.Open("sqlite3", dsn)
@@ -67,7 +59,6 @@ func OpenReadOnly(path string, logger *zerolog.Logger) (*DB, error) {
 	return &DB{sql: sqlDB, logger: logger}, nil
 }
 
-// Close closes the underlying connection.
 func (d *DB) Close() error {
 	if d.sql != nil {
 		return d.sql.Close()
@@ -75,12 +66,10 @@ func (d *DB) Close() error {
 	return nil
 }
 
-// Ping verifies the connection is alive.
 func (d *DB) Ping() error {
 	return d.sql.Ping()
 }
 
-// applyPragmas sets SQLite performance and safety settings.
 func (d *DB) applyPragmas() error {
 	pragmas := []string{
 		"PRAGMA journal_mode=WAL",
@@ -99,9 +88,11 @@ func (d *DB) applyPragmas() error {
 
 func (d *DB) migrate() error {
 	stmts := []string{
-		// ---- file_scan_results --------------------------------
+
+		// ── file_scan_results ─────────────────────────────────
 		`CREATE TABLE IF NOT EXISTS file_scan_results (
 			id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			machine_id   TEXT     NOT NULL DEFAULT '',
 			scan_time    INTEGER  NOT NULL,
 			file_path    TEXT     NOT NULL,
 			file_size    INTEGER,
@@ -113,10 +104,12 @@ func (d *DB) migrate() error {
 			trigger_pid  INTEGER,
 			trigger_uid  INTEGER,
 			trigger_comm TEXT,
+			dedup_count  INTEGER  NOT NULL DEFAULT 0,
 			notes        TEXT,
 			created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
 			updated_at   DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
+		`CREATE INDEX IF NOT EXISTS idx_fsr_machine_id ON file_scan_results(machine_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_fsr_scan_time  ON file_scan_results(scan_time)`,
 		`CREATE INDEX IF NOT EXISTS idx_fsr_file_path  ON file_scan_results(file_path)`,
 		`CREATE INDEX IF NOT EXISTS idx_fsr_file_hash  ON file_scan_results(file_hash)`,
@@ -124,9 +117,10 @@ func (d *DB) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_fsr_status     ON file_scan_results(status)`,
 		`CREATE INDEX IF NOT EXISTS idx_fsr_event_type ON file_scan_results(event_type)`,
 
-		// ---- process_scan_results -----------------------------
+		// ── process_scan_results ──────────────────────────────
 		`CREATE TABLE IF NOT EXISTS process_scan_results (
 			id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			machine_id   TEXT     NOT NULL DEFAULT '',
 			scan_time    INTEGER  NOT NULL,
 			pid          INTEGER  NOT NULL,
 			ppid         INTEGER,
@@ -138,23 +132,28 @@ func (d *DB) migrate() error {
 			exe_path     TEXT,
 			cmdline      TEXT,
 			cwd          TEXT,
+			file_hash    TEXT,
 			yara_matches TEXT,
 			severity     TEXT     NOT NULL DEFAULT 'LOW',
 			status       TEXT     NOT NULL DEFAULT 'NEW',
 			event_type   INTEGER,
+			dedup_count  INTEGER  NOT NULL DEFAULT 0,
 			notes        TEXT,
 			created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
 			updated_at   DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_psr_scan_time ON process_scan_results(scan_time)`,
-		`CREATE INDEX IF NOT EXISTS idx_psr_pid       ON process_scan_results(pid)`,
-		`CREATE INDEX IF NOT EXISTS idx_psr_severity  ON process_scan_results(severity)`,
-		`CREATE INDEX IF NOT EXISTS idx_psr_status    ON process_scan_results(status)`,
-		`CREATE INDEX IF NOT EXISTS idx_psr_name      ON process_scan_results(process_name)`,
+		`CREATE INDEX IF NOT EXISTS idx_psr_machine_id ON process_scan_results(machine_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_psr_scan_time  ON process_scan_results(scan_time)`,
+		`CREATE INDEX IF NOT EXISTS idx_psr_pid        ON process_scan_results(pid)`,
+		`CREATE INDEX IF NOT EXISTS idx_psr_severity   ON process_scan_results(severity)`,
+		`CREATE INDEX IF NOT EXISTS idx_psr_status     ON process_scan_results(status)`,
+		`CREATE INDEX IF NOT EXISTS idx_psr_name       ON process_scan_results(process_name)`,
+		`CREATE INDEX IF NOT EXISTS idx_psr_file_hash  ON process_scan_results(file_hash)`,
 
-		// ---- network_events -----------------------------------
+		// ── network_events ────────────────────────────────────
 		`CREATE TABLE IF NOT EXISTS network_events (
 			id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			machine_id   TEXT     NOT NULL DEFAULT '',
 			event_time   INTEGER  NOT NULL,
 			event_type   INTEGER  NOT NULL,
 			pid          INTEGER  NOT NULL,
@@ -170,14 +169,16 @@ func (d *DB) migrate() error {
 			notes        TEXT,
 			created_at   DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
+		`CREATE INDEX IF NOT EXISTS idx_ne_machine_id ON network_events(machine_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_ne_event_time ON network_events(event_time)`,
 		`CREATE INDEX IF NOT EXISTS idx_ne_pid        ON network_events(pid)`,
 		`CREATE INDEX IF NOT EXISTS idx_ne_dst_port   ON network_events(dst_port)`,
 		`CREATE INDEX IF NOT EXISTS idx_ne_severity   ON network_events(severity)`,
 
-		// ---- security_events ----------------------------------
+		// ── security_events ───────────────────────────────────
 		`CREATE TABLE IF NOT EXISTS security_events (
 			id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			machine_id   TEXT     NOT NULL DEFAULT '',
 			event_time   INTEGER  NOT NULL,
 			event_type   INTEGER  NOT NULL,
 			event_name   TEXT     NOT NULL,
@@ -195,15 +196,17 @@ func (d *DB) migrate() error {
 			created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
 			updated_at   DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
+		`CREATE INDEX IF NOT EXISTS idx_se_machine_id ON security_events(machine_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_se_event_time ON security_events(event_time)`,
 		`CREATE INDEX IF NOT EXISTS idx_se_event_type ON security_events(event_type)`,
 		`CREATE INDEX IF NOT EXISTS idx_se_pid        ON security_events(pid)`,
 		`CREATE INDEX IF NOT EXISTS idx_se_severity   ON security_events(severity)`,
 		`CREATE INDEX IF NOT EXISTS idx_se_status     ON security_events(status)`,
 
-		// ---- memory_events ------------------------------------
+		// ── memory_events ─────────────────────────────────────
 		`CREATE TABLE IF NOT EXISTS memory_events (
 			id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			machine_id   TEXT     NOT NULL DEFAULT '',
 			event_time   INTEGER  NOT NULL,
 			event_type   INTEGER  NOT NULL,
 			pid          INTEGER  NOT NULL,
@@ -219,11 +222,12 @@ func (d *DB) migrate() error {
 			notes        TEXT,
 			created_at   DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
+		`CREATE INDEX IF NOT EXISTS idx_me_machine_id ON memory_events(machine_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_me_event_time ON memory_events(event_time)`,
 		`CREATE INDEX IF NOT EXISTS idx_me_pid        ON memory_events(pid)`,
 		`CREATE INDEX IF NOT EXISTS idx_me_severity   ON memory_events(severity)`,
 
-		// ---- autoruns -----------------------------------------
+		// ── autoruns ──────────────────────────────────────────
 		`CREATE TABLE IF NOT EXISTS autoruns (
 			id           INTEGER PRIMARY KEY AUTOINCREMENT,
 			category     TEXT     NOT NULL,
@@ -248,12 +252,12 @@ func (d *DB) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_ar_first_seen ON autoruns(first_seen)`,
 		`CREATE INDEX IF NOT EXISTS idx_ar_last_seen  ON autoruns(last_seen)`,
 
-		// ---- quarantined_files --------------------------------
+		// ── quarantined_files ─────────────────────────────────
 		`CREATE TABLE IF NOT EXISTS quarantined_files (
 			id              INTEGER PRIMARY KEY AUTOINCREMENT,
-			original_path   TEXT    NOT NULL,
-			quarantine_path TEXT    NOT NULL,
-			file_hash       TEXT    NOT NULL,
+			original_path   TEXT     NOT NULL,
+			quarantine_path TEXT     NOT NULL,
+			file_hash       TEXT     NOT NULL,
 			file_size       INTEGER,
 			quarantine_time INTEGER  NOT NULL,
 			related_scan_id INTEGER,
@@ -268,7 +272,7 @@ func (d *DB) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_qf_file_hash       ON quarantined_files(file_hash)`,
 		`CREATE INDEX IF NOT EXISTS idx_qf_severity        ON quarantined_files(severity)`,
 
-		// ---- event_statistics ---------------------------------
+		// ── event_statistics ──────────────────────────────────
 		`CREATE TABLE IF NOT EXISTS event_statistics (
 			id              INTEGER PRIMARY KEY AUTOINCREMENT,
 			date            TEXT    NOT NULL,
@@ -278,6 +282,17 @@ func (d *DB) migrate() error {
 			malicious_count INTEGER NOT NULL DEFAULT 0,
 			clean_count     INTEGER NOT NULL DEFAULT 0,
 			UNIQUE(date, event_type)
+		)`,
+
+		// ── sync_state ────────────────────────────────────────
+		// Watermark table for remote sync. One row per event table.
+		// last_synced_id tracks the highest ID shipped to the server.
+		// Purge job deletes rows with id <= last_synced_id older than retention.
+		`CREATE TABLE IF NOT EXISTS sync_state (
+			table_name     TEXT    PRIMARY KEY,
+			last_synced_id INTEGER NOT NULL DEFAULT 0,
+			last_synced_at INTEGER NOT NULL DEFAULT 0,
+			synced_rows    INTEGER NOT NULL DEFAULT 0
 		)`,
 	}
 

@@ -13,17 +13,13 @@ import (
 // Rules are checked in priority order — first match at a given
 // level wins. Rule-name prefix conventions:
 //
-//	APT_*        → CRITICAL (nation-state / advanced threat)
-//	Ransomware*  → CRITICAL (data destruction risk)
-//	Exploit*     → HIGH     (active exploitation attempt)
-//	3+ matches   → HIGH     (correlated multi-rule hit)
-//	1-2 matches  → MEDIUM   (single indicator)
-//	0 matches    → CLEAN
-//
-// This function is the single place severity logic lives.
-// Both filescanner and processscanner use it. When the
-// Analyzer interface is added, this becomes one step in the
-// pipeline and can be extended without touching job code.
+//	APT_*, MALWARE_*, MAL_*   → CRITICAL (known malware / APT)
+//	Ransomware*                → CRITICAL (data destruction risk)
+//	Exploit*, EXPL_*, HKTL_*  → HIGH     (exploitation / hacktools)
+//	SUSP_*                     → MEDIUM   (suspicious indicator)
+//	3+ matches (any prefix)    → HIGH     (correlated hit)
+//	1-2 matches                → MEDIUM
+//	0 matches                  → CLEAN
 func ClassifyYARASeverity(matches []models.YaraMatch) models.EventSeverity {
 	if len(matches) == 0 {
 		return models.SeverityClean
@@ -36,8 +32,23 @@ func ClassifyYARASeverity(matches []models.YaraMatch) models.EventSeverity {
 		if hasPrefix(m.Rule, "Ransomware") {
 			return models.SeverityCritical
 		}
+		if hasPrefix(m.Rule, "MALWARE_") {
+			return models.SeverityCritical
+		}
+		if hasPrefix(m.Rule, "MAL_") {
+			return models.SeverityCritical
+		}
 		if hasPrefix(m.Rule, "Exploit") {
 			return models.SeverityHigh
+		}
+		if hasPrefix(m.Rule, "EXPL_") {
+			return models.SeverityHigh
+		}
+		if hasPrefix(m.Rule, "HKTL_") {
+			return models.SeverityHigh
+		}
+		if hasPrefix(m.Rule, "SUSP_") {
+			return models.SeverityMedium
 		}
 	}
 

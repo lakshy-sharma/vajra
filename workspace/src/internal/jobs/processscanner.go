@@ -12,79 +12,59 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
-
+	"vajra/internal/analyzer"
 	"vajra/internal/db/queries"
 	"vajra/internal/ebpf"
 	"vajra/internal/scanner"
+	"vajra/internal/utilities"
 	"vajra/shared/models"
 )
 
-// ProcessScanner consumes ProcessEvents from the eBPF dispatcher,
-// scans the executed binary via the YARA pool, and persists
-// results via ProcessQueries.
-//
-// Pipeline per event:
-//
-//	ProcessEvent
-//	  → ProcessFilter.IsTrusted()      — skip known-safe processes
-//	  → RecentScanTracker              — TTL dedup by exe path
-//	  → resolve exe path               — /proc/PID/exe symlink
-//	  → scanner.Pool.Enqueue()         — blocking submit to YARA
-//	  → result → ClassifyYARASeverity
-//	  → ProcessQueries.Insert()
-//
-// Note: we scan the exe path, not a filename from the event.
-// The event Filename is what was passed to execve — the kernel
-// may have resolved it differently. /proc/PID/exe is always
-// the canonical resolved path of the running binary.
 type ProcessScanner struct {
-	logger  *zerolog.Logger
-	pool    *scanner.Pool
-	queries *queries.ProcessQueries
-	filter  *scanner.ProcessFilter
-	tracker *scanner.RecentScanTracker
+	logger          *zerolog.Logger
+	contentPipeline *analyzer.Pipeline
+	runtimePipeline *analyzer.Pipeline
+	queries         *queries.ProcessQueries
+	filter          *scanner.ProcessFilter
+	tracker         *scanner.RecentScanTracker
+	dedup           *scanner.DedupTracker
+	sysInfo         utilities.SystemInfo
 }
 
-// NewProcessScanner constructs a ProcessScanner.
 func NewProcessScanner(
 	logger *zerolog.Logger,
-	pool *scanner.Pool,
+	contentPipeline *analyzer.Pipeline,
+	runtimePipeline *analyzer.Pipeline,
 	pq *queries.ProcessQueries,
 	filter *scanner.ProcessFilter,
+	dedupWindow time.Duration,
+	sysInfo utilities.SystemInfo,
 ) *ProcessScanner {
 	return &ProcessScanner{
-		logger:  logger,
-		pool:    pool,
-		queries: pq,
-		filter:  filter,
-		// 10 minute TTL for processes — a binary executing again
-		// within 10 minutes is almost certainly the same bytes.
-		tracker: scanner.NewRecentScanTracker(10 * time.Minute),
+		logger:          logger,
+		contentPipeline: contentPipeline,
+		runtimePipeline: runtimePipeline,
+		queries:         pq,
+		filter:          filter,
+		tracker:         scanner.NewRecentScanTracker(10 * time.Minute),
+		dedup:           scanner.NewDedupTracker(dedupWindow),
+		sysInfo:         sysInfo,
 	}
 }
 
-// Run consumes from procCh until ctx is cancelled.
-// Intended to be launched as a goroutine via service.go.
-// wg.Done() is called on return.
-func (ps *ProcessScanner) Run(
-	ctx context.Context,
-	wg *sync.WaitGroup,
-	procCh <-chan ebpf.ProcessEvent,
-) {
+func (ps *ProcessScanner) Run(ctx context.Context, wg *sync.WaitGroup, procCh <-chan ebpf.ProcessEvent) {
 	defer wg.Done()
-
 	ps.logger.Info().Msg("process scanner started")
-
 	for {
 		select {
 		case <-ctx.Done():
 			ps.logger.Info().Msg("process scanner stopped")
 			return
-
 		case event, ok := <-procCh:
 			if !ok {
 				return
@@ -94,160 +74,103 @@ func (ps *ProcessScanner) Run(
 	}
 }
 
-// handle processes a single ProcessEvent through the pipeline.
 func (ps *ProcessScanner) handle(ctx context.Context, event ebpf.ProcessEvent) {
 	comm := ebpf.CStringToGo(event.Comm[:])
 
-	// ── Stage 1: process filter ───────────────────────────────
-	// Trusted processes (e.g. package managers, known system
-	// daemons) are skipped entirely. This is configured via
-	// ExclusionRules.ExcludeProcesses in config.yaml.
-	if ps.filter.IsTrusted(comm) {
-		ps.logger.Debug().
-			Str("comm", comm).
-			Uint32("pid", event.PID).
-			Msg("process scanner: trusted process skipped")
-		return
-	}
-
-	// ── Stage 2: resolve canonical exe path ───────────────────
-	// We prefer /proc/PID/exe over event.Filename because:
-	// 1. execve filename may be relative or unresolved.
-	// 2. The binary is guaranteed to still be mapped at this
-	//    point since we're on the enter probe.
-	// If the proc symlink fails we fall back to event.Filename.
+	// ── Stage 1: resolve exe path ─────────────────────────────
 	exePath := ps.resolveExePath(event.PID, event.Filename[:])
 	if exePath == "" {
-		ps.logger.Debug().
-			Uint32("pid", event.PID).
-			Str("comm", comm).
-			Msg("process scanner: could not resolve exe path, skipping")
+		ps.logger.Debug().Uint32("pid", event.PID).Str("comm", comm).Msg("process scanner: could not resolve exe path, skipping")
 		return
 	}
 
-	// ── Stage 3: recent scan dedup ────────────────────────────
-	// Key on exe path — same binary executing repeatedly should
-	// not trigger repeated scans within the TTL window.
+	// ── Stage 2: recent scan dedup ────────────────────────────
 	if ps.tracker.WasRecentlyScanned(exePath, "") {
-		ps.logger.Debug().
-			Str("exe", exePath).
-			Msg("process scanner: recently scanned, skipping")
+		ps.logger.Debug().Str("exe", exePath).Msg("process scanner: recently scanned, skipping")
 		return
 	}
 	ps.tracker.MarkScanned(exePath, "")
 
-	// ── Stage 4: submit to YARA pool (blocking) ───────────────
-	resultCh := make(chan scanner.ScanResult, 1)
+	// ── Stage 3: attach PID to context ────────────────────────
+	pCtx := analyzer.CtxWithPID(ctx, event.PID)
 
-	if !ps.pool.Enqueue(ctx, exePath, resultCh) {
-		return
+	// ── Stage 4: runtime pipeline ─────────────────────────────
+	runtimeResult, err := ps.runtimePipeline.RunUncached(pCtx, exePath)
+	if err != nil {
+		ps.logger.Error().Err(err).Str("exe", exePath).Msg("process scanner: runtime pipeline error")
 	}
 
-	// ── Stage 5: collect result and persist ───────────────────
-	select {
-	case <-ctx.Done():
-		return
-	case result := <-resultCh:
-		ps.persist(result, event, comm, exePath)
-	}
-}
-
-// resolveExePath returns the canonical path of the executed binary.
-// Resolution order:
-//  1. /proc/PID/exe symlink — always preferred, always the real path
-//  2. event.Filename fallback — only if absolute and stat-able
-//
-// Returns empty string when neither source yields a scannable path.
-// All non-error conditions (process already gone, AppImage mounts,
-// failed PATH candidates) are logged at debug, not error.
-func (ps *ProcessScanner) resolveExePath(pid uint32, filenameBuf []byte) string {
-	procLink := fmt.Sprintf("/proc/%d/exe", pid)
-
-	resolved, err := os.Readlink(procLink)
-	if err == nil && resolved != "" {
-		// Verify we can actually stat it — AppImage FUSE mounts
-		// resolve the symlink but are inaccessible to root.
-		if _, statErr := os.Stat(resolved); statErr == nil {
-			return resolved
+	// ── Stage 5: content pipeline ─────────────────────────────
+	contentResult := analyzer.AnalysisResult{Severity: models.SeverityClean}
+	if !ps.filter.IsTrusted(comm) {
+		fileHash, err := scanner.FullSHA256(exePath)
+		if err != nil {
+			ps.logger.Debug().Err(err).Str("exe", exePath).Msg("process scanner: could not hash exe, skipping content pipeline")
 		} else {
-			ps.logger.Debug().
-				Err(statErr).
-				Str("exe", resolved).
-				Uint32("pid", pid).
-				Msg("process scanner: exe path inaccessible (AppImage or user-namespace mount), skipping")
-			return ""
+			contentResult, err = ps.contentPipeline.Run(pCtx, exePath, fileHash)
+			if err != nil {
+				ps.logger.Error().Err(err).Str("exe", exePath).Msg("process scanner: content pipeline error")
+			}
 		}
+	} else {
+		ps.logger.Debug().Str("comm", comm).Uint32("pid", event.PID).Msg("process scanner: trusted process, skipping content pipeline")
 	}
 
-	// /proc/PID/exe failed — process likely already exited.
-	// Fall back to event.Filename only if it is an absolute
-	// path that exists right now. Relative paths and PATH
-	// candidates that failed (shell resolution attempts) are
-	// dropped here rather than producing spurious scan errors.
-	name := ebpf.CStringToGo(filenameBuf)
-
-	if name == "" {
-		ps.logger.Debug().
-			Uint32("pid", pid).
-			Msg("process scanner: no exe path available, skipping")
-		return ""
+	// ── Stage 6: merge ────────────────────────────────────────
+	merged := analyzer.MergeResults(contentResult, runtimeResult)
+	if merged.Skip {
+		ps.logger.Debug().Str("exe", exePath).Msg("process scanner: clean cached result, skipping insert")
+		return
 	}
 
-	if !filepath.IsAbs(name) {
-		ps.logger.Debug().
-			Str("filename", name).
-			Uint32("pid", pid).
-			Msg("process scanner: relative path from execve, skipping")
-		return ""
-	}
-
-	if _, statErr := os.Stat(name); statErr != nil {
-		// This is a failed PATH candidate from shell resolution —
-		// the execve never succeeded so there is nothing to scan.
-		ps.logger.Debug().
-			Str("filename", name).
-			Uint32("pid", pid).
-			Msg("process scanner: execve candidate does not exist, skipping")
-		return ""
-	}
-
-	return name
+	// ── Stage 7: persist ──────────────────────────────────────
+	ps.persist(merged, event, comm, exePath)
 }
 
-// persist writes a scan result to the database.
 func (ps *ProcessScanner) persist(
-	result scanner.ScanResult,
+	merged analyzer.AnalysisResult,
 	event ebpf.ProcessEvent,
 	comm string,
 	exePath string,
 ) {
-	if result.Error != nil {
-		ps.logger.Debug().
-			Err(result.Error).
-			Str("exe", exePath).
-			Uint32("pid", event.PID).
-			Msg("process scanner: scan skipped")
+	if merged.Severity == models.SeverityClean {
+		ps.logger.Debug().Str("exe", exePath).Str("comm", comm).Uint32("pid", event.PID).Msg("process scanner: clean")
 		return
 	}
 
-	severity := scanner.ClassifyYARASeverity(result.Matches)
+	rule := scanner.RuleFromNotes(merged.Notes, merged.YaraMatches)
+	key := scanner.BuildKey(rule, exePath, merged.Severity)
+	shouldInsert, entry := ps.dedup.CheckAndRecord(key)
 
-	// Collect full process metadata for the DB record.
-	cmdLine := ebpf.CStringToGo(event.Args[:])
-	cwd := ebpf.CStringToGo(event.CWD[:])
-
-	// For clean results we still record the process execution
-	// so the process table gives a complete audit trail.
-	// Only compute the full hash for non-clean results.
-	fileHash := ""
-	if severity != models.SeverityClean {
-		if h, err := scanner.FullSHA256(exePath); err == nil {
-			fileHash = h
+	if !shouldInsert {
+		if entry.RecordID != 0 {
+			if err := ps.queries.IncrementDedupCount(entry.RecordID); err != nil {
+				ps.logger.Error().Err(err).Int64("record_id", entry.RecordID).Msg("process scanner: dedup increment failed")
+			}
 		}
+		ps.logger.Debug().Str("exe", exePath).Str("rule", rule).Uint64("count", entry.Count).Msg("process scanner: duplicate detection suppressed")
+		return
+	}
+
+	// Full cmdline from /proc — eBPF only captures argv[1].
+	cmdLine := readCmdline(event.PID)
+	if cmdLine == "" {
+		cmdLine = ebpf.CStringToGo(event.Args[:])
+	}
+
+	// CWD from /proc — eBPF only gives last path component.
+	cwd := readCWD(event.PID)
+	if cwd == "" {
+		cwd = ebpf.CStringToGo(event.CWD[:])
+	}
+
+	fileHash := ""
+	if h, err := scanner.FullSHA256(exePath); err == nil {
+		fileHash = h
 	}
 
 	record := &models.ProcessScanResult{
-		ScanTime:    time.Now().Unix(),
+		ScanTime:    ps.sysInfo.EBPFTimestampToUnix(event.Timestamp),
 		PID:         event.PID,
 		PPID:        event.PPID,
 		UID:         event.UID,
@@ -258,39 +181,73 @@ func (ps *ProcessScanner) persist(
 		ExePath:     exePath,
 		CmdLine:     cmdLine,
 		CWD:         cwd,
-		YaraMatches: result.Matches,
-		Severity:    severity,
+		FileHash:    fileHash,
+		YaraMatches: merged.YaraMatches,
+		Severity:    merged.Severity,
 		Status:      models.StatusNew,
 		EventType:   event.Type,
-		Notes:       fileHash,
+		DedupCount:  1,
+		Notes:       merged.Notes,
+		MachineID:   ps.sysInfo.MachineID,
 	}
 
 	if err := ps.queries.Insert(record); err != nil {
-		ps.logger.Error().
-			Err(err).
-			Str("exe", exePath).
-			Uint32("pid", event.PID).
-			Msg("process scanner: DB insert failed")
+		ps.logger.Error().Err(err).Str("exe", exePath).Uint32("pid", event.PID).Msg("process scanner: DB insert failed")
 		return
 	}
 
-	if severity != models.SeverityClean {
-		ps.logger.Warn().
-			Str("exe", exePath).
-			Str("comm", comm).
-			Uint32("pid", event.PID).
-			Uint32("ppid", event.PPID).
-			Uint32("uid", event.UID).
-			Str("severity", string(severity)).
-			Int("yara_matches", len(result.Matches)).
-			Dur("scan_duration", result.Duration).
-			Msg("PROCESS SCAN DETECTION")
-	} else {
-		ps.logger.Debug().
-			Str("exe", exePath).
-			Str("comm", comm).
-			Uint32("pid", event.PID).
-			Dur("scan_duration", result.Duration).
-			Msg("process scanner: clean")
+	ps.dedup.RecordInsert(key, record.ID)
+
+	ps.logger.Warn().
+		Str("exe", exePath).
+		Str("comm", comm).
+		Uint32("pid", event.PID).
+		Str("cmdline", cmdLine).
+		Str("severity", string(merged.Severity)).
+		Int("yara_matches", len(merged.YaraMatches)).
+		Str("notes", merged.Notes).
+		Msg("PROCESS SCAN DETECTION")
+}
+
+func (ps *ProcessScanner) resolveExePath(pid uint32, filenameBuf []byte) string {
+	procLink := fmt.Sprintf("/proc/%d/exe", pid)
+	resolved, err := os.Readlink(procLink)
+	if err == nil && resolved != "" {
+		if _, statErr := os.Stat(resolved); statErr == nil {
+			return resolved
+		}
+		ps.logger.Debug().Str("exe", resolved).Uint32("pid", pid).Msg("process scanner: exe path inaccessible, skipping")
+		return ""
 	}
+	name := ebpf.CStringToGo(filenameBuf)
+	if name == "" || !filepath.IsAbs(name) {
+		return ""
+	}
+	if _, statErr := os.Stat(name); statErr != nil {
+		return ""
+	}
+	return name
+}
+
+// readCmdline reads the full command line from /proc/PID/cmdline.
+// The file is null-delimited; we replace nulls with spaces.
+// Returns empty string if the process has already exited.
+func readCmdline(pid uint32) string {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil || len(data) == 0 {
+		return ""
+	}
+	// Trim trailing null then replace all nulls with spaces.
+	data = []byte(strings.TrimRight(string(data), "\x00"))
+	return strings.ReplaceAll(string(data), "\x00", " ")
+}
+
+// readCWD resolves /proc/PID/cwd to the full working directory path.
+// Returns empty string if the process has already exited.
+func readCWD(pid uint32) string {
+	cwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", pid))
+	if err != nil {
+		return ""
+	}
+	return cwd
 }

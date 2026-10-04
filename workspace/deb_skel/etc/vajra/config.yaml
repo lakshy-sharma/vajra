@@ -14,24 +14,32 @@ timing_settings:
   database_cleanup_time_hour: 24
   database_retention_days: 90
   shutdown_timeout_sec: 30
-  single_file_scan_timeout_sec: 60
+  single_file_scan_timeout_sec: 30
+  dedup_window_min: 5
 
 performance_settings:
-  default_threads: 2
+  default_threads: 1
   max_allowed_threads: 3
   scan_queue_size: 1000
   file_scan_buffer_size: 100
 
+rules_settings:
+  rules_filepath: "./deb_skel/opt/vajra/rules.zip"
+  rules_archive_dir: "/opt/vajra/rules-archive"
+  rules_remote_url: "https://github.com/YARAHQ/yara-forge/releases/latest/download/yara-forge-rules-core.zip"
+  rules_remote_hash_url: "https://github.com/YARAHQ/yara-forge/releases/latest/download/yara-forge-rules-core.zip.sha256"
+  rules_sync_interval_hour: 24
+  rules_archive_count: 7
+
 scan_settings:
-  target_directory: "/home/lakshy/Citadel/Filling Cabinet/"
-  rules_filepath: "../rules.zip"
+  target_directory: "/home/lakshy/Citadel"
   exclusion_rules:
     exclude_paths:
     exclude_extensions:
-      - swp
-      - lock
-      - pid
-      - socket
+      - .swp
+      - .lock
+      - .pid
+      - .socket
     exclude_patterns:
     exclude_processes:
       - gopls
