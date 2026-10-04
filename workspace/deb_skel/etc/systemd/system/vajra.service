@@ -1,21 +1,47 @@
 [Unit]
-Description=Vajra EDR service
-After=network.target
+Description=Vajra EDR — endpoint detection and response
+Documentation=https://github.com/lakshy-sharma/vajra
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 User=vajra
 Group=vajra
 Type=exec
-LimitNOFILE=16384
+
+# Resource limits.
+LimitNOFILE=65536
+LimitNPROC=512
+
+# Restart policy — always restart on failure with 5s backoff.
 Restart=always
 RestartSec=5
+
+# Logging via journald.
 StandardOutput=journal
 StandardError=journal
-AmbientCapabilities=CAP_BPF,CAP_PERFMON,CAP_NET_ADMIN
+SyslogIdentifier=vajra
+
+# Capabilities required for eBPF and network monitoring.
+# CAP_BPF        — load and manage BPF programs
+# CAP_PERFMON    — attach perf events (BPF maps)
+# CAP_NET_ADMIN  — network monitoring and iptables for response
+# CAP_SYS_ADMIN  — BTF CO-RE access on some kernels
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_SYS_ADMIN
+
+# Hardening.
 NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/vajra /var/log/vajra /opt/vajra
+PrivateTmp=yes
+PrivateDevices=no
+ProtectKernelTunables=no
+ProtectKernelModules=no
+ProtectControlGroups=no
+
 ExecStart=/opt/vajra/vajra -c /etc/vajra/config.yaml
 
 [Install]
-WantedBy=default.target
-RequiredBy=network.target
-Alias=vajra.service
+WantedBy=multi-user.target

@@ -3,21 +3,45 @@
 set -e
 
 setup_user_and_group() {
-    groupadd vajra &&
-    useradd -M -s /usr/sbin/nologin vajra &&
-    usermod -aG vajra vajra;
+  if ! getent group vajra >/dev/null 2>&1; then
+    groupadd --system vajra
+  fi
+  if ! getent passwd vajra >/dev/null 2>&1; then
+    useradd \
+      --system \
+      --no-create-home \
+      --shell /usr/sbin/nologin \
+      --gid vajra \
+      vajra
+  fi
+}
+
+create_directories() {
+  # Runtime and database storage.
+  mkdir -p /var/lib/vajra
+  mkdir -p /var/lib/vajra/rules-archive
+  mkdir -p /var/log/vajra
+
+  # Ensure log file exists for lumberjack.
+  touch /var/log/vajra/vajra.log
 }
 
 transfer_ownership() {
-    chown -R vajra:vajra /etc/vajra &&
-    chown -R vajra:vajra /opt/vajra &&
-    chown -R vajra:vajra /var/log/vajra;
+  chown -R vajra:vajra /etc/vajra
+  chown -R vajra:vajra /opt/vajra
+  chown -R vajra:vajra /var/lib/vajra
+  chown -R vajra:vajra /var/log/vajra
 }
 
 enable_service() {
-    systemctl enable vajra
+  systemctl daemon-reload
+  systemctl enable vajra
 }
 
-setup_user_and_group &&
-transfer_ownership &&
+setup_user_and_group
+create_directories
+transfer_ownership
 enable_service
+
+echo "Vajra installed. Start with: systemctl start vajra"
+
