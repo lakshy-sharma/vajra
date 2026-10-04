@@ -1,4 +1,9 @@
 /*
+internal/entrypoint.go
+Package internal for the vajra project.
+All function declared here are supposed to be used inside the project and
+the function APIs are subject to change at authr's discretion.
+
 Copyright © 2025 Lakshy Sharma lakshy.d.sharma@gmail.com
 
 This program is free software: you can redistribute it and/or modify
@@ -18,58 +23,17 @@ package internal
 
 import (
 	"os"
-	"runtime"
-	"time"
-	"vajra/internal/database"
-	"vajra/internal/utilities"
+	"path/filepath"
 
-	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
-	"github.com/shirou/gopsutil/v3/cpu"
-	"github.com/shirou/gopsutil/v3/process"
+	"vajra/internal/db"
+	"vajra/internal/utilities"
 )
 
-// Capture the system metrics periodically
-func logMetrics(logger *zerolog.Logger) {
-	// Complete system cpu usage over 100 ms
-	cpuPercents, err := cpu.Percent(100*time.Millisecond, false)
-	systemCPU := 0.0
-	if err == nil && len(cpuPercents) > 0 {
-		systemCPU = cpuPercents[0] // total across all cores
-	}
-
-	// Fetch current process details
-	p, err := process.NewProcess(int32(os.Getpid()))
-	procCPU := 0.0
-	procRSS := uint64(0)
-	if err == nil {
-		if c, err := p.CPUPercent(); err == nil {
-			procCPU = c // process CPU %
-		}
-		if m, err := p.MemoryInfo(); err == nil {
-			procRSS = m.RSS // resident memory in bytes
-		}
-	}
-
-	// Fetch runtime memory statistics
-	var mem runtime.MemStats
-	runtime.ReadMemStats(&mem)
-
-	logger.Info().
-		Float64("system_cpu_percent", systemCPU).
-		Float64("process_cpu_percent", procCPU).
-		Uint64("process_rss_mb", procRSS/1024/1024). // closer to htop RES
-		Uint64("current_heap_mb", mem.Alloc/1024/1024).
-		Uint64("total_heap_mb", mem.TotalAlloc/1024/1024).
-		Uint64("allocated_system_memory_mb", mem.Sys/1024/1024).
-		Uint32("garbage_cycle_count", mem.NumGC).
-		Msg("process stats")
-}
-
-// This is the main function which parses complete config and starts relevant activities
-func Entrypoint(config_path string) {
+// Entrypoint function to parse the configurations and start services.
+func Entrypoint(configPath string) {
 	// Parse the configuration file and load it.
-	AppConfig, err := utilities.LoadConfig(config_path)
+	AppConfig, err := utilities.LoadConfig(configPath)
 	if err != nil {
 		log.Error().Msg("failed to load configuration")
 	}
@@ -77,43 +41,40 @@ func Entrypoint(config_path string) {
 	// Setup logger
 	logger := utilities.GetLogger(AppConfig)
 
-	// Setup temp directory for working.
-	if err := os.MkdirAll(AppConfig.GenericSettings.WorkDirectory, 0755); err != nil {
-		logger.Error().Err(err).Str("recommended_action", "change your work directory").Msg("failed to setup work directory.")
+	// Setup work directory
+	if err := os.MkdirAll(AppConfig.GenericSettings.WorkDirectory, 0o755); err != nil {
+		logger.Error().Err(err).Str("recommendation", "change your work directory").Msg("failed to setup work directory.")
 		return
 	}
 
-	// Create the required folder and setup the Database.
-	// Generate a dbHandler here which can be passed down to other objects.
-	if err := os.MkdirAll(AppConfig.GenericSettings.DbDirectory, 0755); err != nil {
-		logger.Error().Err(err).Str("recommended_action", "change your db directory").Msg("failed to setup database directory")
+	// Create the required folder and setup the DB.
+	// Create a dbHandler to pass into another database.
+	if err := os.MkdirAll(AppConfig.GenericSettings.DBDirectory, 0o755); err != nil {
+		logger.Error().Err(err).Str("recommendation", "change your db directory").Msg("failed to setup database directory")
 		return
 	}
-	dbHandler := database.NewDBHandler(AppConfig, logger)
-	dbHandler.SetupDatabase()
-
-	// Start monitoring goroutine
-	go func() {
-		ticker := time.NewTicker(time.Duration(AppConfig.GenericSettings.MonitoringTimeSec) * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			logMetrics(logger)
-		}
-	}()
-
+	dbPath := filepath.Join(AppConfig.GenericSettings.DBDirectory, AppConfig.GenericSettings.DBFilename)
+	database, err := db.Open(dbPath, logger)
+	if err != nil {
+		logger.Fatal().Err(err).Msg("failed to open database")
+		return
+	}
+	defer database.Close()
 	// Log startup information
 	logger.Info().
 		Str("version", "0.0.1").
 		Str("mode", AppConfig.GenericSettings.OperationMode).
 		Str("target", AppConfig.ScanSettings.TargetDirectory).
 		Str("rules", AppConfig.ScanSettings.RulesFilepath).
-		Msg("Vajra EDR is starting")
+		Int("pid", os.Getpid()).
+		Msg("starting_vajra_edr")
 
+	// Start main operations.
 	switch AppConfig.GenericSettings.OperationMode {
-	// case "instant_scan":
+	// case "quick_scan":
 	// runInstantScan(logger, &AppConfig, dbHandler)
-	case "service_mode":
-		startServiceMode(logger, &AppConfig, dbHandler)
+	case "monitor":
+		startServiceMode(logger, &AppConfig, database)
 	default:
 		logger.Fatal().
 			Str("mode", AppConfig.GenericSettings.OperationMode).

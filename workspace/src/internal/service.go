@@ -1,95 +1,147 @@
-/*
-Copyright © 2025 Lakshy Sharma lakshy.d.sharma@gmail.com
+// internal/service.go
+//
+// Copyright © 2025 Lakshy Sharma lakshy.d.sharma@gmail.com
+// AGPL-3.0 License
 
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU Affero General Public License as
-published by the Free Software Foundation, either version 3 of the
-License, or (at your option) any later version.
+//go:build linux
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU Affero General Public License for more details.
-
-You should have received a copy of the GNU Affero General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
-*/
 package internal
 
 import (
 	"context"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
-	"vajra/internal/database"
-	"vajra/internal/eBPFHandlers"
-	"vajra/internal/eBPFListeners"
-	"vajra/internal/jobs"
-	"vajra/internal/utilities"
 
 	"github.com/rs/zerolog"
+	"vajra/internal/db"
+	"vajra/internal/db/queries"
+	"vajra/internal/ebpf"
+	"vajra/internal/jobs"
+	"vajra/internal/jobs/autoruns"
+	"vajra/internal/scanner"
+	"vajra/internal/utilities"
 )
 
-// startServiceMode runs the EDR in continuous monitoring mode
-func startServiceMode(logger *zerolog.Logger, config *utilities.Config, dbHandler *database.DBHandler) {
-	logger.Info().Msg("starting service mode")
+func startServiceMode(logger *zerolog.Logger, cfg *utilities.Config, database *db.DB) {
+	logger.Info().Msg("starting monitoring mode")
 
-	// Create the eBPF handler for processing events from eBPF.
-	eventHandler, err := eBPFHandlers.NewEventHandler(logger, config, dbHandler)
-	if err != nil {
-		logger.Fatal().Err(err).Msg("failed to create eBPF event handler")
-	}
-	defer eventHandler.Stop()
-
-	// Create and start eBPF event generator to capture eBPF events.
-	gen, err := eBPFListeners.NewEventGenerator(eventHandler.EventListener)
-	if err != nil {
-		logger.Fatal().Err(err).Msg("failed to create eBPF event generator")
-	}
-	defer gen.Stop()
-	if err := gen.Start(); err != nil {
-		logger.Fatal().Err(err).Msg("failed to start event generator")
-	}
-	logger.Info().Msg("eBPF monitoring started with YARA scanning enabled")
-
-	// Define wait groups and context with a cancel function
-	// for performing clean shutdown.
-	var wg sync.WaitGroup
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Setup signal channels for stopping code on events.
-	errChan := make(chan error, 2)
+	var wg sync.WaitGroup
+
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// TODO
-	// Start periodic full system scans
+	// ── YARA rule compilation ─────────────────────────────────
+	rulesCompiler := scanner.NewRulesCompiler(logger)
+	extractionPath := filepath.Join(cfg.GenericSettings.WorkDirectory, "rules")
 
-	// Start database cleanup task
-	wg.Add(1)
-	go jobs.RunDBCleanup(ctx, &wg, logger, dbHandler, config)
-	wg.Add(1)
-	go jobs.RunAutorunScan(ctx, &wg, logger, dbHandler, config)
-
-	logger.Info().Msg("service mode active, press Ctrl+C to stop")
-
-	// Wait for shutdown signal
-	select {
-	case sig := <-sigChan:
-		logger.Info().
-			Str("signal", sig.String()).
-			Msg("received shutdown signal, initiating graceful shutdown")
-	case err := <-errChan:
-		logger.Error().
-			Err(err).
-			Msg("critical error occurred, initiating shutdown")
+	if err := rulesCompiler.ExtractRules(cfg.ScanSettings.RulesFilepath, extractionPath); err != nil {
+		logger.Fatal().Err(err).Msg("failed to extract YARA rules")
 	}
 
-	// Shutdown sequence
-	logger.Info().Msg("shutting down services...")
+	yaraRules, err := rulesCompiler.CompileRules(extractionPath)
+	if err != nil {
+		logger.Fatal().Err(err).Msg("failed to compile YARA rules")
+	}
+
+	// ── Scanner pool ──────────────────────────────────────────
+	pool := scanner.NewPool(
+		yaraRules,
+		cfg.PerformanceSettings.DefaultThreads,
+		cfg.PerformanceSettings.MaxAllowedThreads,
+		cfg.PerformanceSettings.ScanQueueSize,
+		cfg.TimingSettings.SingleFileScanTimeoutSec,
+		logger,
+	)
+	defer pool.Stop()
+
+	// ── Shared filters ────────────────────────────────────────
+	exclusionFilter := scanner.NewExclusionFilter(cfg)
+	processFilter := scanner.NewProcessFilter(cfg)
+
+	// ── eBPF typed channel bundle ─────────────────────────────
+	// Buffer depth matches the YARA pool queue size so neither
+	// side starves the other under burst load.
+	channels := ebpf.NewChannels(cfg.PerformanceSettings.ScanQueueSize)
+
+	// ── eBPF listener ─────────────────────────────────────────
+	listener, err := ebpf.NewListener(logger)
+	if err != nil {
+		logger.Fatal().Err(err).Msg("failed to create eBPF listener")
+	}
+	defer listener.Stop()
+
+	// rawCh sits between listener and dispatcher.
+	// Same buffer depth as the typed channels.
+	rawCh := make(chan ebpf.RawEvent, cfg.PerformanceSettings.ScanQueueSize)
+
+	if err := listener.Start(ctx, rawCh); err != nil {
+		logger.Fatal().Err(err).Msg("failed to start eBPF listener")
+	}
+
+	// ── eBPF dispatcher ───────────────────────────────────────
+	dispatcher := ebpf.NewDispatcher(logger)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		dispatcher.Run(ctx, rawCh, channels)
+	}()
+
+	// ── DB cleanup job ────────────────────────────────────────
+	wg.Add(1)
+	go jobs.RunDBCleanup(
+		ctx,
+		&wg,
+		logger,
+		queries.NewCleanupQueries(database),
+		cfg.TimingSettings.DatabaseCleanupTimeHour,
+		cfg.TimingSettings.DatabaseRetentionDays,
+	)
+
+	// ── Autorun scanner job ───────────────────────────────────
+	wg.Add(1)
+	go autoruns.RunAutorunScan(
+		ctx,
+		&wg,
+		logger,
+		database,
+		cfg.TimingSettings.AutorunScanTimeMin,
+	)
+	jobs.DrainChannels(ctx, &wg, logger, channels)
+	// ── File scanner job ──────────────────────────────────────
+	fileScanner := jobs.NewFileScanner(
+		logger,
+		pool,
+		queries.NewFileQueries(database),
+		exclusionFilter,
+	)
+	wg.Add(1)
+	go fileScanner.Run(ctx, &wg, channels.File)
+
+	// ── Process scanner job ───────────────────────────────────
+	processScanner := jobs.NewProcessScanner(
+		logger,
+		pool,
+		queries.NewProcessQueries(database),
+		processFilter,
+	)
+	wg.Add(1)
+	go processScanner.Run(ctx, &wg, channels.Process)
+
+	logger.Info().Msg("monitoring active — press Ctrl+C to stop")
+
+	select {
+	case sig := <-sigChan:
+		logger.Info().Str("signal", sig.String()).Msg("shutdown signal received")
+	}
+
+	logger.Info().Msg("shutting down...")
 	cancel()
 
 	done := make(chan struct{})
@@ -100,8 +152,8 @@ func startServiceMode(logger *zerolog.Logger, config *utilities.Config, dbHandle
 
 	select {
 	case <-done:
-		logger.Info().Msg("all services stopped successfully")
-	case <-time.After(time.Duration(config.TimingSettings.ShutdownTimeoutSec) * time.Second):
+		logger.Info().Msg("clean shutdown complete")
+	case <-time.After(time.Duration(cfg.TimingSettings.ShutdownTimeoutSec) * time.Second):
 		logger.Warn().Msg("shutdown timeout exceeded, forcing exit")
 	}
 }

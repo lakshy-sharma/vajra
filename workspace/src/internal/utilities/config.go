@@ -1,19 +1,4 @@
-/*
-Copyright © 2025 Lakshy Sharma lakshy.d.sharma@gmail.com
-
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU Affero General Public License as
-published by the Free Software Foundation, either version 3 of the
-License, or (at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU Affero General Public License for more details.
-
-You should have received a copy of the GNU Affero General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
-*/
+// internal/utilities/config.go
 package utilities
 
 import (
@@ -38,39 +23,31 @@ type APIServerSettings struct {
 }
 
 type GenericSettings struct {
-	OperationMode     string `yaml:"operation_mode"`
-	WorkDirectory     string `yaml:"work_directory"`
-	DbDirectory       string `yaml:"db_directory"`
-	DbFilename        string `yaml:"db_filename"`
-	MonitoringTimeSec int    `yaml:"monitoring_timer_sec"`
+	OperationMode string `yaml:"operation_mode"`
+	WorkDirectory string `yaml:"work_directory"`
+	DBDirectory   string `yaml:"db_directory"`
+	DBFilename    string `yaml:"db_filename"`
 }
 
 type TimingSettings struct {
-	AutorunScanTimeMin            int `yaml:"autorun_scan_time_min"`
-	DatabaseCleanupTimeHour       int `yaml:"database_cleanup_time_hour"`
-	FullFilesystemScanTimeHour    int `yaml:"full_filesystem_scan_time_hour"`
-	FullProcessScanTimeHour       int `yaml:"full_process_scan_time_hour"`
-	ShutdownTimeoutSec            int `yaml:"shutdown_timeout_sec"`
-	SingleFileScanTimeoutSec      int `yaml:"single_file_scan_timeout_sec"`
-	SingleProcessScanTimeoutSec   int `yaml:"single_process_scan_timeout_sec"`
-	CompleteFileScanTimeoutMin    int `yaml:"complete_file_scan_timeout_min"`
-	CompleteProcessScanTimeoutMin int `yaml:"complete_process_scan_timeout_min"`
+	AutorunScanTimeMin       int `yaml:"autorun_scan_time_min"`
+	DatabaseCleanupTimeHour  int `yaml:"database_cleanup_time_hour"`
+	DatabaseRetentionDays    int `yaml:"database_retention_days"` // NEW: was hardcoded 90
+	ShutdownTimeoutSec       int `yaml:"shutdown_timeout_sec"`
+	SingleFileScanTimeoutSec int `yaml:"single_file_scan_timeout_sec"`
 }
 
 type PerformanceSettings struct {
-	DefaultThreads        int `yaml:"default_threads"`
-	MaxAllowedThreads     int `yaml:"max_allowed_threads"`
-	DBInsertBatchSize     int `yaml:"db_insert_batch_size"`
-	FileScanBufferSize    int `yaml:"file_scan_buffer_size"`
-	ProcessScanBufferSize int `yaml:"process_scan_buffer_size"`
+	DefaultThreads     int `yaml:"default_threads"`
+	MaxAllowedThreads  int `yaml:"max_allowed_threads"`
+	ScanQueueSize      int `yaml:"scan_queue_size"` // NEW: pool queue depth
+	FileScanBufferSize int `yaml:"file_scan_buffer_size"`
 }
 
 type ScanSettings struct {
-	TargetDirectory           string         `yaml:"target_directory"`
-	RulesFilepath             string         `yaml:"rules_filepath"`
-	EnablePeriodicScan        bool           `yaml:"enable_periodic_scan"`
-	PeriodicScanIntervalHours int            `yaml:"periodic_scan_interval_hr"`
-	ExclusionRules            ExclusionRules `yaml:"exclusion_rules"`
+	TargetDirectory string         `yaml:"target_directory"`
+	RulesFilepath   string         `yaml:"rules_filepath"`
+	ExclusionRules  ExclusionRules `yaml:"exclusion_rules"`
 }
 
 type ExclusionRules struct {
@@ -93,34 +70,44 @@ type LoggingSettings struct {
 	TimeFormat        string `yaml:"time_format"`
 }
 
-// Make a good worker determiner here.
-// func getMaxWorkers() int {
-// 	// Determine required workers and start scanners.
-// 	numWorkers := GlobalConfig.PerformanceSettings.DefaultThreads
-// 	maxWorkers := runtime.NumCPU() / 2
-// 	// Limit max workers to max allowed for any system.
-// 	if maxWorkers > GlobalConfig.PerformanceSettings.MaxAllowedThreads {
-// 		maxWorkers = GlobalConfig.PerformanceSettings.MaxAllowedThreads
-// 	}
-// 	// Set workers to max allowed workers.
-// 	numWorkers = maxWorkers
-// 	return numWorkers
-// }
-
-// LoadConfig reads and unmarshals the YAML configuration file.
 func LoadConfig(configPath string) (Config, error) {
 	var config Config
-
-	// Read the file content
 	data, err := os.ReadFile(configPath)
 	if err != nil {
-		return config, fmt.Errorf("failed to read config file %s: %w", configPath, err)
+		return config, fmt.Errorf("config: read %s: %w", configPath, err)
 	}
-
-	// Unmarshal the YAML data into the Config struct
 	if err := yaml.Unmarshal(data, &config); err != nil {
-		return config, fmt.Errorf("failed to unmarshal config file %s: %w", configPath, err)
+		return config, fmt.Errorf("config: parse %s: %w", configPath, err)
 	}
-
+	applyDefaults(&config)
 	return config, nil
+}
+
+// applyDefaults fills in zero values with sane starting points.
+// This prevents panics when fields are omitted from the YAML.
+func applyDefaults(c *Config) {
+	if c.TimingSettings.AutorunScanTimeMin == 0 {
+		c.TimingSettings.AutorunScanTimeMin = 30
+	}
+	if c.TimingSettings.DatabaseCleanupTimeHour == 0 {
+		c.TimingSettings.DatabaseCleanupTimeHour = 24
+	}
+	if c.TimingSettings.DatabaseRetentionDays == 0 {
+		c.TimingSettings.DatabaseRetentionDays = 90
+	}
+	if c.TimingSettings.ShutdownTimeoutSec == 0 {
+		c.TimingSettings.ShutdownTimeoutSec = 30
+	}
+	if c.TimingSettings.SingleFileScanTimeoutSec == 0 {
+		c.TimingSettings.SingleFileScanTimeoutSec = 30
+	}
+	if c.PerformanceSettings.DefaultThreads == 0 {
+		c.PerformanceSettings.DefaultThreads = 2
+	}
+	if c.PerformanceSettings.MaxAllowedThreads == 0 {
+		c.PerformanceSettings.MaxAllowedThreads = 8
+	}
+	if c.PerformanceSettings.ScanQueueSize == 0 {
+		c.PerformanceSettings.ScanQueueSize = 1000
+	}
 }

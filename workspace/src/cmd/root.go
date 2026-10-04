@@ -18,14 +18,13 @@ package cmd
 
 import (
 	"os"
+
 	"vajra/internal"
 
 	"github.com/spf13/cobra"
 )
 
-var (
-	config_path string
-)
+var configPath string
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
@@ -33,7 +32,7 @@ var rootCmd = &cobra.Command{
 	Short: "A complete endpoint detection and response system",
 	Long:  ``,
 	Run: func(cmd *cobra.Command, args []string) {
-		internal.Entrypoint(config_path)
+		internal.Entrypoint(configPath)
 	},
 }
 
@@ -47,5 +46,5 @@ func Execute() {
 }
 
 func init() {
-	rootCmd.Flags().StringVarP(&config_path, "config_path", "c", "./config.yaml", "Path to yaml configuration file")
+	rootCmd.Flags().StringVarP(&configPath, "config_path", "c", "./config.yaml", "Path to yaml configuration file")
 }

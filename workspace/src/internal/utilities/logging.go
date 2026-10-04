@@ -1,4 +1,6 @@
 /*
+Package utilities for vajra.
+
 Copyright © 2025 Lakshy Sharma lakshy.d.sharma@gmail.com
 
 This program is free software: you can redistribute it and/or modify
@@ -28,7 +30,7 @@ import (
 
 // Generates a rolling file lumberjack object for our logger.
 func newRollingFile(config Config) io.Writer {
-	if err := os.MkdirAll(config.Logging.Directory, 0744); err != nil {
+	if err := os.MkdirAll(config.Logging.Directory, 0o744); err != nil {
 		log.Error().Err(err).Str("path", config.Logging.Directory).Msg("can't create log directory")
 		return nil
 	}
@@ -41,7 +43,7 @@ func newRollingFile(config Config) io.Writer {
 	}
 }
 
-// Create a logger.
+// GetLogger returns a zerolog Logger object.
 func GetLogger(config Config) *zerolog.Logger {
 	var writers []io.Writer
 

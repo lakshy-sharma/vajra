@@ -1,44 +1,30 @@
-# Generic settings used across our module.
+# Generic settings
 generic_settings:
-  # Allowed modes are instant scan and daemon_mode
-  operation_mode: "service_mode"
+  operation_mode: "monitor"
   work_directory: "/tmp/vajra"
   db_directory: "./database"
   db_filename: "vajra.db"
-  monitoring_timer_sec: 30
 
 api_settings:
-  host: localhost
+  host: "localhost"
   port: 8086
 
 timing_settings:
-  autorun_scan_time_min: 30 
+  autorun_scan_time_min: 30
   database_cleanup_time_hour: 24
-  full_filesystem_scan_time_hour: 24
-  full_process_scan_time_hour: 24
+  database_retention_days: 90
   shutdown_timeout_sec: 30
   single_file_scan_timeout_sec: 60
-  single_process_scan_timeout_sec: 10
-  complete_file_scan_timeout_min: 30
-  complete_process_scan_timeout_min: 30
 
 performance_settings:
   default_threads: 2
-  max_allowed_threads: 3 # Keep it lower than your cpu count.
+  max_allowed_threads: 3
+  scan_queue_size: 1000
   file_scan_buffer_size: 100
-  process_scan_buffer_size: 50
-  db_insert_batch_size: 1000
 
-# Scan configurations
 scan_settings:
   target_directory: "/home/lakshy/Citadel/Filling Cabinet/"
-  # Allows only zip files. Pack your rules into a zip file.
   rules_filepath: "../rules.zip"
-
-  # WARNING: Use carefully.
-  # These are Exclusion rules to avoid scanning trusted paths. 
-  # Use them very carefully since files inside these paths / extensions are skipped automatically by scanner.
-  # When in doubt its best to leave them empty.
   exclusion_rules:
     exclude_paths:
     exclude_extensions:
@@ -47,7 +33,7 @@ scan_settings:
       - pid
       - socket
     exclude_patterns:
-    exclude_processes: 
+    exclude_processes:
       - gopls
       - pylsp
       - rust-analyzer
@@ -58,15 +44,14 @@ scan_settings:
       - dbus-daemon
       - pulseaudio
 
-# Logging configuration
 logging:
-  enable_console: True
-  use_json: True
-  enable_file_logging: True
+  enable_console: true
+  use_json: true
+  enable_file_logging: true
   log_directory: "./logs"
   log_filename: "vajra.log"
   max_size_mb: 50
   max_age_days: 1
   max_backups: 5
   log_level: "info"
-  time_format: "UNIXMS" # Zerolog timeformat
+  time_format: "UNIXMS"
