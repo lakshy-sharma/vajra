@@ -1,252 +1,164 @@
+# Dataflow
+
 ╔══════════════════════════════════════════════════════════════════════════════════╗
 ║                           KERNEL / SYSTEM LAYER                                  ║
 ║                                                                                  ║
-║   execve  dup2  openat  connect  mmap  ptrace  capset  unshare  modules          ║
+║   execve  dup2/3  openat  connect  mmap  ptrace  capset  unshare  modules        ║
 ╚══════════════════════╦═══════════════════════════════════════════════════════════╝
                        │ eBPF tracepoints
                        ▼
 ╔══════════════════════════════════════════════════════════════════════════════════╗
-║                         EBPF LAYER  (internal/ebpf/)                             ║
+║  EBPF LAYER  (internal/ebpf/)                                                    ║
 ║                                                                                  ║
-║   Listener                                                                       ║
-║   └── perf ring buffer read loop                                                 ║
-║       └── deserialize() → RawEvent{Type, Data}                                  ║
+║  Listener → perf ring buffer → deserialize() → RawEvent                         ║
+║  Dispatcher → typed channels                                                     ║
 ║                                                                                  ║
-║   Dispatcher                                                                     ║
-║   └── route() → typed channels                                                   ║
-║                                                                                  ║
-║   Channels                                                                       ║
-║   ├── Process  chan ProcessEvent                                                  ║
-║   ├── File     chan FileEvent                                                     ║
-║   ├── Network  chan NetworkEvent                                                  ║
-║   ├── Memory   chan MmapEvent                                                     ║
-║   ├── Security chan SecurityEvent                                                 ║
-║   ├── Module   chan ModuleEvent                                                   ║
-║   ├── Namespace chan NamespaceEvent                                               ║
-║   └── Dup      chan DupEvent                                                      ║
+║  Process  File  Network  Memory  Security  Module  Namespace  Dup                ║
 ╚══════════════════════╦═══════════════════════════════════════════════════════════╝
                        │
-        ┌──────────────┼──────────────────────────────────┐
-        │              │                                   │
-        ▼              ▼                                   ▼
-╔═══════════════╗ ╔═══════════════════════════╗ ╔════════════════════╗
-║   WATCHER     ║ ║        WATCHER            ║ ║      WATCHER       ║
-║   LAYER       ║ ║        LAYER              ║ ║      LAYER         ║
-║               ║ ║                           ║ ║                    ║
-║  EventSink    ║ ║  FileScanner   Process    ║ ║   DupWatcher       ║
-║               ║ ║                Scanner    ║ ║                    ║
-║  Consumes:    ║ ║  Consumes:     Consumes:  ║ ║  Consumes:         ║
-║  Network      ║ ║  File chan     Process    ║ ║  Dup chan          ║
-║  Memory       ║ ║               chan        ║ ║                    ║
-║  Security     ║ ║                           ║ ║  For each event:   ║
-║  Module       ║ ║  For each event:          ║ ║  readlink oldfd    ║
-║  Namespace    ║ ║  filter→eligible          ║ ║  → socket inode?   ║
-║               ║ ║  →QuickHash              ║ ║  → /proc/net lookup║
-║  Raw record   ║ ║  →SHA256                 ║ ║  → confirmed?      ║
-║  only. No     ║ ║  → Analyzer              ║ ║                    ║
-║  analysis.    ║ ║    Pipeline              ║ ║  pid+inode dedup   ║
-║  Heuristic    ║ ║  → dedup                 ║ ║  30s window        ║
-║  severity.    ║ ║  → Finding               ║ ║  → Finding         ║
-╚═══════════════╝ ╚═══════════╦═══════════════╝ ╚═════════╦══════════╝
-        │                     │                            │
-        │                     ▼                            │
-        │         ╔═══════════════════════════╗            │
-        │         ║    ANALYZER LAYER         ║            │
-        │         ║    (internal/analyzer/)   ║            │
-        │         ║                           ║            │
-        │         ║  Content Pipeline         ║            │
-        │         ║  (cached on SHA256)       ║            │
-        │         ║  ┌─────────────────────┐  ║            │
-        │         ║  │ HashAnalyzer        │  ║            │
-        │         ║  │ (known_bad_hashes)  │  ║            │
-        │         ║  │ short-circuits on   │  ║            │
-        │         ║  │ CRITICAL match      │  ║            │
-        │         ║  ├─────────────────────┤  ║            │
-        │         ║  │ YARAAnalyzer        │  ║            │
-        │         ║  │ (pool → rules)      │  ║            │
-        │         ║  └─────────────────────┘  ║            │
-        │         ║                           ║            │
-        │         ║  Runtime Pipeline         ║            │
-        │         ║  (never cached,           ║            │
-        │         ║   always runs)            ║            │
-        │         ║  ┌─────────────────────┐  ║            │
-        │         ║  │ LDPreloadAnalyzer   │  ║            │
-        │         ║  ├─────────────────────┤  ║            │
-        │         ║  │ CapabilityAnalyzer  │  ║            │
-        │         ║  ├─────────────────────┤  ║            │
-        │         ║  │ LOLBinAnalyzer      │  ║            │
-        │         ║  │ (process tree       │  ║            │
-        │         ║  │  parent lookup)     │  ║            │
-        │         ║  └─────────────────────┘  ║            │
-        │         ║                           ║            │
-        │         ║  → MergeResults()         ║            │
-        │         ║  → Finding                ║            │
-        │         ╚═══════════════════════════╝            │
-        │                     │                            │
-        │              ┌──────┘                            │
-        │              │                                   │
-        │              ▼                                   │
-        │  ╔═══════════════════════════════════════════╗   │
-        │  ║         SCANNER LAYER                     ║   │
-        │  ║         (internal/scanner/)               ║   │
-        │  ║                                           ║   │
-        │  ║  Pull-based, timer or startup triggered   ║   │
-        │  ║                                           ║   │
-        │  ║  AutorunScanner                           ║   │
-        │  ║  ├── walks 12 persistence locations       ║   │
-        │  ║  ├── diffs against DB state               ║   │
-        │  ║  └── → Finding (new/changed entries)      ║   │
-        │  ║                                           ║   │
-        │  ║  SecretsScanner                           ║   │
-        │  ║  ├── walks filesystem (text files)        ║   │
-        │  ║  ├── betterleaks v2 SDK per file          ║   │
-        │  ║  ├── sha256(secret) — never store raw     ║   │
-        │  ║  └── → Finding                            ║   │
-        │  ║                                           ║   │
-        │  ║  RunningProcessScanner                    ║   │
-        │  ║  ├── walks /proc/PID/exe on startup       ║   │
-        │  ║  ├── submits to Analyzer pipeline         ║   │
-        │  ║  └── → Finding                            ║   │
-        │  ║                                           ║   │
-        │  ║  UserProfileScanner                       ║   │
-        │  ║  ├── reads passwd/shadow/sudoers/ssh keys ║   │
-        │  ║  ├── diffs against user_inventory         ║   │
-        │  ║  └── → Finding (policy violations)        ║   │
-        │  ╚═══════════════════════════════════════════╝   │
-        │                     │                            │
-        └──────────┬───────────┘────────────────────────── ┘
-                   │ all sources produce Finding
-                   ▼
-╔══════════════════════════════════════════════════════════════════════════════════╗
-║                      FINDING WRITER  (internal/findings/)                        ║
-║                                                                                  ║
-║  FindingWriter.Write(ctx, Finding)                                               ║
-║  │                                                                               ║
-║  ├── DedupTracker.CheckAndRecord(source+rule_id+target_path+severity)            ║
-║  │   ├── duplicate within window → IncrementDedupCount, return                  ║
-║  │   └── new → continue                                                          ║
-║  │                                                                               ║
-║  ├── INSERT detections (core fields)                                             ║
-║  │                                                                               ║
-║  ├── if YaraMatches or FileHash present                                          ║
-║  │   └── INSERT detection_artifacts (detection_id FK)                           ║
-║  │                                                                               ║
-║  ├── if network socket details present                                           ║
-║  │   └── INSERT detection_network (detection_id FK)                             ║
-║  │                                                                               ║
-║  ├── if secrets details present                                                  ║
-║  │   └── INSERT detection_secrets (detection_id FK)                             ║
-║  │                                                                               ║
-║  ├── if extra fields present                                                     ║
-║  │   └── INSERT detection_extensions key/value (detection_id FK)                ║
-║  │                                                                               ║
-║  └── if severity >= HIGH                                                         ║
-║      └── trigger EvidenceCollector                                               ║
-╚══════════════════════╦═══════════════════════════════════════════════════════════╝
-                       │
-        ┌──────────────┼──────────────────────────┐
-        │              │                          │
-        ▼              ▼                          ▼
-╔══════════════╗ ╔════════════════╗  ╔════════════════════════════╗
-║  DETECTIONS  ║ ║    EVIDENCE    ║  ║       RAW TELEMETRY        ║
-║  DB TABLES   ║ ║   COLLECTOR    ║  ║       DB TABLES            ║
-║              ║ ║                ║  ║                            ║
-║  detections  ║ ║  On HIGH/CRIT  ║  ║  network_events            ║
-║  detection   ║ ║  immediately   ║  ║  memory_events             ║
-║_artifacts  ║ ║  reads:        ║  ║  security_events           ║
-║  detection   ║ ║  /proc/PID/    ║  ║  process_tree              ║
-║  _network    ║ ║  ├── fd/       ║  ║                            ║
-║  detection   ║ ║  ├── maps      ║  ║  (written by EventSink     ║
-║_secrets    ║ ║  ├── environ   ║  ║   directly, not via        ║
-║  detection   ║ ║  └── status    ║  ║   FindingWriter)           ║
-║  _extensions ║ ║                ║  ╚════════════════════════════╝
-║              ║ ║  Serializes    ║
-║              ║ ║  to JSON blob  ║
-║              ║ ║                ║
-║              ║ ║  INSERT        ║
-║              ║ ║  evidence_     ║
-║              ║ ║  snapshots     ║
-║              ║ ║  (FK →         ║
-║              ║ ║  detection_id) ║
-╚══════════════╝ ╚════════════════╝
+        ┌──────────────┼─────────────────────────────────┐
+        ▼              ▼                                  ▼
+╔══════════════╗  ╔════════════════════════════╗  ╔══════════════════╗
+║  EVENTSINK   ║  ║  WATCHER LAYER             ║  ║  DUP WATCHER     ║
+║              ║  ║  (internal/watcher/)       ║  ║                  ║
+║  Consumes:   ║  ║                            ║  ║  Dup chan         ║
+║  Network     ║  ║  FileScanner               ║  ║                  ║
+║  Memory      ║  ║  File chan → eligible?      ║  ║  readlink oldfd  ║
+║  Security    ║  ║  → QuickHash → SHA256       ║  ║  → socket inode? ║
+║  Module      ║  ║  → Analyzer Pipeline        ║  ║  → /proc/net     ║
+║  Namespace   ║  ║  → Finding                  ║  ║  → confirmed?    ║
+║              ║  ║                            ║  ║  → Finding       ║
+║  Raw record  ║  ║  ProcessScanner             ║  ║                  ║
+║  only.       ║  ║  Process chan               ║  ║  pid+inode dedup ║
+║  Bypasses    ║  ║  → process_tree write        ║  ║  30s window      ║
+║  FindingWriter║  ║  → Content Pipeline         ║  ╚══════════════════╝
+║              ║  ║  → Runtime Pipeline         ║          │
+╚══════╦═══════╝  ║  → MergeResults()           ║          │
+       │          ║  → Finding                  ║          │
+       │          ╚═══════════╦════════════════╝          │
+       │                      │                            │
+       │          ╔═══════════╩════════════════╗          │
+       │          ║  ANALYZER LAYER            ║          │
+       │          ║  (internal/analyzer/)      ║          │
+       │          ║                            ║          │
+       │          ║  Content Pipeline          ║          │
+       │          ║  (cached on SHA256)        ║          │
+       │          ║  ┌──────────────────────┐  ║          │
+       │          ║  │ HashAnalyzer (planned)│  ║          │
+       │          ║  │ short-circuits CRIT  │  ║          │
+       │          ║  ├──────────────────────┤  ║          │
+       │          ║  │ YARAAnalyzer         │  ║          │
+       │          ║  └──────────────────────┘  ║          │
+       │          ║                            ║          │
+       │          ║  Runtime Pipeline          ║          │
+       │          ║  (never cached)            ║          │
+       │          ║  ┌──────────────────────┐  ║          │
+       │          ║  │ LDPreloadAnalyzer    │  ║          │
+       │          ║  ├──────────────────────┤  ║          │
+       │          ║  │ CapabilityAnalyzer   │  ║          │
+       │          ║  ├──────────────────────┤  ║          │
+       │          ║  │ LOLBinAnalyzer       │  ║          │
+       │          ║  │ (process tree lookup)│  ║          │
+       │          ║  └──────────────────────┘  ║          │
+       │          ╚═══════════╦════════════════╝          │
+       │                      │                            │
+       │          ╔═══════════╩════════════════╗          │
+       │          ║  SCANNER LAYER             ║          │
+       │          ║  (internal/detect/)        ║          │
+       │          ║                            ║          │
+       │          ║  AutorunScanner            ║          │
+       │          ║  SecretsScanner (planned)  ║          │
+       │          ║  RunningProcessScanner     ║          │
+       │          ║  (planned)                 ║          │
+       │          ║  UserProfileScanner        ║          │
+       │          ║  (planned)                 ║          │
+       │          ╚═══════════╦════════════════╝          │
+       │                      │                            │
+       │              ┌───────┘        ────────────────────┘
+       │              │       all watchers and scanners
+       │              │       produce Finding
+       │              ▼
+       │  ╔═══════════════════════════════════════════════════════════╗
+       │  ║  FINDING WRITER  (internal/findings/)                     ║
+       │  ║                                                           ║
+       │  ║  Write(ctx, Finding)                                      ║
+       │  ║  ├── DedupTracker.CheckAndRecord(rule+path+severity)      ║
+       │  ║  │   ├── duplicate → IncrementDedupCount, return 0        ║
+       │  ║  │   └── new → continue                                   ║
+       │  ║  ├── INSERT detections                                    ║
+       │  ║  ├── if FileHash/YaraMatches → INSERT detection_artifacts ║
+       │  ║  ├── if RemoteAddr → INSERT detection_network             ║
+       │  ║  ├── if SecretHash → INSERT detection_secrets             ║
+       │  ║  ├── if Extensions → INSERT detection_extensions (rows)   ║
+       │  ║  └── if severity >= HIGH → captureEvidence()              ║
+       │  ║       reads /proc/PID/fd, maps, environ, status           ║
+       │  ║       INSERT evidence_snapshots                           ║
+       │  ║                                                           ║
+       │  ║  Metrics: Written, Deduped, Errors, Evidence, EvidFail    ║
+       │  ║  LogMetrics() called by health ticker every 15 min        ║
+       │  ╚═══════════════════════════════════════════════════════════╝
+       │                      │
+       ▼                      ▼
+╔════════════════╗   ╔═════════════════════════════════════╗
+║  RAW TELEMETRY ║   ║  DETECTION TABLES                   ║
+║                ║   ║                                     ║
+║  network_events║   ║  detections                         ║
+║  memory_events ║   ║  detection_artifacts                ║
+║  security_events║  ║  detection_network                  ║
+║  process_tree  ║   ║  detection_secrets                  ║
+║  (never pruned)║   ║  detection_extensions               ║
+║                ║   ║  evidence_snapshots                 ║
+╚════════════════╝   ╚═════════════════════════════════════╝
 
 ╔══════════════════════════════════════════════════════════════════════════════════╗
-║                    AUDIT LOG  (written by all components)                        ║
-║                                                                                  ║
-║  Every component writes to audit_log on:                                         ║
-║  ├── startup / shutdown                                                          ║
-║  ├── scan completion (files scanned, duration, hits)                             ║
-║  ├── rule/signature update                                                       ║
-║  ├── health check (every 15 min — pool workers, queue depth, uptime)            ║
-║  └── error conditions                                                            ║
-║                                                                                  ║
-║  audit_log is append-only. Never updated, never deleted by retention cleanup.   ║
+║  AUDIT LOG  (internal/db/queries/auditlog.go)                                    ║
+║  Append-only. Every component writes on startup, shutdown, scan completion,      ║
+║  rule update, health check, error. Never pruned by retention cleanup.            ║
 ╚══════════════════════════════════════════════════════════════════════════════════╝
 
 ╔══════════════════════════════════════════════════════════════════════════════════╗
-║               INVENTORY TABLES  (written by scanners)                            ║
-║                                                                                  ║
-║  autoruns        ← AutorunScanner                                                ║
-║  user_inventory  ← UserProfileScanner                                           ║
-║  known_bad_hashes ← vajra hashes update CLI + VirusTotal enrichment             ║
+║  INVENTORY TABLES                                                                ║
+║  autoruns ← AutorunScanner                                                       ║
+║  user_inventory ← UserProfileScanner (planned)                                  ║
+║  known_bad_hashes ← vajra hashes update + VirusTotal enrichment (planned)       ║
 ╚══════════════════════════════════════════════════════════════════════════════════╝
 
 ╔══════════════════════════════════════════════════════════════════════════════════╗
-║                    OPERATIONAL TABLES                                            ║
+║  SERVICE LAYER  (internal/service.go)                                            ║
 ║                                                                                  ║
-║  quarantined_files  ← Response system (Phase 5)                                  ║
-║  event_statistics   ← Aggregation job (hourly ticker)                            ║
-║  sync_state         ← Remote sync watermarks (Phase 3)                          ║
+║  wireAll()                                                                       ║
+║  ├── bootstrap: LoadConfig → OpenDB → CompileRules → BuildPool → FindingWriter  ║
+║  │                                                                               ║
+║  ├── EventSink.Run(ctx, wg, channels)   [multi-channel, wired separately]       ║
+║  ├── go DupWatcher.Run(ctx, wg, ch.Dup)                                         ║
+║  ├── go FileScanner.Run(ctx, wg, ch.File)                                       ║
+║  ├── go ProcessScanner.Run(ctx, wg, ch.Process)                                 ║
+║  │                                                                               ║
+║  ├── go AutorunScanner.Run(ctx, wg)                                             ║
+║  │                                                                               ║
+║  ├── go DBCleanup.Run(ctx, wg)                                                  ║
+║  └── go RuleSyncer.Run(ctx, wg)                                                 ║
 ╚══════════════════════════════════════════════════════════════════════════════════╝
 
 ╔══════════════════════════════════════════════════════════════════════════════════╗
-║                         SERVICE LAYER  (internal/service.go)                     ║
+║  CLI LAYER  (cmd/)                                                               ║
 ║                                                                                  ║
-║  wireJobs()                                                                      ║
-║  │                                                                               ║
-║  ├── bootstrap: LoadConfig → OpenDB → CompileRules → BuildPool                  ║
-║  │                                                                               ║
-║  ├── watchers := []watcher.Watcher{                                              ║
-║  │     EventSink, FileScanner, ProcessScanner, DupWatcher                       ║
-║  │   }                                                                           ║
-║  │   for w := range watchers { go w.Run(ctx, wg) }                              ║
-║  │                                                                               ║
-║  ├── scanners := []scanner.Scanner{                                              ║
-║  │     AutorunScanner, SecretsScanner,                                           ║
-║  │     RunningProcessScanner, UserProfileScanner                                 ║
-║  │   }                                                                           ║
-║  │   for s := range scanners { go s.Run(ctx, wg) }                              ║
-║  │                                                                               ║
-║  └── jobs := []job.Job{                                                          ║
-║        DBCleanup, RuleSyncer, AggregationJob, HealthTicker                      ║
-║      }                                                                           ║
-║      for j := range jobs { go j.Run(ctx, wg) }                                  ║
+║  vajra [monitor]       → service.go daemon                                       ║
+║  vajra scan [dir]      → detect.RunFullScan() blocking                           ║
+║  vajra rules update    → job.RuleSyncer.RunOnce()                               ║
+║  vajra rules status    → read-only DB query                                      ║
+║  vajra hashes update   → planned                                                 ║
 ╚══════════════════════════════════════════════════════════════════════════════════╝
 
 ╔══════════════════════════════════════════════════════════════════════════════════╗
-║                         CLI LAYER  (cmd/)                                        ║
+║  UI LAYER  (vajra-ui, separate Wails binary)                                     ║
 ║                                                                                  ║
-║  vajra                → service.go (daemon, all watchers+scanners+jobs)          ║
-║  vajra scan [dir]     → RunFullScan (blocking, file scanner only)                ║
-║  vajra rules update   → RuleSyncer.RunOnce()                                    ║
-║  vajra rules status   → read-only DB query                                       ║
-║  vajra hashes update  → HashUpdater.RunOnce()  (planned)                        ║
-║  vajra audit          → AuditRunner.Run()      (planned)                        ║
-║  vajra profile        → UserProfileScanner.RunOnce() (planned)                  ║
-╚══════════════════════════════════════════════════════════════════════════════════╝
-
-╔══════════════════════════════════════════════════════════════════════════════════╗
-║                         UI LAYER  (vajra-ui, separate binary)                    ║
-║                                                                                  ║
-║  Read-only SQLite (WAL mode, no write lock contention)                           ║
+║  Read-only SQLite (WAL mode, no write lock contention with daemon)               ║
 ║                                                                                  ║
 ║  Dashboard     → event_statistics + audit_log                                    ║
-║  Alert list    → detections (single table, all sources)                          ║
-║  Alert detail  → detections JOIN detection_artifacts                             ║
-║                           JOIN detection_network                                 ║
-║                           JOIN evidence_snapshots                                ║
+║  Alert list    → detections (all sources unified)                                ║
+║  Alert detail  → detections JOIN artifacts + network + evidence                  ║
 ║  Process tree  → process_tree recursive CTE                                      ║
 ║  Autorun view  → autoruns                                                        ║
-║  User profile  → user_inventory                                                  ║
 ║  Secret view   → detection_secrets JOIN detections                               ║
 ╚══════════════════════════════════════════════════════════════════════════════════╝
