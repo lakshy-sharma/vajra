@@ -30,6 +30,7 @@ type ProcessScanner struct {
 	contentPipeline *analyzer.Pipeline
 	runtimePipeline *analyzer.Pipeline
 	queries         *queries.ProcessQueries
+	treeQueries     *queries.ProcessTreeQueries
 	filter          *scanner.ProcessFilter
 	tracker         *scanner.RecentScanTracker
 	dedup           *scanner.DedupTracker
@@ -41,6 +42,7 @@ func NewProcessScanner(
 	contentPipeline *analyzer.Pipeline,
 	runtimePipeline *analyzer.Pipeline,
 	pq *queries.ProcessQueries,
+	treeQ *queries.ProcessTreeQueries,
 	filter *scanner.ProcessFilter,
 	dedupWindow time.Duration,
 	sysInfo utilities.SystemInfo,
@@ -50,6 +52,7 @@ func NewProcessScanner(
 		contentPipeline: contentPipeline,
 		runtimePipeline: runtimePipeline,
 		queries:         pq,
+		treeQueries:     treeQ,
 		filter:          filter,
 		tracker:         scanner.NewRecentScanTracker(10 * time.Minute),
 		dedup:           scanner.NewDedupTracker(dedupWindow),
@@ -77,39 +80,65 @@ func (ps *ProcessScanner) Run(ctx context.Context, wg *sync.WaitGroup, procCh <-
 func (ps *ProcessScanner) handle(ctx context.Context, event ebpf.ProcessEvent) {
 	comm := ebpf.CStringToGo(event.Comm[:])
 
+	// ── Process tree write — unconditional ────────────────────
+	// Every execve writes to the adjacency list regardless of dedup,
+	// exclusions, or what the analysis pipeline finds. The server
+	// needs a complete tree; holes break recursive CTE traversal.
+	// cmdline is read here rather than waiting for persist() since
+	// the process may exit before persist() is reached.
+	cmdLine := readCmdline(event.PID)
+	if cmdLine == "" {
+		cmdLine = ebpf.CStringToGo(event.Args[:])
+	}
+	exePath := ebpf.CStringToGo(event.Filename[:])
+
+	treeEntry := &models.ProcessTreeEntry{
+		MachineID: ps.sysInfo.MachineID,
+		PID:       event.PID,
+		PPID:      event.PPID,
+		Comm:      comm,
+		ExePath:   exePath,
+		CmdLine:   cmdLine,
+		EventTime: ps.sysInfo.EBPFTimestampToUnix(event.Timestamp),
+	}
+	if err := ps.treeQueries.Insert(treeEntry); err != nil {
+		ps.logger.Error().Err(err).Uint32("pid", event.PID).Msg("process scanner: process tree insert failed")
+		// Non-fatal — continue with analysis even if tree write fails.
+	}
+
 	// ── Stage 1: resolve exe path ─────────────────────────────
-	exePath := ps.resolveExePath(event.PID, event.Filename[:])
-	if exePath == "" {
+	resolvedExePath := ps.resolveExePath(event.PID, event.Filename[:])
+	if resolvedExePath == "" {
 		ps.logger.Debug().Uint32("pid", event.PID).Str("comm", comm).Msg("process scanner: could not resolve exe path, skipping")
 		return
 	}
 
 	// ── Stage 2: recent scan dedup ────────────────────────────
-	if ps.tracker.WasRecentlyScanned(exePath, "") {
-		ps.logger.Debug().Str("exe", exePath).Msg("process scanner: recently scanned, skipping")
+	if ps.tracker.WasRecentlyScanned(resolvedExePath, "") {
+		ps.logger.Debug().Str("exe", resolvedExePath).Msg("process scanner: recently scanned, skipping")
 		return
 	}
-	ps.tracker.MarkScanned(exePath, "")
+	ps.tracker.MarkScanned(resolvedExePath, "")
 
 	// ── Stage 3: attach PID to context ────────────────────────
 	pCtx := analyzer.CtxWithPID(ctx, event.PID)
 
 	// ── Stage 4: runtime pipeline ─────────────────────────────
-	runtimeResult, err := ps.runtimePipeline.RunUncached(pCtx, exePath)
+	runtimeResult, err := ps.runtimePipeline.RunUncached(pCtx, resolvedExePath)
 	if err != nil {
-		ps.logger.Error().Err(err).Str("exe", exePath).Msg("process scanner: runtime pipeline error")
+		ps.logger.Error().Err(err).Str("exe", resolvedExePath).Msg("process scanner: runtime pipeline error")
 	}
 
 	// ── Stage 5: content pipeline ─────────────────────────────
 	contentResult := analyzer.AnalysisResult{Severity: models.SeverityClean}
 	if !ps.filter.IsTrusted(comm) {
-		fileHash, err := scanner.FullSHA256(exePath)
+		fileHash, err := scanner.FullSHA256(resolvedExePath)
 		if err != nil {
-			ps.logger.Debug().Err(err).Str("exe", exePath).Msg("process scanner: could not hash exe, skipping content pipeline")
+			ps.logger.Debug().Err(err).Str("exe", resolvedExePath).Msg("process scanner: could not hash exe, skipping content pipeline")
 		} else {
-			contentResult, err = ps.contentPipeline.Run(pCtx, exePath, fileHash)
+			contentResult, err = ps.contentPipeline.Run(pCtx, resolvedExePath, fileHash)
 			if err != nil {
-				ps.logger.Error().Err(err).Str("exe", exePath).Msg("process scanner: content pipeline error")
+				ps.logger.Error().Err(err).Str("exe", resolvedExePath).Msg("process scanner: content pipeline error")
 			}
 		}
 	} else {
@@ -119,12 +148,12 @@ func (ps *ProcessScanner) handle(ctx context.Context, event ebpf.ProcessEvent) {
 	// ── Stage 6: merge ────────────────────────────────────────
 	merged := analyzer.MergeResults(contentResult, runtimeResult)
 	if merged.Skip {
-		ps.logger.Debug().Str("exe", exePath).Msg("process scanner: clean cached result, skipping insert")
+		ps.logger.Debug().Str("exe", resolvedExePath).Msg("process scanner: clean cached result, skipping insert")
 		return
 	}
 
 	// ── Stage 7: persist ──────────────────────────────────────
-	ps.persist(merged, event, comm, exePath)
+	ps.persist(merged, event, comm, resolvedExePath, cmdLine)
 }
 
 func (ps *ProcessScanner) persist(
@@ -132,6 +161,7 @@ func (ps *ProcessScanner) persist(
 	event ebpf.ProcessEvent,
 	comm string,
 	exePath string,
+	cmdLine string,
 ) {
 	if merged.Severity == models.SeverityClean {
 		ps.logger.Debug().Str("exe", exePath).Str("comm", comm).Uint32("pid", event.PID).Msg("process scanner: clean")
@@ -152,13 +182,6 @@ func (ps *ProcessScanner) persist(
 		return
 	}
 
-	// Full cmdline from /proc — eBPF only captures argv[1].
-	cmdLine := readCmdline(event.PID)
-	if cmdLine == "" {
-		cmdLine = ebpf.CStringToGo(event.Args[:])
-	}
-
-	// CWD from /proc — eBPF only gives last path component.
 	cwd := readCWD(event.PID)
 	if cwd == "" {
 		cwd = ebpf.CStringToGo(event.CWD[:])

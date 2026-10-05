@@ -1,3 +1,8 @@
+// internal/service.go
+//
+// Copyright © 2026 Lakshy Sharma lakshy.d.sharma@gmail.com
+// AGPL-3.0 License
+
 //go:build linux
 
 package internal
@@ -68,7 +73,6 @@ func wireJobs(
 	database *db.DB,
 	sysInfo utilities.SystemInfo,
 ) {
-	// YARA rules — compiled once, shared across all pipelines.
 	rulesCompiler := scanner.NewRulesCompiler(logger)
 	extractionPath := filepath.Join(cfg.GenericSettings.WorkDirectory, "rules")
 
@@ -105,7 +109,6 @@ func wireJobs(
 		logger.Fatal().Err(err).Msg("failed to start eBPF listener")
 	}
 
-	// Stop listener cleanly on shutdown.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -119,9 +122,8 @@ func wireJobs(
 		ebpf.NewDispatcher(logger).Run(ctx, rawCh, channels)
 	}()
 
-	// Namespace channel is never written to by the dispatcher —
-	// namespace events are translated to SecurityEvent upstream.
-	// This drain guards against future dispatcher changes.
+	// Namespace channel drain — namespace events are translated to
+	// SecurityEvent upstream; this guards against future dispatcher changes.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -155,6 +157,16 @@ func wireJobs(
 		sysInfo,
 	).Run(ctx, wg, channels)
 
+	// DupWatcher — reverse shell detection via dup2/dup3 onto stdio.
+	// Reads from channels.Dup directly, writes CRITICAL to security_events
+	// on confirmed network socket redirection. No pipeline, no comm filtering.
+	wg.Add(1)
+	go jobs.NewDupWatcher(
+		logger,
+		queries.NewSecurityQueries(database),
+		sysInfo,
+	).Run(ctx, wg, channels.Dup)
+
 	wg.Add(1)
 	go jobs.NewRuleSyncer(logger, cfg.RulesSettings).Run(ctx, wg)
 
@@ -186,13 +198,13 @@ func wirePipelines(
 		analyzer.WithCache(resultCache),
 	)
 
-	// Runtime pipeline always runs regardless of process exclusion filter.
-	// A trusted process exhibiting reverse shell or capability abuse
-	// is more suspicious than an unknown one.
+	// Runtime pipeline — always runs regardless of process exclusion filter.
+	// RevShellAnalyzer removed: reverse shell detection is now driven by
+	// dup2/dup3 events in DupWatcher, which catches the bash -i >& /dev/tcp/...
+	// pattern that exec-time fd inspection could not see.
 	runtimePipeline := analyzer.NewPipeline(
 		[]analyzer.Analyzer{
 			procanalyzer.NewLDPreloadAnalyzer(logger),
-			procanalyzer.NewRevShellAnalyzer(logger),
 			procanalyzer.NewCapabilityAnalyzer(logger),
 		},
 	)
@@ -207,9 +219,14 @@ func wirePipelines(
 	go fileScanner.Run(ctx, wg, channels.File)
 
 	processScanner := jobs.NewProcessScanner(
-		logger, contentPipeline, runtimePipeline,
+		logger,
+		contentPipeline,
+		runtimePipeline,
 		queries.NewProcessQueries(database),
-		processFilter, dedupWindow, sysInfo,
+		queries.NewProcessTreeQueries(database),
+		processFilter,
+		dedupWindow,
+		sysInfo,
 	)
 	wg.Add(1)
 	go processScanner.Run(ctx, wg, channels.Process)

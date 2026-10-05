@@ -202,3 +202,16 @@ type EventStatistic struct {
 	MaliciousCount int64
 	CleanCount     int64
 }
+
+// ProcessTreeEntry is one row in the process_tree adjacency list.
+// Written on every execve regardless of scan outcome.
+type ProcessTreeEntry struct {
+	ID        int64
+	MachineID string
+	PID       uint32
+	PPID      uint32
+	Comm      string
+	ExePath   string
+	CmdLine   string
+	EventTime int64
+}

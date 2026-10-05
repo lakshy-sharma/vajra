@@ -52,6 +52,21 @@ func (d *Dispatcher) Run(ctx context.Context, rawCh <-chan RawEvent, ch *Channel
 func (d *Dispatcher) route(event RawEvent, ch *Channels) {
 	switch event.Type {
 
+	// ── Dup stdio → Dup channel ───────────────────────────────
+	// Raw DupEvent sent directly to DupWatcher. Not converted to
+	// SecurityEvent here — DupWatcher performs the socket check and
+	// writes to security_events itself only on confirmed detections.
+	case EventTypeProcessDupStdio:
+		e, ok := event.Data.(DupEvent)
+		if !ok {
+			d.logBadType(event.Type, "DupEvent")
+			return
+		}
+		select {
+		case ch.Dup <- e:
+		default:
+			d.logDrop(event.Type)
+		}
 	// ── Process events → Process channel ─────────────────────
 	case EventTypeProcessExec,
 		EventTypeProcessSetuid,

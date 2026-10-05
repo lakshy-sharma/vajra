@@ -88,7 +88,6 @@ func (d *DB) applyPragmas() error {
 
 func (d *DB) migrate() error {
 	stmts := []string{
-
 		// ── file_scan_results ─────────────────────────────────
 		`CREATE TABLE IF NOT EXISTS file_scan_results (
 			id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -294,6 +293,28 @@ func (d *DB) migrate() error {
 			last_synced_at INTEGER NOT NULL DEFAULT 0,
 			synced_rows    INTEGER NOT NULL DEFAULT 0
 		)`,
+		// ── process_tree ──────────────────────────────────────
+		// Adjacency list of every execve event. Written on every
+		// process execution regardless of scan result or dedup.
+		// The server reconstructs full execution forests via recursive
+		// CTE on (machine_id, ppid, pid). Never pruned by retention
+		// cleanup — tree completeness matters more than disk space.
+		`CREATE TABLE IF NOT EXISTS process_tree (
+			id         INTEGER PRIMARY KEY AUTOINCREMENT,
+			machine_id TEXT    NOT NULL DEFAULT '',
+			pid        INTEGER NOT NULL,
+			ppid       INTEGER NOT NULL,
+			comm       TEXT    NOT NULL DEFAULT '',
+			exe_path   TEXT    NOT NULL DEFAULT '',
+			cmdline    TEXT    NOT NULL DEFAULT '',
+			event_time INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_pt_machine_id ON process_tree(machine_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_pt_pid        ON process_tree(pid)`,
+		`CREATE INDEX IF NOT EXISTS idx_pt_ppid       ON process_tree(ppid)`,
+		`CREATE INDEX IF NOT EXISTS idx_pt_event_time ON process_tree(event_time)`,
+		// Composite index for the recursive CTE query pattern.
+		`CREATE INDEX IF NOT EXISTS idx_pt_machine_ppid_pid ON process_tree(machine_id, ppid, pid)`,
 	}
 
 	for _, stmt := range stmts {

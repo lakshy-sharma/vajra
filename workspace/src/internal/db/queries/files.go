@@ -1,6 +1,6 @@
-// internal/db/queries/processes.go
+// internal/db/queries/files.go
 //
-// Copyright © 2025 Lakshy Sharma lakshy.d.sharma@gmail.com
+// Copyright © 2026 Lakshy Sharma lakshy.d.sharma@gmail.com
 // AGPL-3.0 License
 
 package queries

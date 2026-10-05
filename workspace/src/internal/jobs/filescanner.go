@@ -81,7 +81,7 @@ func (fs *FileScanner) handle(ctx context.Context, event ebpf.FileEvent) {
 		return
 	}
 
-	eligible, reason := isEligibleFile(filePath)
+	eligible, reason := isEligibleFile(filePath, comm)
 	if !eligible {
 		fs.logger.Debug().Str("file", filePath).Str("reason", reason).Msg("file scanner: ineligible")
 		return
@@ -182,7 +182,17 @@ func (fs *FileScanner) persist(
 		Msg("FILE SCAN DETECTION")
 }
 
-func isEligibleFile(filePath string) (bool, string) {
+// isEligibleFile returns true if a file should be submitted to YARA.
+// Three independent conditions — any one passing makes the file eligible:
+//
+//  1. Execute bit set — catches chmod+x scripts without shebangs
+//  2. Magic bytes match — ELF, shebang, MZ (PE), Mach-O fat binary
+//  3. Triggered by a known interpreter — python3, perl, ruby, etc.
+//     opening a script file that has no magic bytes of its own
+//
+// Size bounds always apply regardless of which condition triggered.
+// The broken fifth magic byte check (magic[3]==0x0d) has been removed.
+func isEligibleFile(filePath string, triggerComm string) (bool, string) {
 	info, err := os.Stat(filePath)
 	if err != nil {
 		return false, "stat_failed"
@@ -196,12 +206,33 @@ func isEligibleFile(filePath string) (bool, string) {
 	if info.Size() > 100*1024*1024 {
 		return false, "too_large"
 	}
-	if !hasExecutableMagic(filePath) {
-		return false, "not_executable_magic"
+
+	// Condition 1: execute bit
+	if info.Mode()&0o111 != 0 {
+		return true, ""
 	}
-	return true, ""
+
+	// Condition 2: magic bytes
+	if hasExecutableMagic(filePath) {
+		return true, ""
+	}
+
+	// Condition 3: known interpreter as trigger
+	// Only applies for eBPF-driven scans where TriggerComm is available.
+	// Not used in full scan walks — no triggering process exists there.
+	if triggerComm != "" && utilities.KnownInterpreters[triggerComm] {
+		return true, ""
+	}
+
+	return false, "not_executable"
 }
 
+// hasExecutableMagic reads the first 4 bytes of a file and checks for
+// known executable format signatures.
+// ELF:      7f 45 4c 46
+// Shebang:  23 21  (#!)
+// MZ (PE):  4d 5a
+// Mach-O:   ca fe ba be
 func hasExecutableMagic(filePath string) bool {
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -214,20 +245,23 @@ func hasExecutableMagic(filePath string) bool {
 	if err != nil || n < 2 {
 		return false
 	}
+
+	// ELF
 	if n >= 4 && magic[0] == 0x7f && magic[1] == 0x45 && magic[2] == 0x4c && magic[3] == 0x46 {
 		return true
 	}
+	// Shebang
 	if magic[0] == '#' && magic[1] == '!' {
 		return true
 	}
+	// MZ / Windows PE
 	if magic[0] == 0x4d && magic[1] == 0x5a {
 		return true
 	}
+	// Mach-O fat binary
 	if n >= 4 && magic[0] == 0xca && magic[1] == 0xfe && magic[2] == 0xba && magic[3] == 0xbe {
 		return true
 	}
-	if n >= 4 && magic[3] == 0x0d {
-		return true
-	}
+
 	return false
 }

@@ -1,3 +1,8 @@
+// internal/jobs/autoruns/sources_linux.go
+//
+// Copyright © 2026 Lakshy Sharma lakshy.d.sharma@gmail.com
+// AGPL-3.0 License
+
 //go:build linux
 
 package autoruns
