@@ -1,68 +1,71 @@
-# Vajra
+# Vajra EDR
 
 An endpoint detection and response system engineered to be soft on your systems and your security teams.
 
 A huge shoutout to [Kraken](https://github.com/botherder/kraken) which is my inspiration to start this project.
 
-Made with :heart: in India
+Made with ❤️ in India
 
 ## Goals
 
-Build a modern endpoint detection and response system capable of routine system scans, behavioral monitoring, and remediation of malicious files.
+Build a modern, production-grade endpoint detection and response system with routine scanning, behavioral monitoring, and remediation — without becoming a resource hog or an alert machine gun.
 
 **What makes us different?**
 
-1. Reduced memory and CPU footprint through modern languages and careful engineering.
-2. Extra attention to minimizing alert fatigue through intelligent filtering and deduplication.
+1. Reduced memory and CPU footprint through careful engineering and load-aware autotune.
+2. Alert fatigue addressed at the architecture level — unified dedup, result caching, and a single Finding writer across all detection sources.
 3. eBPF-based monitoring — no kernel modules, no polling, no missed events.
-4. Single self-contained binary with embedded YARA rules and SQLite persistence.
-5. Analyzer pipeline architecture — YARA, hash lookup, LD_PRELOAD, reverse shell, and capability abuse checks run as composable stages.
-
-For roadmap and feature development plans refer to TODO.md.
+4. Normalized detection schema — all findings from all sources land in one table, making the UI, sync, and response system simple.
+5. Composable analyzer pipeline — YARA, hash lookup, LD_PRELOAD, capability abuse, and LOLBin checks run as independent stages. Adding a new analyzer is one struct and one line in service.go.
 
 ## Current Features
 
-1. eBPF syscall monitoring — file creation, process execution, network connections, memory events, namespace operations, kernel module loads.
-2. YARA file and process scanning via an autotuning worker pool with load-average awareness.
-3. Analyzer pipeline — pluggable detection stages with result caching, short-circuit on CRITICAL, and separate content vs runtime pipelines for process events.
-4. Runtime process analysis — LD_PRELOAD injection detection, reverse shell detection via stdio fd inspection, dangerous capability detection.
-5. Autorun/persistence scanner covering all major Linux persistence categories (systemd, cron, shell profiles, PAM, LD_PRELOAD, XDG, D-Bus, at jobs, anacron, SysV init).
-6. SQLite-backed event storage with retention-based cleanup and alert deduplication.
-7. Intelligent deduplication — TTL-based scan cache, magic-byte file filtering, head+tail+mtime QuickHash, alert-level dedup with count tracking.
-8. Automatic YARA rule updates from YARA Forge with 7-generation archive rotation.
-9. Network, memory, security, and module event persistence with severity classification.
+- eBPF syscall monitoring — process execution, file creation, network connections, memory events, dup2/dup3 stdio redirection, namespace operations, kernel module loads
+- Reverse shell detection via dup2/dup3 tracepoints — catches `bash -i >& /dev/tcp/...` that exec-time inspection misses
+- YARA file and process scanning via an autotuning worker pool with load-average awareness
+- Three-condition file eligibility — execute bit, magic bytes, or triggered by known interpreter
+- Runtime process analysis — LD_PRELOAD injection, dangerous capability detection
+- Autorun/persistence scanner — all major Linux persistence categories (systemd, cron, shell profiles, PAM, LD_PRELOAD, XDG, D-Bus, at jobs, anacron, SysV init)
+- Unified detection schema — all sources write through FindingWriter to a single detections table with normalized extension tables
+- Evidence snapshots — /proc state captured immediately on HIGH/CRITICAL detections
+- Process tree — every execve written as adjacency list for server-side recursive CTE traversal
+- SQLite persistence — WAL mode, retention-based cleanup, append-only audit log
+- Intelligent deduplication — TTL-based scan cache, QuickHash (head+tail+mtime), alert dedup with count tracking
+- Automatic YARA rule updates from YARA Forge with 7-generation archive rotation
+- CLI — `vajra scan [dir]`, `vajra rules update/status`
 
 ## Architecture
 
 eBPF Kernel Events
 │
 ▼
-Listener → Dispatcher (fan-out)
+Listener → Dispatcher (typed channel fan-out)
 │
-├── File channel → FileScanner → Analyzer Pipeline → DB
-├── Process channel → ProcessScanner → Content Pipeline + Runtime Pipeline → DB
-├── Network/Memory/Security/Module channels → EventSink → DB
-└── Autorun scanner (periodic) → DB
+├── File chan → FileScanner → Analyzer Pipeline → FindingWriter → detections
+├── Process chan → ProcessScanner → Content + Runtime Pipelines → FindingWriter → detections
+├── Dup chan → DupWatcher → socket check → FindingWriter → detections
+├── Network/Memory/Security/Module → EventSink → raw telemetry tables
+│
+└── (pull-based, periodic)
+AutorunScanner → FindingWriter → detections + autoruns
 
 ## Resources Required
 
-1. **CPUs**: 2 minimum, 4 recommended *(configurable)*
-2. **RAM**: 100 MB typical
-3. **Kernel**: 5.11+ with `CONFIG_DEBUG_INFO_BTF=y`
+- **CPUs**: 2 minimum, 4 recommended
+- **RAM**: 100 MB typical
+- **Kernel**: 5.11+ with `CONFIG_DEBUG_INFO_BTF=y`
 
-## Platform Support Matrix
+## Platform Support
 
 | OS | amd64 | arm64 |
-|-|-|-|
+|---|---|---|
 | Ubuntu 24.04+ | Yes | Planned |
 | Debian Trixie+ | Yes | Planned |
 | Fedora 42+ | Planned | Planned |
-| Windows 11 | Not Started | Not Started |
-| macOS | Not Started | Not Started |
+| Windows 11 | Not Started | — |
+| macOS | Not Started | — |
 
 ## Installation
-
-Download the latest `.deb` package from releases and install:
 
 ```bash
 sudo dpkg -i vajra_<version>_amd64.deb
@@ -70,19 +73,20 @@ sudo systemctl start vajra
 sudo systemctl status vajra
 ```
 
-Configuration lives at `/etc/vajra/config.yaml`. Logs at `/var/log/vajra/`. Database at `/var/lib/vajra/`.
+Configuration: `/etc/vajra/config.yaml` — Logs: `/var/log/vajra/` — Database: `/var/lib/vajra/`
 
 ## CLI
 
 ```bash
-vajra -c /etc/vajra/config.yaml          # start in monitor mode
-vajra rules update                        # check and download updated YARA rules
-vajra rules status                        # show current rules version and archive count
+vajra -c /etc/vajra/config.yaml    # start in monitor mode
+vajra scan [directory]             # blocking full filesystem scan
+vajra rules update                 # check and download updated YARA rules
+vajra rules status                 # show current rules version and archive count
 ```
 
-## Contributing
+## Build
 
-### Build Dependencies
+### Dependencies
 
 **Debian/Ubuntu**
 
@@ -109,7 +113,7 @@ make linux_amd64
 make linux_arm64
 ```
 
-### Configuration
+## Configuration Reference
 
 ```yaml
 generic_settings:
@@ -156,5 +160,3 @@ performance_settings:
 ## Security
 
 If you spot any security issues please contact <lakshy.d.sharma@gmail.com> directly.
-Best effort will be made to understand and resolve concerns quickly.
-Thank you for your awareness in advance.

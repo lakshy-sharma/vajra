@@ -1,6 +1,6 @@
 // internal/analyzer/analyzer.go
 //
-// Copyright © 2025 Lakshy Sharma lakshy.d.sharma@gmail.com
+// Copyright © 2026 Lakshy Sharma lakshy.d.sharma@gmail.com
 // AGPL-3.0 License
 
 package analyzer
@@ -12,35 +12,37 @@ import (
 	"vajra/shared/models"
 )
 
-// AnalysisResult is returned by every Analyzer implementation.
-type AnalysisResult struct {
+// Analyzer is the interface every detection stage implements.
+// Stateless — safe to reuse across scans and goroutines.
+// Path is the file or exe path being analysed. PID context
+// is available via CtxWithPID for process-specific analyzers.
+type Analyzer interface {
+	Name() string
+	Analyze(ctx context.Context, path string) (Result, error)
+}
+
+// Result is returned by every Analyzer implementation.
+type Result struct {
 	Severity    models.EventSeverity
 	YaraMatches []models.YaraMatch
 	Notes       string
 	// Skip signals the caller should not insert a DB record.
-	// Set only by the cache for previously seen CLEAN binaries.
+	// Set only by the cache on a previously seen CLEAN binary.
 	Skip bool
 }
 
-// Analyzer is the interface every analysis step implements.
-type Analyzer interface {
-	Name() string
-	Analyze(ctx context.Context, path string) (AnalysisResult, error)
-}
-
-// ── Context helpers ───────────────────────────────────────────
+// ── PID context ───────────────────────────────────────────────
 
 type ctxKey int
 
 const pidKey ctxKey = 0
 
-// CtxWithPID stores a PID in ctx for process analyzers to read.
+// CtxWithPID stores a PID for process analyzers to read.
 func CtxWithPID(ctx context.Context, pid uint32) context.Context {
 	return context.WithValue(ctx, pidKey, pid)
 }
 
 // PIDFromCtx retrieves the PID stored by CtxWithPID.
-// Returns 0 and false if no PID is present.
 func PIDFromCtx(ctx context.Context) (uint32, bool) {
 	pid, ok := ctx.Value(pidKey).(uint32)
 	return pid, ok
@@ -50,26 +52,25 @@ func PIDFromCtx(ctx context.Context) (uint32, bool) {
 
 // ResultCache stores content-analysis results keyed on SHA256.
 // Only used for file-content analyzers (YARA, hash lookup).
-// Runtime analyzers (LD_PRELOAD, reverse shell, capability) are
-// never cached — their findings depend on process state, not
-// file content.
+// Runtime analyzers are never cached — their findings depend on
+// live process state, not file content.
 type ResultCache struct {
 	mu    sync.RWMutex
-	items map[string]AnalysisResult
+	items map[string]Result
 }
 
 func NewResultCache() *ResultCache {
-	return &ResultCache{items: make(map[string]AnalysisResult)}
+	return &ResultCache{items: make(map[string]Result)}
 }
 
-func (c *ResultCache) Get(sha256 string) (AnalysisResult, bool) {
+func (c *ResultCache) Get(sha256 string) (Result, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	r, ok := c.items[sha256]
 	return r, ok
 }
 
-func (c *ResultCache) Set(sha256 string, r AnalysisResult) {
+func (c *ResultCache) Set(sha256 string, r Result) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.items[sha256] = r
@@ -83,9 +84,7 @@ func (c *ResultCache) Len() int {
 
 // ── Pipeline ──────────────────────────────────────────────────
 
-// Pipeline runs a list of Analyzers in order.
-// Short-circuits on the first CRITICAL result.
-// Optionally checks a ResultCache before running analyzers.
+// Pipeline runs a list of Analyzers in order, short-circuiting on CRITICAL.
 type Pipeline struct {
 	analyzers []Analyzer
 	cache     *ResultCache
@@ -93,7 +92,6 @@ type Pipeline struct {
 
 type PipelineOption func(*Pipeline)
 
-// WithCache attaches a ResultCache to the pipeline.
 func WithCache(c *ResultCache) PipelineOption {
 	return func(p *Pipeline) { p.cache = c }
 }
@@ -107,11 +105,10 @@ func NewPipeline(analyzers []Analyzer, opts ...PipelineOption) *Pipeline {
 }
 
 // Run executes the pipeline with cache support.
-// On a CLEAN cache hit returns Skip=true — caller skips DB insert.
-// On a non-CLEAN cache hit returns the cached result without
-// re-running analyzers — caller still inserts (new execution of
-// a known-bad binary is always worth recording).
-func (p *Pipeline) Run(ctx context.Context, path, sha256 string) (AnalysisResult, error) {
+// CLEAN cache hit → Skip=true, caller skips DB insert.
+// Non-CLEAN cache hit → cached result returned, caller still inserts
+// because a new execution of a known-bad binary is always worth recording.
+func (p *Pipeline) Run(ctx context.Context, path, sha256 string) (Result, error) {
 	if p.cache != nil && sha256 != "" {
 		if cached, ok := p.cache.Get(sha256); ok {
 			if cached.Severity == models.SeverityClean {
@@ -126,70 +123,55 @@ func (p *Pipeline) Run(ctx context.Context, path, sha256 string) (AnalysisResult
 	if p.cache != nil && sha256 != "" {
 		p.cache.Set(sha256, result)
 	}
-
 	return result, nil
 }
 
-// RunUncached executes the pipeline without consulting or
-// populating the cache. Used for runtime analyzers whose
-// findings depend on live process state, not file content.
-func (p *Pipeline) RunUncached(ctx context.Context, path string) (AnalysisResult, error) {
+// RunUncached executes the pipeline without consulting the cache.
+// Used for runtime analyzers whose findings depend on live process state.
+func (p *Pipeline) RunUncached(ctx context.Context, path string) (Result, error) {
 	return p.run(ctx, path), nil
 }
 
-// run is the shared execution core used by both Run and RunUncached.
-func (p *Pipeline) run(ctx context.Context, path string) AnalysisResult {
-	merged := AnalysisResult{Severity: models.SeverityClean}
-
+func (p *Pipeline) run(ctx context.Context, path string) Result {
+	merged := Result{Severity: models.SeverityClean}
 	for _, a := range p.analyzers {
 		result, err := a.Analyze(ctx, path)
 		if err != nil {
-			// Error from one analyzer does not stop the chain.
-			// The caller logs errors using the analyzer Name().
 			continue
 		}
-
 		if severityRank(result.Severity) > severityRank(merged.Severity) {
 			merged.Severity = result.Severity
 		}
-		if len(result.YaraMatches) > 0 {
-			merged.YaraMatches = append(merged.YaraMatches, result.YaraMatches...)
-		}
+		merged.YaraMatches = append(merged.YaraMatches, result.YaraMatches...)
 		if result.Notes != "" {
 			if merged.Notes != "" {
 				merged.Notes += "; "
 			}
 			merged.Notes += result.Notes
 		}
-
-		// Short-circuit on CRITICAL.
 		if result.Severity == models.SeverityCritical {
 			break
 		}
 	}
-
 	return merged
 }
 
-// mergeResults merges b into a, taking the higher severity.
+// MergeResults merges b into a, taking the higher severity.
 // Used by ProcessScanner to combine content and runtime results.
-func MergeResults(a, b AnalysisResult) AnalysisResult {
+// Runtime findings clear Skip — a clean content cache result is
+// overridden if runtime analysis finds something.
+func MergeResults(a, b Result) Result {
 	merged := a
 	if severityRank(b.Severity) > severityRank(merged.Severity) {
 		merged.Severity = b.Severity
 	}
-	if len(b.YaraMatches) > 0 {
-		merged.YaraMatches = append(merged.YaraMatches, b.YaraMatches...)
-	}
+	merged.YaraMatches = append(merged.YaraMatches, b.YaraMatches...)
 	if b.Notes != "" {
 		if merged.Notes != "" {
 			merged.Notes += "; "
 		}
 		merged.Notes += b.Notes
 	}
-	// Runtime results never set Skip — only content cache does.
-	// If either result says Skip, the merge clears it because
-	// a runtime finding overrides a clean content result.
 	if b.Severity != models.SeverityClean {
 		merged.Skip = false
 	}

@@ -10,7 +10,7 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
-	"vajra/internal/jobs"
+	"vajra/internal/job"
 	"vajra/internal/utilities"
 )
 
@@ -39,7 +39,7 @@ restarted automatically after a successful update.`,
 		}
 
 		logger := utilities.GetLogger(cfg)
-		syncer := jobs.NewRuleSyncer(logger, cfg.RulesSettings)
+		syncer := job.NewRuleSyncer(logger, cfg.RulesSettings)
 
 		fmt.Println("Checking for rule updates...")
 		if err := syncer.RunOnce(); err != nil {
@@ -66,7 +66,7 @@ var rulesStatusCmd = &cobra.Command{
 
 		// Hash the current rules file.
 		logger := utilities.GetLogger(cfg)
-		syncer := jobs.NewRuleSyncer(logger, cfg.RulesSettings)
+		syncer := job.NewRuleSyncer(logger, cfg.RulesSettings)
 
 		hash, err := syncer.LocalHash()
 		if err != nil {

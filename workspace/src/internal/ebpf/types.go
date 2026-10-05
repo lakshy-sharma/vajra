@@ -9,11 +9,6 @@ package ebpf
 
 import "bytes"
 
-// ============================================================
-// Event type constants.
-// MUST match the #define values in c/ebpf_events.c exactly.
-// ============================================================
-
 const (
 	// Process events
 	EventTypeProcessExec     uint32 = 1
@@ -24,6 +19,7 @@ const (
 	EventTypeProcessMmap     uint32 = 9
 	EventTypeProcessMprotect uint32 = 10
 	EventTypeProcessCapset   uint32 = 11
+	EventTypeProcessDupStdio uint32 = 12 // dup2/dup3 onto fd 0/1/2
 
 	// File events
 	EventTypeFileOpen   uint32 = 20
@@ -46,30 +42,12 @@ const (
 	EventTypeNamespaceEnter  uint32 = 71
 )
 
-// ============================================================
-// RawEvent — the only type that flows out of the listener
-// into the dispatcher. Data holds a typed struct boxed as
-// interface{} after deserialization.
-// ============================================================
-
 type RawEvent struct {
 	Type uint32
 	Data interface{}
 }
 
-// ============================================================
-// Go-side event structs.
-//
-// Field layout mirrors the C structs in c/ebpf_events.c
-// exactly, including explicit pad fields.
-// binary.Read in the listener reads these field by field in
-// order, so every pad byte in C must have a corresponding
-// field here.
-// ============================================================
-
 // ProcessEvent mirrors struct process_event.
-// Used for: execve, setuid, setgid, memfd_create.
-// Size: 7×4 + 16 + 256 + 512 + 256 + 4 + 4 + 8 + 8 = 1096 bytes
 type ProcessEvent struct {
 	Type      uint32
 	PID       uint32
@@ -82,16 +60,14 @@ type ProcessEvent struct {
 	Filename  [256]byte
 	Args      [512]byte
 	CWD       [256]byte
-	Pad0      uint32  // mirrors __u32 _pad0 in C
-	Flags     uint32  // memfd flags or 0
-	Pad1      [4]byte // ← added: mirrors _ [4]byte in bpfProcessEvent
+	Pad0      uint32
+	Flags     uint32
+	Pad1      [4]byte
 	Timestamp uint64
 	Ret       int64
 }
 
 // FileEvent mirrors struct file_event.
-// Used for: openat (O_CREAT), unlinkat, renameat2, fchmodat.
-// Size: 4×4 + 16 + 256 + 256 + 4 + 4 + 8 + 8 + 8 = 580 bytes
 type FileEvent struct {
 	Type       uint32
 	PID        uint32
@@ -108,8 +84,6 @@ type FileEvent struct {
 }
 
 // NetworkEvent mirrors struct network_event.
-// Used for: connect, bind, socket (raw/packet), DNS.
-// Size: 4×4 + 16 + 16 + 16 + 2 + 2 + 1 + 1 + 2 + 8 + 8 = 88 bytes
 type NetworkEvent struct {
 	Type      uint32
 	PID       uint32
@@ -122,33 +96,29 @@ type NetworkEvent struct {
 	DstPort   uint16
 	Protocol  uint8
 	Family    uint8
-	Pad0      [2]byte // mirrors __u8 _pad0[2] in C
+	Pad0      [2]byte
 	Timestamp uint64
 	Ret       int64
 }
 
 // MmapEvent mirrors struct mmap_event.
-// Used for: mmap (PROT_EXEC only), mprotect (PROT_EXEC only).
-// Size: 3×4 + 16 + 4 + 8 + 8 + 4 + 4 + 4 + 4 + 256 + 8 = 336 bytes
 type MmapEvent struct {
 	Type      uint32
 	PID       uint32
 	UID       uint32
 	Comm      [16]byte
-	Pad0      uint32 // mirrors __u32 _pad0 in C
+	Pad0      uint32
 	Addr      uint64
 	Length    uint64
 	Prot      uint32
 	MapFlags  uint32
 	Fd        int32
-	Pad1      uint32 // mirrors __u32 _pad1 in C
+	Pad1      uint32
 	Filename  [256]byte
 	Timestamp uint64
 }
 
 // PtraceEvent mirrors struct ptrace_event.
-// Used for: ptrace only.
-// Size: 4×4 + 16 + 4 + 4 + 8 + 8 = 56 bytes
 type PtraceEvent struct {
 	Type      uint32
 	PID       uint32
@@ -156,20 +126,18 @@ type PtraceEvent struct {
 	UID       uint32
 	Comm      [16]byte
 	Request   uint32
-	Pad0      uint32 // mirrors __u32 _pad0 in C
+	Pad0      uint32
 	Timestamp uint64
 	Ret       int64
 }
 
 // CapsetEvent mirrors struct capset_event.
-// Used for: capset only.
-// Size: 3×4 + 16 + 4 + 8 + 8 + 8 + 8 + 8 = 72 bytes
 type CapsetEvent struct {
 	Type        uint32
 	PID         uint32
 	UID         uint32
 	Comm        [16]byte
-	Pad0        uint32 // mirrors __u32 _pad0 in C
+	Pad0        uint32
 	Effective   uint64
 	Permitted   uint64
 	Inheritable uint64
@@ -177,9 +145,24 @@ type CapsetEvent struct {
 	Ret         int64
 }
 
+// DupEvent mirrors struct dup_event.
+// Emitted when dup2 or dup3 redirects any fd onto stdin, stdout, or stderr.
+// OldFd is the source — if it resolves to a network socket inode in
+// /proc/net/tcp* the combination is a reverse shell.
+// NewFd is always 0, 1, or 2 — kernel-side filter enforces this.
+// Size: 4+4+4+4+16+4+4+8 = 48 bytes
+type DupEvent struct {
+	Type      uint32
+	PID       uint32
+	PPID      uint32
+	UID       uint32
+	Comm      [16]byte
+	OldFd     uint32
+	NewFd     uint32
+	Timestamp uint64
+}
+
 // NamespaceEvent mirrors struct namespace_event.
-// Used for: unshare, setns.
-// Size: 3×4 + 16 + 4 + 4 + 8 + 8 = 52 bytes
 type NamespaceEvent struct {
 	Type      uint32
 	PID       uint32
@@ -187,14 +170,12 @@ type NamespaceEvent struct {
 	Comm      [16]byte
 	NSType    uint32
 	Flags     uint32
-	Pad1      [4]byte // ← added: mirrors _ [4]byte in bpfNamespaceEvent
+	Pad1      [4]byte
 	Timestamp uint64
 	Ret       int64
 }
 
 // ModuleEvent mirrors struct module_event.
-// Used for: init_module, finit_module.
-// Size: 4×4 + 16 + 256 + 8 + 8 = 304 bytes
 type ModuleEvent struct {
 	Type      uint32
 	PID       uint32
@@ -206,11 +187,6 @@ type ModuleEvent struct {
 	Ret       int64
 }
 
-// dnsEventRaw mirrors struct dns_event_raw.
-// Unexported — used only inside the listener for binary.Read.
-// The listener parses the payload with gopacket and produces
-// a DNSEvent which is what the dispatcher and consumers see.
-// Size: 2×4 + 8 + 16 + 2×4 + 256 = 296 bytes
 type dnsEventRaw struct {
 	Type       uint32
 	PID        uint32
@@ -221,43 +197,30 @@ type dnsEventRaw struct {
 	Payload    [256]byte
 }
 
-// ============================================================
-// Dispatcher-level types.
-// These are produced by the dispatcher, not deserialized
-// directly from eBPF bytes.
-// ============================================================
-
-// SecurityEvent consolidates ptrace, capset, and namespace
+// SecurityEvent consolidates ptrace, capset, namespace, and dup_stdio
 // events into a single type for the security_events table.
-// The dispatcher translates PtraceEvent / CapsetEvent /
-// NamespaceEvent into this before sending downstream.
 type SecurityEvent struct {
 	Type      uint32
 	EventName string
 	PID       uint32
 	UID       uint32
 	Comm      string
-	TargetPID uint32 // ptrace only, 0 otherwise
-	Details   string // JSON string of event-specific fields
+	TargetPID uint32
+	Details   string
 	Timestamp uint64
 }
 
-// DNSQuestion is one question entry from a parsed DNS packet.
 type DNSQuestion struct {
 	Name string
 	Type string
 }
 
-// DNSAnswer is one answer entry from a parsed DNS packet.
 type DNSAnswer struct {
 	Name string
 	IP   string
 	TTL  uint32
 }
 
-// DNSEvent is the parsed DNS event produced by the listener
-// from a dnsEventRaw after gopacket parsing.
-// Sent on the Network channel with Type = EventTypeNetDNS.
 type DNSEvent struct {
 	PID       uint32
 	UID       uint32
@@ -267,26 +230,17 @@ type DNSEvent struct {
 	Answers   []DNSAnswer
 }
 
-// ============================================================
-// Channel bundle.
-// Created once in service.go, passed to the dispatcher and
-// to every job that consumes events.
-// ============================================================
-
-// Channels holds one typed channel per event category.
-// Buffer depth should match the YARA pool queue size so
-// neither side applies unwanted back-pressure on the other.
 type Channels struct {
 	Process   chan ProcessEvent
 	File      chan FileEvent
 	Network   chan NetworkEvent
-	Memory    chan MmapEvent // mmap + mprotect events
+	Memory    chan MmapEvent
 	Security  chan SecurityEvent
 	Module    chan ModuleEvent
 	Namespace chan NamespaceEvent
+	Dup       chan DupEvent
 }
 
-// NewChannels allocates all typed event channels.
 func NewChannels(bufferDepth int) *Channels {
 	return &Channels{
 		Process:   make(chan ProcessEvent, bufferDepth),
@@ -296,15 +250,10 @@ func NewChannels(bufferDepth int) *Channels {
 		Security:  make(chan SecurityEvent, bufferDepth),
 		Module:    make(chan ModuleEvent, bufferDepth),
 		Namespace: make(chan NamespaceEvent, bufferDepth),
+		Dup:       make(chan DupEvent, bufferDepth),
 	}
 }
 
-// ============================================================
-// Helpers
-// ============================================================
-
-// CStringToGo converts a null-terminated C string held in a
-// byte slice to a Go string. Replaces utilities.ConvertCStringToGo.
 func CStringToGo(b []byte) string {
 	n := bytes.IndexByte(b, 0)
 	if n == -1 {
@@ -313,7 +262,6 @@ func CStringToGo(b []byte) string {
 	return string(b[:n])
 }
 
-// In types.go — add this function
 func EventTypeName(t uint32) string {
 	names := map[uint32]string{
 		1:  "execve",
@@ -324,6 +272,7 @@ func EventTypeName(t uint32) string {
 		9:  "mmap",
 		10: "mprotect",
 		11: "capset",
+		12: "dup_stdio",
 		20: "file_open",
 		22: "file_delete",
 		23: "file_rename",

@@ -32,7 +32,7 @@ rules_settings:
   rules_archive_count: 7
 
 scan_settings:
-  target_directory: "/home/lakshy/Citadel"
+  target_directory: "/home/lakshy-sharma"
   exclusion_rules:
     exclude_paths:
     exclude_extensions:

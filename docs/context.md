@@ -1,194 +1,171 @@
-# Vajra EDR — Architecture and Context Document
+# Vajra EDR — Architecture and Context
 
-# Updated: October 2026
+Updated: October 2026
 
-## Repository Layout
+## Interface Design Decisions
 
-workspace/src/
-internal/
-analyzer/
-analyzer.go # Analyzer interface, Pipeline, ResultCache, MergeResults, PID context helpers
-yara.go # YARAAnalyzer — wraps pool, blocks until result
-ebpf/
-c/ebpf_events.c # BPF C program — kernel side
-types.go # Event structs, Channels, CStringToGo, EventTypeName
-listener.go # BPF load, tracepoint attach, perf read loop
-dispatcher.go # RawEvent → typed channels, SecurityEvent translation
-db/
-db.go # Open, OpenReadOnly, migrate, pragmas
-queries/
-autoruns.go # Insert, MarkInactive, UpdateLastSeen, LoadActive
-cleanup.go # RunCleanup — calls all table DeleteBefore methods
-files.go # Insert (populates r.ID), IncrementDedupCount, ListBySeverity
-memory.go # Insert, ListByPID, DeleteBefore
-network.go # Insert, ListByDstPort, DeleteLowSeverityBefore
-processes.go # Insert (populates r.ID), IncrementDedupCount, ListBySeverity
-security.go # Insert, UpdateStatus, ListCritical
-jobs/
-autoruns/
-autoruns.go # Scanner, Diff, RunAutorunScan goroutine entry
-sources_linux.go # All 12 Linux persistence sources
-cleanup.go # RunDBCleanup goroutine entry
-eventsink.go # Network/Memory/Security/Module → DB; memory dedup pid+prot 60s window
-filescanner.go # filter→eligible→QuickHash→SHA256→pipeline→dedup→insert
-processscanner.go # resolve→dedup→runtime pipeline→content pipeline→merge→dedup→insert
-rulesync.go # GitHub API tag check→download→zip verify→archive→atomic replace→restart
-procanalyzer/
-ldpreload.go # /proc/PID/environ; standard + snap + snapd paths
-revshell.go # /proc/PID/fd/0,1,2 vs /proc/net/tcp and tcp6
-capability.go # /proc/PID/status CapEff bitmask; always runs regardless of ProcessFilter
-scanner/
-dedup.go # DedupTracker — rule+path+severity key, window-based, RecordInsert
-filter.go # ExclusionFilter, ProcessFilter, RecentScanTracker
-hasher.go # QuickHash (head+tail+mtime), FullSHA256, HashFile, StatFile
-pool.go # Pool, autotune with /proc/loadavg four-zone scaling, Submit/Enqueue
-severity.go # ClassifyYARASeverity — APT/MALWARE/MAL/Ransomware → CRITICAL; HKTL/Exploit/EXPL → HIGH; SUSP → MEDIUM
-yara.go # RulesCompiler — ExtractRules, CompileRules
-utilities/
-  clock.go          # SystemInfo, LoadSystemInfo, EBPFTimestampToUnix
-  config.go         # Config struct with RulesSettings, LoadConfig, applyDefaults  
-  logging.go        # GetLogger, lumberjack rolling file
+### Why three separate abstractions: Watcher, Scanner, Job
 
-entrypoint.go # Config load, directory setup, LoadSystemInfo, mode dispatch
-service.go # startServiceMode, wireJobs, wirePipelines
-shared/models/
-models.go # All DB model structs — MachineID, DedupCount, FileHash on all relevant structs
-cmd/
-root.go # Cobra root, --config flag
-rules.go # vajra rules update / vajra rules status
+The original flat `jobs/` package mixed three fundamentally different execution models:
 
-## Schema Summary
+- **Watcher** — push-based, blocks on a channel, reacts to kernel events. FileScanner, ProcessScanner, DupWatcher, EventSink.
+- **Scanner** — pull-based, walks a data source on a timer or at startup. AutorunScanner, SecretsScanner, RunningProcessScanner, UserProfileScanner.
+- **Job** — utility goroutine with no detection role. DBCleanup, RuleSyncer, AggregationJob.
 
-All five event tables (`file_scan_results`, `process_scan_results`, `network_events`, `memory_events`, `security_events`) have:
+Separating them means `service.go` wires each category uniformly. Adding a new detection component is one constructor call and one `go x.Run(ctx, wg)`. Nothing in service.go needs to know what the component does internally.
 
-- `machine_id TEXT NOT NULL DEFAULT ''` — endpoint identity from /etc/machine-id
-- `event_time INTEGER NOT NULL` — wall clock Unix time converted from eBPF boot-relative timestamp
+EventSink is deliberately not wired through the `Watcher` interface because it consumes multiple channels simultaneously. Forcing it through `Run(ctx, wg)` would require hiding the channel fan-out inside a struct that owns all channels — which would break the principle that each watcher owns its own channel dependency injected at construction time.
 
-`file_scan_results` and `process_scan_results` additionally have:
+### Why Analyzer is separate from Watcher/Scanner
 
-- `dedup_count INTEGER NOT NULL DEFAULT 0` — incremented on duplicate detections within window
+Analyzers are stateless functions: path in, result out. They compose into pipelines, cache on SHA256, and short-circuit on CRITICAL. They have no lifecycle — no goroutine, no channel, no timer.
 
-`process_scan_results` additionally has:
+Watchers and Scanners have lifecycle. They own goroutines. They produce Findings as output.
 
-- `file_hash TEXT` — SHA256 of scanned binary, populated on non-clean results only
+Mixing them would mean either giving Analyzers artificial lifecycle (wrong) or giving Watchers the pipeline composition logic (wrong). The boundary is: Analyzers are called by Watchers and Scanners, never the reverse.
 
-`sync_state` table exists for future remote sync watermarking:
+### Why RuleMatch is an interface in utilities/
 
-- `table_name TEXT PRIMARY KEY`, `last_synced_id INTEGER`, `last_synced_at INTEGER`, `synced_rows INTEGER`
+Severity classification was originally YARA-specific (`ClassifyYARASeverity` taking `[]YaraMatch`). Moving to a `RuleMatch` interface in `utilities/` means:
 
-`process_tree` table (to be written next session):
+- betterleaks findings implement `RuleMatch` via `RuleID()` and `RuleTags()`
+- Hash lookup results implement `RuleMatch` via `RuleID()` returning the malware family
+- `ClassifySeverity([]RuleMatch)` works for all three without knowing which engine produced them
 
-- pid, ppid, comm, exe_path — from ProcessEvent fields already captured
-- machine_id — for multi-endpoint server queries
-- event_time — kernel wall clock time of execve
-- Queried via recursive CTE: WITH RECURSIVE tree AS (SELECT *FROM process_tree WHERE pid=? UNION ALL SELECT p.* FROM process_tree p JOIN tree t ON p.ppid=t.pid)
-- Prerequisite for: LOLBin chain detection, behavioral correlation, evidence snapshots, server-side attack reconstruction
+The YARA naming convention (APT_, MALWARE_, HKTL_, SUSP_) becomes the shared vocabulary. Any engine that follows it gets severity classification for free.
 
-`known_bad_hashes` table (to be written next session):
+### Why FindingWriter is the single DB insertion point
 
-- sha256 TEXT PRIMARY KEY
-- family TEXT — malware family name from feed
-- source TEXT NOT NULL — 'malwarebazaar', 'virustotal', 'stix', 'manual'
-- tags TEXT — JSON array of tags from feed
-- added_at INTEGER NOT NULL
-- stix_id TEXT — null until STIX engine exists; back-reference for when STIX bundles populate this table
+Before the refactor, FileScanner wrote to `file_scan_results`, ProcessScanner wrote to `process_scan_results`, DupWatcher wrote to `security_events`. Three separate dedup implementations, three separate insert paths, no unified detection record.
 
-## Key Design Decisions
+FindingWriter enforces:
 
-### SystemInfo — single source of truth
+- One dedup implementation for all sources
+- One schema (detections + extension tables) for all sources
+- Evidence capture triggered in one place (on HIGH/CRITICAL)
+- Metrics tracked in one place
 
-`utilities.LoadSystemInfo()` reads `/etc/machine-id` and computes boot epoch from `/proc/uptime` once at startup. Both `EventSink` and `ProcessScanner` and `FileScanner` receive it as a dependency. `EBPFTimestampToUnix(nsec uint64) int64` converts `bpf_ktime_get_ns()` values to wall clock seconds. No component computes its own boot epoch independently.
+The cost is that all detection sources must produce a `Finding` value. This is correct — it means each source only needs to know what it detected, not how to store it.
 
-### Two-pipeline process scanner
+### Why detections is unified but extension tables are separate
 
-Content pipeline (YARA + future HashAnalyzer) is cached via ResultCache keyed on SHA256 and filter-aware — trusted processes skip it entirely. Runtime pipeline (LDPreload, RevShell, Capability) is never cached and always runs regardless of ProcessFilter. Rationale: a trusted process name exhibiting reverse shell behaviour is more suspicious than an unknown one. `MergeResults()` takes the higher severity across both pipelines and clears `Skip` if the runtime pipeline found anything.
+A single `details TEXT` JSON column becomes a dumping ground. The extension table design instead:
 
-### DedupTracker
+- `detection_artifacts` — file hash + YARA matches (file/process detections only)
+- `detection_network` — socket details (reverse shell detections only)
+- `detection_secrets` — betterleaks findings (secrets scanner only)
+- `detection_extensions` — key/value rows, one per field, indexed on key
 
-Keyed on `rule+path+severity`. `CheckAndRecord()` returns `shouldInsert bool` and `*DedupEntry`. First occurrence: insert to DB, call `RecordInsert(key, record.ID)` to store the row ID. Subsequent occurrences within window: call `IncrementDedupCount(entry.RecordID)` instead of inserting. Severity escalation on the same path always generates a new row since the key changes. Clean results bypass dedup entirely.
+The last one is the escape hatch. It exists to avoid schema migrations for source-specific fields that don't warrant a dedicated column. Each key gets its own row so `WHERE key='autorun_category' AND value='systemd_system'` is index-assisted.
 
-`Insert()` on FileQueries and ProcessQueries populates `r.ID` via `LastInsertId()` — this is required for `RecordInsert` to work correctly.
+### Why the file size floor is 4 bytes, not 100MB ceiling
 
-### ResultCache
+The original 10-byte floor and 100MB ceiling were engineering shortcuts. The floor is correct in spirit — nothing meaningful executes in under 4 bytes. The ceiling is wrong — a 150MB binary is absolutely a threat. Packed malware and droppers don't respect size limits.
 
-Keyed on SHA256, no TTL. YARA results are deterministic for a given binary content. Cache cleared on agent restart which coincides with rule recompile at startup. When HashAnalyzer is added it will also consult this cache — a known-bad hash match short-circuits YARA entirely.
+The correct protection against large files stalling the YARA pool is the per-file scan timeout (`single_file_scan_timeout_sec` in config), not a size cap. YARA aborts the scan and returns an error on timeout. The ceiling has been removed. The floor is 4 bytes.
 
-### Event sink — no analysis
+### Why process_tree is never pruned
 
-Raw kernel event recording only. Severity is heuristic: dst port numbers for network, prot flags for memory, event name for security. Detection logic lives exclusively in the file and process scanner pipelines. This keeps the sink on the hot path with minimal latency.
+Process tree completeness matters more than disk space. A single missing execve row creates a hole in the ancestry chain that breaks:
 
-### Memory dedup — per-goroutine map
+- Server-side recursive CTE traversal
+- LOLBin parent context lookup
+- Behavioral correlation
+- Evidence snapshot context
 
-`consumeMemory` owns its dedup map exclusively. No mutex needed since only one goroutine reads and writes it. Cleanup ticker runs inside the same select loop. This is structurally different from DedupTracker which is shared and mutex-protected.
+Retention cleanup touches `detections` (resolved only) and raw telemetry (age-based). It never touches `process_tree`.
 
-### Rule syncer — tag-based not hash-based
+### Why DupWatcher writes through FindingWriter, not security_events
 
-YARA Forge does not publish a separate SHA256 manifest. The syncer calls the GitHub releases API for `tag_name` (e.g. `20260816`) and compares against a `.rules_version` file stored alongside `rules.zip`. On mismatch: download → verify ZIP magic bytes (PK\x03\x04) → archive current with timestamp name → atomic `os.Rename` → write new tag → prune oldest archives beyond `RulesArchiveCount` → `systemctl restart vajra`.
+Reverse shell is a detection, not raw telemetry. Raw telemetry tables record everything the kernel produces — ptrace, capset, namespace, dns, network connections — without analysis. DupWatcher performs analysis (socket inode lookup, inet table cross-reference) and produces a confirmed finding. That belongs in `detections` alongside YARA hits and capability detections, not mixed into the raw event stream.
 
-### Pool autotune — four load zones
+### Why EventSink bypasses FindingWriter
 
-Reads `/proc/loadavg` every 10s. Below 0.5×CPU: grow freely on any queue depth. 0.5–0.8×CPU: grow only if queue depth exceeds worker count. 0.8–1.0×CPU: hold current size. Above 1.0×CPU: log shrink intent (actual shrink deferred — requires per-worker cancel contexts).
+EventSink records everything including noise. Network events include every DNS query and outbound connection. Memory events include every mmap with PROT_EXEC. Security events include every ptrace call. These are not findings — they are raw observability data for the Sigma engine and behavioral correlation server-side.
 
-### Planned architecture for remote pipeline
+Running them through FindingWriter would create millions of CLEAN detection rows that serve no purpose locally. The distinction is: FindingWriter is for anomalies. EventSink is for forensic completeness.
 
-Vajra (endpoint)
-→ Fluentbit (log shipping)
-→ OpenSearch / ClickHouse (hot storage)
-→ Rule processing engine (Sigma, correlation, STIX enrichment)
-→ PostgreSQL (analyst workflow state)
-→ UI
+## eBPF Tracepoints
 
-Sigma and STIX belong server-side where cross-endpoint log sequences and relationship graphs are available. The `known_bad_hashes` table is the local cache that the STIX engine will populate when built — `stix_id` column is already in the schema for back-reference.
+| Tracepoint | Event | Notes |
+|---|---|---|
+| sys_enter_execve | ProcessEvent | cmdline from /proc/PID/cmdline in Go |
+| sys_enter_setuid | ProcessEvent | |
+| sys_enter_setgid | ProcessEvent | |
+| sys_enter_memfd_create | ProcessEvent | |
+| sys_enter_ptrace | PtraceEvent → SecurityEvent | |
+| sys_enter_mmap | MmapEvent | PROT_EXEC only |
+| sys_enter_mprotect | MmapEvent | PROT_EXEC only |
+| sys_enter_capset | CapsetEvent → SecurityEvent | |
+| sys_enter_dup2 | DupEvent | newfd <= 2 kernel-side filter |
+| sys_enter_dup3 | DupEvent | newfd <= 2 kernel-side filter |
+| sys_enter_openat | FileEvent | O_CREAT only |
+| sys_enter_unlinkat | FileEvent | |
+| sys_enter_renameat2 | FileEvent | |
+| sys_enter_fchmodat | FileEvent | |
+| sys_enter_connect | NetworkEvent | AF_INET/AF_INET6 only |
+| sys_enter_bind | NetworkEvent | AF_INET/AF_INET6 only |
+| sys_enter_socket | NetworkEvent | SOCK_RAW/SOCK_PACKET only |
+| sys_enter_sendto | dns_event_raw | port 53 only |
+| sys_enter_sendmsg | dns_event_raw | port 53 only, bpf_probe_read_user for msg_name |
+| sys_enter_init_module | ModuleEvent | name always empty |
+| sys_enter_finit_module | ModuleEvent | name always empty — bpf_d_path unavailable in tracepoints |
+| sys_enter_unshare | NamespaceEvent → SecurityEvent | |
+| sys_enter_setns | NamespaceEvent → SecurityEvent | |
 
-### Process tree as primary correlation primitive
+## Schema
 
-The process tree is not stored for detection purposes alone. It is the
-primary data structure the server uses to reconstruct attack chains.
-A flat stream of process events with pid/ppid/machine_id is sufficient
-for the server to build the full execution forest via recursive CTE.
+### Detection tables (non-clean findings)
 
-The agent's responsibility is to write every execve event to the
-process_tree table reliably and with accurate timestamps. The server's
-responsibility is to traverse that tree when correlating alerts.
+detections
+├── detection_artifacts FK → detections.id (file hash, YARA matches)
+├── detection_network FK → detections.id (socket details)
+├── detection_secrets FK → detections.id (betterleaks, sha256(secret) only)
+├── detection_extensions FK → detections.id (key/value escape hatch, indexed)
+└── evidence_snapshots FK → detections.id (live /proc state at detection time)
 
-This division means the agent stays simple — no in-process tree
-traversal, no chain detection logic, no graph queries. All of that
-lives on the server where it has cross-endpoint visibility and
-historical data depth.
+### Raw telemetry (everything, including noise)
 
-The one exception is LOLBin detection which needs parent process
-context available at detection time. For this, the process scanner
-reads /proc/PID/status for PPID and does a single parent lookup
-in the process_tree table to check if the parent is a script
-interpreter or download tool. This is a shallow lookup, not full
-tree traversal.
+network_events
+memory_events
+security_events
+process_tree (never pruned)
+
+### Inventory
+
+autoruns
+user_inventory (planned)
+known_bad_hashes (planned — HashAnalyzer + MalwareBazaar seed)
+
+### Operational
+
+audit_log (append-only, never pruned)
+event_statistics (hourly aggregation, planned)
+quarantined_files (response system, Phase 5)
+sync_state (remote sync watermarks, Phase 3)
 
 ## Known Issues
 
-1. **Pool shrink not implemented** — autotune logs intent but cannot actually shrink without per-worker cancel contexts. Low priority.
+1. **Pool shrink not implemented** — autotune logs intent but cannot shrink without per-worker cancel contexts.
 
-2. **DNS bpf_probe_read** — sendmsg reads `msg->msg_name` via `bpf_probe_read_kernel` but it is a userspace pointer. Should be `bpf_probe_read_user`. Low risk since most DNS goes via sendto not sendmsg.
+2. **rulesync restart race** — in-flight YARA scans are lost on systemd restart triggered by rule update. Acceptable since restart is fast and eBPF resumes immediately.
 
-3. **rulesync restart race** — if rule sync triggers systemd restart while a YARA scan is in progress, in-flight results are lost. Acceptable since restart is fast and eBPF resumes immediately. Hot reload would eliminate this but is deferred.
+3. **Flatpak false positives in LDPreloadAnalyzer** — `/run/flatpak/` and `~/.local/share/flatpak/` not in standardLibPaths. Add when observed.
 
-4. **Flatpak false positives in LDPreloadAnalyzer** — `/run/flatpak/` and `~/.local/share/flatpak/` not yet in `standardLibPaths`. Flatpak apps will produce the same false positive that snap did before its fix. Add when a Flatpak false positive is observed.
+4. **Module name always empty** — bpf_d_path unavailable in tracepoint programs. Requires fentry migration or userspace enrichment.
 
-5. **Module name always empty** — `init_module` syscall does not pass filename in args. `finit_module` does but we don't read it. The module_load event fires correctly; name enrichment via `/proc/PID/fd/N` is a follow-up.
+5. **Boot epoch drift** — NTP clock steps after startup make EBPFTimestampToUnix slightly wrong. Rare enough to defer.
 
-6. **boot epoch drift** — if NTP steps the system clock after agent startup the boot epoch becomes slightly wrong. Re-reading `/proc/uptime` periodically and detecting drift is the fix. Rare enough to defer.
+6. **KnownInterpreters requires review** — versioned binaries (python3.14 etc) need adding as distributions update. Last reviewed October 2026.
 
-## Next Session Starting Point
+7. **DupWatcher misses pre-exec socket inheritance** — inetd-style socket handoff produces no DupEvent. Acceptable tradeoff given the false positive it prevented.
 
-Priority order for next work:
+## Next Session
 
-1. **HashAnalyzer** — `internal/analyzer/hash.go`; `known_bad_hashes` table in schema; `vajra hashes update` CLI command seeding from MalwareBazaar CSV; slots in before YARAAnalyzer in content pipeline; short-circuits on CRITICAL match
+Priority order:
 
-2. **Process tree table** — `process_tree` table as adjacency list; written from ProcessEvent PPID on every execve; prerequisite for LOLBin chain detection and server-side correlation
-
-3. **LOLBin analyzer** — `internal/procanalyzer/lolbin.go`; uses full cmdline (now correctly captured); config-driven pattern list
-
-4. **Running process scanner** — startup walk of `/proc/PID/exe`; catches pre-existing malware before agent started
-
-5. **Container tagging** — `/proc/PID/cgroup` parsing; `container_id` and `container_runtime` on process_scan_results
-
-6. **EventStatistic aggregation job** — hourly ticker; table exists but nothing writes to it
+1. **HashAnalyzer** — `internal/analyzer/hash.go`; `known_bad_hashes` table; slots before YARA in content pipeline; short-circuits on CRITICAL
+2. **MalwareBazaar seed** — `vajra hashes update` CLI; CSV download; bulk insert
+3. **LOLBin analyzer** — `internal/analyzer/lolbin.go`; cmdline patterns; parent lookup via process_tree
+4. **Running process scanner** — `internal/detect/procwalk.go`; /proc/PID/exe walk on startup
+5. **Secrets scanner** — `internal/detect/secrets.go`; betterleaks v2 SDK

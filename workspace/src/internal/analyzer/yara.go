@@ -1,6 +1,6 @@
 // internal/analyzer/yara.go
 //
-// Copyright © 2025 Lakshy Sharma lakshy.d.sharma@gmail.com
+// Copyright © 2026 Lakshy Sharma lakshy.d.sharma@gmail.com
 // AGPL-3.0 License
 
 package analyzer
@@ -10,69 +10,69 @@ import (
 	"fmt"
 
 	"github.com/rs/zerolog"
-	"vajra/internal/scanner"
+	"vajra/internal/scanner/yara"
+	"vajra/internal/utilities"
+	"vajra/shared/models"
 )
 
-// YARAAnalyzer submits a file path to the shared YARA pool
-// and returns the classified result.
-// It is the slowest analyzer in the pipeline and should always
-// run last so faster analyzers can short-circuit before it.
+// YARAAnalyzer submits a file to the shared YARA pool and returns
+// a classified result. Slowest analyzer in the pipeline — runs last
+// so faster analyzers can short-circuit before it.
 type YARAAnalyzer struct {
-	pool   *scanner.Pool
+	pool   *yara.Pool
 	logger *zerolog.Logger
 }
 
-// NewYARAAnalyzer constructs a YARAAnalyzer backed by the shared pool.
-// The pool is created once in service.go and passed in — YARAAnalyzer
-// does not own it and must not call pool.Stop().
-func NewYARAAnalyzer(pool *scanner.Pool, logger *zerolog.Logger) *YARAAnalyzer {
-	return &YARAAnalyzer{
-		pool:   pool,
-		logger: logger,
-	}
+func NewYARAAnalyzer(pool *yara.Pool, logger *zerolog.Logger) *YARAAnalyzer {
+	return &YARAAnalyzer{pool: pool, logger: logger}
 }
 
-// Name implements Analyzer.
-func (y *YARAAnalyzer) Name() string {
-	return "yara"
-}
+func (y *YARAAnalyzer) Name() string { return "yara" }
 
-// Analyze submits path to the YARA pool and blocks until the
-// result is available or ctx is cancelled.
-// Returns an error if the pool rejected the submission (shutdown)
-// or if YARA itself returned an error for this file.
-func (y *YARAAnalyzer) Analyze(ctx context.Context, path string) (AnalysisResult, error) {
-	resultCh := make(chan scanner.ScanResult, 1)
+func (y *YARAAnalyzer) Analyze(ctx context.Context, path string) (Result, error) {
+	resultCh := make(chan yara.ScanResult, 1)
 
 	if !y.pool.Enqueue(ctx, path, resultCh) {
-		// ctx cancelled while waiting for queue space.
-		return AnalysisResult{}, fmt.Errorf("yara: pool enqueue cancelled for %s", path)
+		return Result{}, fmt.Errorf("yara: enqueue cancelled: %s", path)
 	}
 
 	select {
 	case <-ctx.Done():
-		return AnalysisResult{}, fmt.Errorf("yara: context cancelled waiting for result on %s", path)
-
-	case result := <-resultCh:
-		if result.Error != nil {
-			// YARA errors are usually permission denied or file
-			// vanished between eligibility check and scan.
-			// Return the error — pipeline will log and continue.
-			return AnalysisResult{}, fmt.Errorf("yara: scan error on %s: %w", path, result.Error)
+		return Result{}, fmt.Errorf("yara: context cancelled: %s", path)
+	case r := <-resultCh:
+		if r.Error != nil {
+			return Result{}, fmt.Errorf("yara: scan error on %s: %w", path, r.Error)
 		}
 
-		severity := scanner.ClassifyYARASeverity(result.Matches)
+		// Convert []yara.Match to []utilities.RuleMatch for engine-agnostic
+		// severity classification, then extract model matches for storage.
+		ruleMatches := make([]utilities.RuleMatch, len(r.Matches))
+		for i, m := range r.Matches {
+			ruleMatches[i] = m
+		}
+		severity := utilities.ClassifySeverity(ruleMatches)
+		modelMatches := yara.ToModelMatches(r.Matches)
 
 		y.logger.Debug().
 			Str("path", path).
 			Str("severity", string(severity)).
-			Int("matches", len(result.Matches)).
-			Dur("duration", result.Duration).
-			Msg("yara analyzer: scan complete")
+			Int("matches", len(r.Matches)).
+			Dur("duration", r.Duration).
+			Msg("yara: scan complete")
 
-		return AnalysisResult{
+		return Result{
 			Severity:    severity,
-			YaraMatches: result.Matches,
+			YaraMatches: modelMatches,
 		}, nil
 	}
+}
+
+// classifyFromMatches is exposed for testing — allows severity
+// classification without a live YARA pool.
+func classifyFromMatches(matches []models.YaraMatch) models.EventSeverity {
+	ruleMatches := make([]utilities.RuleMatch, len(matches))
+	for i, m := range matches {
+		ruleMatches[i] = yara.Match{YaraMatch: m}
+	}
+	return utilities.ClassifySeverity(ruleMatches)
 }

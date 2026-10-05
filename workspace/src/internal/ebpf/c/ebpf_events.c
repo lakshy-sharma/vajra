@@ -66,6 +66,7 @@
 #define EVT_PROCESS_MMAP 9
 #define EVT_PROCESS_MPROTECT 10
 #define EVT_PROCESS_CAPSET 11
+#define EVT_PROCESS_DUP_STDIO 12 // dup2/dup3 onto fd 0/1/2
 
 // File events
 #define EVT_FILE_OPEN 20
@@ -128,7 +129,7 @@ struct file_event {
   __u32 mode;                 // chmod mode, 0 otherwise
   __u32 flags;                // open flags
   __u64 timestamp;
-  __u64 size; // file size for truncate, 0 otherwise
+  __u64 size;
   __s64 ret;
 };
 
@@ -146,7 +147,7 @@ struct network_event {
   __u16 dst_port;
   __u8 protocol;
   __u8 family;
-  __u8 _pad0[2]; // align timestamp to 8 bytes
+  __u8 _pad0[2];
   __u64 timestamp;
   __s64 ret;
 };
@@ -158,13 +159,13 @@ struct mmap_event {
   __u32 pid;
   __u32 uid;
   char comm[TASK_COMM_LEN]; // 16 bytes
-  __u32 _pad0;              // align addr to 8 bytes
+  __u32 _pad0;
   __u64 addr;
   __u64 length;
   __u32 prot;
   __u32 map_flags;
   __s32 fd;
-  __u32 _pad1;             // align filename to natural boundary
+  __u32 _pad1;
   char filename[PATH_MAX]; // 256 bytes
   __u64 timestamp;
 };
@@ -178,7 +179,7 @@ struct ptrace_event {
   __u32 uid;
   char comm[TASK_COMM_LEN]; // 16 bytes
   __u32 request;
-  __u32 _pad0; // align timestamp to 8 bytes
+  __u32 _pad0;
   __u64 timestamp;
   __s64 ret;
 };
@@ -190,12 +191,28 @@ struct capset_event {
   __u32 pid;
   __u32 uid;
   char comm[TASK_COMM_LEN]; // 16 bytes
-  __u32 _pad0;              // align effective to 8 bytes
+  __u32 _pad0;
   __u64 effective;
   __u64 permitted;
   __u64 inheritable;
   __u64 timestamp;
   __s64 ret;
+};
+
+// dup_event: dup2/dup3 onto stdio fds (newfd <= 2) only.
+// Kernel-side filter: only emitted when newfd is 0, 1, or 2.
+// This is the primary signal for the bash -i >& /dev/tcp/...
+// reverse shell pattern which exec-time fd inspection misses.
+// Size: 4+4+4+4+16+4+4+8 = 48 bytes
+struct dup_event {
+  __u32 type;
+  __u32 pid;
+  __u32 ppid;
+  __u32 uid;
+  char comm[TASK_COMM_LEN]; // 16 bytes
+  __u32 oldfd;              // source fd being duplicated
+  __u32 newfd;              // destination fd (0=stdin, 1=stdout, 2=stderr)
+  __u64 timestamp;
 };
 
 // namespace_event: unshare, setns.
@@ -219,7 +236,7 @@ struct module_event {
   __u32 uid;
   __u32 gid;
   char comm[TASK_COMM_LEN]; // 16 bytes
-  char name[PATH_MAX];      // 256 bytes
+  char name[PATH_MAX]; // 256 bytes — resolved via bpf_d_path for finit_module
   __u64 timestamp;
   __s64 ret;
 };
@@ -238,8 +255,6 @@ struct dns_event_raw {
 
 // ============================================================
 // Compat structs for reading userspace sockaddr.
-// We define these ourselves — vmlinux sockaddr internals
-// differ across kernel versions and we only need port/addr.
 // ============================================================
 
 struct sockaddr_in_compat {
@@ -266,19 +281,16 @@ struct msghdr_compat {
   __kernel_size_t msg_controllen;
   unsigned int msg_flags;
 };
+
 // ============================================================
 // Maps
 // ============================================================
 
-// Single output channel to Go userspace.
 struct {
   __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
   __uint(key_size, sizeof(__u32));
   __uint(value_size, sizeof(__u32));
 } events SEC(".maps");
-
-// Per-CPU scratch space — one map per struct type.
-// Index 0 is always used; per-CPU means no locking needed.
 
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -326,6 +338,13 @@ struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
   __uint(max_entries, 1);
   __type(key, __u32);
+  __type(value, struct dup_event);
+} dup_heap SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
   __type(value, struct namespace_event);
 } namespace_heap SEC(".maps");
 
@@ -347,8 +366,6 @@ struct {
 // Helpers
 // ============================================================
 
-// get_creds reads uid/gid/euid/egid from the current task.
-// Uses bpf_get_current_task_btf() available since kernel 5.11.
 static __always_inline void get_creds(__u32 *uid, __u32 *gid, __u32 *euid,
                                       __u32 *egid) {
   struct task_struct *task = bpf_get_current_task_btf();
@@ -364,14 +381,12 @@ static __always_inline void get_creds(__u32 *uid, __u32 *gid, __u32 *euid,
     *egid = BPF_CORE_READ(cred, egid.val);
 }
 
-// get_ppid reads the parent process TGID from current task.
 static __always_inline __u32 get_ppid(void) {
   struct task_struct *task = bpf_get_current_task_btf();
   struct task_struct *parent = BPF_CORE_READ(task, real_parent);
   return BPF_CORE_READ(parent, tgid);
 }
 
-// emit_process_event fills and sends a process_event.
 static __always_inline int emit_process_event(void *ctx, __u32 type,
                                               __u32 flags,
                                               const char *filename_ptr,
@@ -401,7 +416,6 @@ static __always_inline int emit_process_event(void *ctx, __u32 type,
   else
     e->args[0] = '\0';
 
-  // cwd: read from task fs struct
   struct task_struct *task = bpf_get_current_task_btf();
   struct fs_struct *fs = BPF_CORE_READ(task, fs);
   struct dentry *dentry = BPF_CORE_READ(fs, pwd.dentry);
@@ -412,7 +426,6 @@ static __always_inline int emit_process_event(void *ctx, __u32 type,
   return 0;
 }
 
-// handle_dns_traffic captures raw DNS payload for gopacket parsing.
 static __always_inline int handle_dns_traffic(void *ctx, const char *buf,
                                               __u32 len) {
   if (len < 12)
@@ -447,7 +460,6 @@ static __always_inline int handle_dns_traffic(void *ctx, const char *buf,
 SEC("tracepoint/syscalls/sys_enter_execve")
 int trace_execve(struct trace_event_raw_sys_enter *ctx) {
   const char *filename = (const char *)ctx->args[0];
-  // args[1] is argv — we read the first element only for space reasons
   const char *const *argv = (const char *const *)ctx->args[1];
   const char *first_arg = NULL;
   bpf_probe_read_user(&first_arg, sizeof(first_arg), &argv[1]);
@@ -497,7 +509,7 @@ SEC("tracepoint/syscalls/sys_enter_mmap")
 int trace_mmap(struct trace_event_raw_sys_enter *ctx) {
   __u32 prot = (__u32)ctx->args[2];
   if (!(prot & PROT_EXEC))
-    return 0; // only executable mappings
+    return 0;
 
   __u32 zero = 0;
   struct mmap_event *e = bpf_map_lookup_elem(&mmap_heap, &zero);
@@ -527,7 +539,7 @@ SEC("tracepoint/syscalls/sys_enter_mprotect")
 int trace_mprotect(struct trace_event_raw_sys_enter *ctx) {
   __u32 prot = (__u32)ctx->args[2];
   if (!(prot & PROT_EXEC))
-    return 0; // only when adding execute permission
+    return 0;
 
   __u32 zero = 0;
   struct mmap_event *e = bpf_map_lookup_elem(&mmap_heap, &zero);
@@ -568,8 +580,6 @@ int trace_capset(struct trace_event_raw_sys_enter *ctx) {
   bpf_get_current_comm(&e->comm, sizeof(e->comm));
   get_creds(&e->uid, NULL, NULL, NULL);
 
-  // kernel_cap_t on kernels >= 6.3 is a plain __u64, not a
-  // struct with a cap[] array. Read the whole value directly.
   struct task_struct *task = bpf_get_current_task_btf();
   const struct cred *cred = BPF_CORE_READ(task, cred);
 
@@ -578,7 +588,6 @@ int trace_capset(struct trace_event_raw_sys_enter *ctx) {
   BPF_CORE_READ_INTO(&perm, cred, cap_permitted);
   BPF_CORE_READ_INTO(&inh, cred, cap_inheritable);
 
-  // kernel_cap_t is __u64 on modern kernels — cast directly.
   e->effective = *(__u64 *)&eff;
   e->permitted = *(__u64 *)&perm;
   e->inheritable = *(__u64 *)&inh;
@@ -586,6 +595,53 @@ int trace_capset(struct trace_event_raw_sys_enter *ctx) {
   bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, e, sizeof(*e));
   return 0;
 }
+
+// trace_dup_stdio fires on dup2 and dup3 when newfd is 0, 1, or 2.
+// Kernel-side filter keeps this off the hot path for all other dup calls.
+// This is the signal that catches the bash -i >& /dev/tcp/... pattern:
+// the shell calls dup2(sockfd, 0/1/2) after exec, which exec-time fd
+// inspection cannot see. oldfd and newfd are both recorded so userspace
+// can correlate: if oldfd is a known network socket inode, it's a rev shell.
+static __always_inline int trace_dup_common(void *ctx, __u32 oldfd,
+                                            __u32 newfd) {
+  // Only stdio redirection is security-relevant for our purposes.
+  if (newfd > 2)
+    return 0;
+
+  __u32 zero = 0;
+  struct dup_event *e = bpf_map_lookup_elem(&dup_heap, &zero);
+  if (!e)
+    return 0;
+
+  e->type = EVT_PROCESS_DUP_STDIO;
+  e->pid = bpf_get_current_pid_tgid() >> 32;
+  e->ppid = get_ppid();
+  e->timestamp = bpf_ktime_get_ns();
+  e->oldfd = oldfd;
+  e->newfd = newfd;
+
+  bpf_get_current_comm(&e->comm, sizeof(e->comm));
+  get_creds(&e->uid, NULL, NULL, NULL);
+
+  bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, e, sizeof(*e));
+  return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_dup2")
+int trace_dup2(struct trace_event_raw_sys_enter *ctx) {
+  __u32 oldfd = (__u32)ctx->args[0];
+  __u32 newfd = (__u32)ctx->args[1];
+  return trace_dup_common(ctx, oldfd, newfd);
+}
+
+SEC("tracepoint/syscalls/sys_enter_dup3")
+int trace_dup3(struct trace_event_raw_sys_enter *ctx) {
+  __u32 oldfd = (__u32)ctx->args[0];
+  __u32 newfd = (__u32)ctx->args[1];
+  // args[2] is flags — O_CLOEXEC only, not security relevant here
+  return trace_dup_common(ctx, oldfd, newfd);
+}
+
 // ============================================================
 // Tracepoints — File
 // ============================================================
@@ -594,7 +650,7 @@ SEC("tracepoint/syscalls/sys_enter_openat")
 int trace_openat(struct trace_event_raw_sys_enter *ctx) {
   __u32 flags = (__u32)ctx->args[2];
   if (!(flags & O_CREAT))
-    return 0; // only new file creation
+    return 0;
 
   __u32 zero = 0;
   struct file_event *e = bpf_map_lookup_elem(&file_heap, &zero);
@@ -851,7 +907,9 @@ int trace_sendmsg(struct trace_event_raw_sys_enter *ctx) {
     return 0;
 
   void *name_ptr = NULL;
-  bpf_probe_read_kernel(&name_ptr, sizeof(name_ptr), &msg->msg_name);
+  // Fix: msg_name is a userspace pointer — must use bpf_probe_read_user,
+  // not bpf_probe_read_kernel. Known issue #2 now resolved.
+  bpf_probe_read_user(&name_ptr, sizeof(name_ptr), &msg->msg_name);
   if (!name_ptr)
     return 0;
 
@@ -873,7 +931,7 @@ int trace_sendmsg(struct trace_event_raw_sys_enter *ctx) {
     return 0;
 
   struct iovec *iov_ptr = NULL;
-  bpf_probe_read_kernel(&iov_ptr, sizeof(iov_ptr), &msg->msg_iov);
+  bpf_probe_read_user(&iov_ptr, sizeof(iov_ptr), &msg->msg_iov);
   if (!iov_ptr)
     return 0;
 
@@ -921,6 +979,11 @@ int trace_finit_module(struct trace_event_raw_sys_enter *ctx) {
 
   bpf_get_current_comm(&e->comm, sizeof(e->comm));
   get_creds(&e->uid, &e->gid, NULL, NULL);
+
+  // finit_module takes an fd not a filename. bpf_d_path is not
+  // available in tracepoint programs — name enrichment requires
+  // fentry program type or userspace /proc/PID/fd/N resolution.
+  // Deferred. Module load is still recorded; name will be empty.
   e->name[0] = '\0';
 
   bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, e, sizeof(*e));

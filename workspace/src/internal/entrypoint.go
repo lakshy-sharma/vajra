@@ -1,3 +1,8 @@
+// internal/entrypoint.go
+//
+// Copyright © 2026 Lakshy Sharma lakshy.d.sharma@gmail.com
+// AGPL-3.0 License
+
 package internal
 
 import (
@@ -10,30 +15,26 @@ import (
 )
 
 func Entrypoint(configPath string) {
-	AppConfig, err := utilities.LoadConfig(configPath)
+	cfg, err := utilities.LoadConfig(configPath)
 	if err != nil {
 		log.Fatal().Err(err).Str("path", configPath).Msg("failed to load configuration")
 		return
 	}
 
-	logger := utilities.GetLogger(AppConfig)
+	logger := utilities.GetLogger(cfg)
 
-	if err := os.MkdirAll(AppConfig.GenericSettings.WorkDirectory, 0o755); err != nil {
-		logger.Fatal().Err(err).Str("path", AppConfig.GenericSettings.WorkDirectory).Msg("failed to create work directory")
-		return
+	for _, dir := range []string{
+		cfg.GenericSettings.WorkDirectory,
+		cfg.GenericSettings.DBDirectory,
+		cfg.RulesSettings.RulesArchiveDir,
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			logger.Fatal().Err(err).Str("path", dir).Msg("failed to create directory")
+			return
+		}
 	}
 
-	if err := os.MkdirAll(AppConfig.GenericSettings.DBDirectory, 0o755); err != nil {
-		logger.Fatal().Err(err).Str("path", AppConfig.GenericSettings.DBDirectory).Msg("failed to create database directory")
-		return
-	}
-
-	if err := os.MkdirAll(AppConfig.RulesSettings.RulesArchiveDir, 0o755); err != nil {
-		logger.Fatal().Err(err).Str("path", AppConfig.RulesSettings.RulesArchiveDir).Msg("failed to create rules archive directory")
-		return
-	}
-
-	dbPath := filepath.Join(AppConfig.GenericSettings.DBDirectory, AppConfig.GenericSettings.DBFilename)
+	dbPath := filepath.Join(cfg.GenericSettings.DBDirectory, cfg.GenericSettings.DBFilename)
 	database, err := db.Open(dbPath, logger)
 	if err != nil {
 		logger.Fatal().Err(err).Str("path", dbPath).Msg("failed to open database")
@@ -49,18 +50,18 @@ func Entrypoint(configPath string) {
 
 	logger.Info().
 		Str("version", "0.0.1").
-		Str("mode", AppConfig.GenericSettings.OperationMode).
-		Str("target", AppConfig.ScanSettings.TargetDirectory).
-		Str("rules", AppConfig.RulesSettings.RulesFilepath).
+		Str("mode", cfg.GenericSettings.OperationMode).
+		Str("target", cfg.ScanSettings.TargetDirectory).
+		Str("rules", cfg.RulesSettings.RulesFilepath).
 		Int("pid", os.Getpid()).
 		Str("machine_id", sysInfo.MachineID).
 		Int64("boot_epoch", sysInfo.BootEpoch).
 		Msg("starting vajra edr")
 
-	switch AppConfig.GenericSettings.OperationMode {
+	switch cfg.GenericSettings.OperationMode {
 	case "monitor":
-		startServiceMode(logger, &AppConfig, database, sysInfo)
+		startServiceMode(logger, &cfg, database, sysInfo)
 	default:
-		logger.Fatal().Str("mode", AppConfig.GenericSettings.OperationMode).Msg("unknown operation mode")
+		logger.Fatal().Str("mode", cfg.GenericSettings.OperationMode).Msg("unknown operation mode")
 	}
 }

@@ -38,6 +38,18 @@ type bpfDnsEventRaw struct {
 	Payload    [256]int8
 }
 
+type bpfDupEvent struct {
+	_         structs.HostLayout
+	Type      uint32
+	Pid       uint32
+	Ppid      uint32
+	Uid       uint32
+	Comm      [16]int8
+	Oldfd     uint32
+	Newfd     uint32
+	Timestamp uint64
+}
+
 type bpfFileEvent struct {
 	_          structs.HostLayout
 	Type       uint32
@@ -153,6 +165,7 @@ type bpfPtraceEvent struct {
 const (
 	bpfMapCapsetHeap        = "capset_heap"
 	bpfMapDnsHeap           = "dns_heap"
+	bpfMapDupHeap           = "dup_heap"
 	bpfMapEvents            = "events"
 	bpfMapFileHeap          = "file_heap"
 	bpfMapMmapHeap          = "mmap_heap"
@@ -164,6 +177,8 @@ const (
 	bpfProgTraceBind        = "trace_bind"
 	bpfProgTraceCapset      = "trace_capset"
 	bpfProgTraceConnect     = "trace_connect"
+	bpfProgTraceDup2        = "trace_dup2"
+	bpfProgTraceDup3        = "trace_dup3"
 	bpfProgTraceExecve      = "trace_execve"
 	bpfProgTraceFchmodat    = "trace_fchmodat"
 	bpfProgTraceFinitModule = "trace_finit_module"
@@ -229,6 +244,8 @@ type bpfProgramSpecs struct {
 	TraceBind        *ebpf.ProgramSpec `ebpf:"trace_bind"`
 	TraceCapset      *ebpf.ProgramSpec `ebpf:"trace_capset"`
 	TraceConnect     *ebpf.ProgramSpec `ebpf:"trace_connect"`
+	TraceDup2        *ebpf.ProgramSpec `ebpf:"trace_dup2"`
+	TraceDup3        *ebpf.ProgramSpec `ebpf:"trace_dup3"`
 	TraceExecve      *ebpf.ProgramSpec `ebpf:"trace_execve"`
 	TraceFchmodat    *ebpf.ProgramSpec `ebpf:"trace_fchmodat"`
 	TraceFinitModule *ebpf.ProgramSpec `ebpf:"trace_finit_module"`
@@ -255,6 +272,7 @@ type bpfProgramSpecs struct {
 type bpfMapSpecs struct {
 	CapsetHeap    *ebpf.MapSpec `ebpf:"capset_heap"`
 	DnsHeap       *ebpf.MapSpec `ebpf:"dns_heap"`
+	DupHeap       *ebpf.MapSpec `ebpf:"dup_heap"`
 	Events        *ebpf.MapSpec `ebpf:"events"`
 	FileHeap      *ebpf.MapSpec `ebpf:"file_heap"`
 	MmapHeap      *ebpf.MapSpec `ebpf:"mmap_heap"`
@@ -293,6 +311,7 @@ func (o *bpfObjects) Close() error {
 type bpfMaps struct {
 	CapsetHeap    *ebpf.Map `ebpf:"capset_heap"`
 	DnsHeap       *ebpf.Map `ebpf:"dns_heap"`
+	DupHeap       *ebpf.Map `ebpf:"dup_heap"`
 	Events        *ebpf.Map `ebpf:"events"`
 	FileHeap      *ebpf.Map `ebpf:"file_heap"`
 	MmapHeap      *ebpf.Map `ebpf:"mmap_heap"`
@@ -307,6 +326,7 @@ func (m *bpfMaps) Close() error {
 	return _BpfClose(
 		m.CapsetHeap,
 		m.DnsHeap,
+		m.DupHeap,
 		m.Events,
 		m.FileHeap,
 		m.MmapHeap,
@@ -331,6 +351,8 @@ type bpfPrograms struct {
 	TraceBind        *ebpf.Program `ebpf:"trace_bind"`
 	TraceCapset      *ebpf.Program `ebpf:"trace_capset"`
 	TraceConnect     *ebpf.Program `ebpf:"trace_connect"`
+	TraceDup2        *ebpf.Program `ebpf:"trace_dup2"`
+	TraceDup3        *ebpf.Program `ebpf:"trace_dup3"`
 	TraceExecve      *ebpf.Program `ebpf:"trace_execve"`
 	TraceFchmodat    *ebpf.Program `ebpf:"trace_fchmodat"`
 	TraceFinitModule *ebpf.Program `ebpf:"trace_finit_module"`
@@ -356,6 +378,8 @@ func (p *bpfPrograms) Close() error {
 		p.TraceBind,
 		p.TraceCapset,
 		p.TraceConnect,
+		p.TraceDup2,
+		p.TraceDup3,
 		p.TraceExecve,
 		p.TraceFchmodat,
 		p.TraceFinitModule,

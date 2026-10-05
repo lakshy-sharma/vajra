@@ -118,6 +118,8 @@ func (l *Listener) attachTracepoints() {
 		{"syscalls", "sys_enter_mmap", l.objs.TraceMmap},
 		{"syscalls", "sys_enter_mprotect", l.objs.TraceMprotect},
 		{"syscalls", "sys_enter_capset", l.objs.TraceCapset},
+		{"syscalls", "sys_enter_dup2", l.objs.TraceDup2},
+		{"syscalls", "sys_enter_dup3", l.objs.TraceDup3},
 		// File
 		{"syscalls", "sys_enter_openat", l.objs.TraceOpenat},
 		{"syscalls", "sys_enter_unlinkat", l.objs.TraceUnlinkat},
@@ -244,6 +246,12 @@ func (l *Listener) deserialize(raw []byte) (RawEvent, error) {
 		}
 		return RawEvent{Type: eventType, Data: e}, nil
 
+	case EventTypeProcessDupStdio:
+		var e DupEvent
+		if err := binary.Read(r, binary.LittleEndian, &e); err != nil {
+			return RawEvent{}, fmt.Errorf("DupEvent decode: %w", err)
+		}
+		return RawEvent{Type: eventType, Data: e}, nil
 	// ── File events ───────────────────────────────────────────
 	case EventTypeFileOpen,
 		EventTypeFileDelete,
