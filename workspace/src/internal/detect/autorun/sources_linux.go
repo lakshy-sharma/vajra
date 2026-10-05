@@ -1,11 +1,11 @@
-// internal/jobs/autoruns/sources_linux.go
+// internal/detect/autorun/sources_linux.go
 //
 // Copyright © 2026 Lakshy Sharma lakshy.d.sharma@gmail.com
 // AGPL-3.0 License
 
 //go:build linux
 
-package autoruns
+package autorun
 
 import (
 	"bufio"
@@ -14,12 +14,12 @@ import (
 	"regexp"
 	"strings"
 
-	"vajra/internal/scanner"
+	"vajra/internal/utilities"
 	"vajra/shared/models"
 )
 
-func GetSources() []AutorunSource {
-	return []AutorunSource{
+func GetSources() []Source {
+	return []Source{
 		&SystemdSystemSource{root: "/"},
 		&SystemdUserSource{root: "/"},
 		&CronSystemSource{root: "/"},
@@ -39,7 +39,7 @@ func hashEntry(e *models.AutorunEntry) {
 	if e.ImagePath == "" {
 		return
 	}
-	sha256h, sha1h, md5h, err := scanner.HashFile(e.ImagePath)
+	sha256h, sha1h, md5h, err := utilities.HashFile(e.ImagePath)
 	if err != nil {
 		return
 	}
@@ -78,7 +78,7 @@ func allUsers() []string {
 	return homes
 }
 
-// ── Systemd ──────────────────────────────────────────────────
+// ── Systemd ───────────────────────────────────────────────────
 
 type SystemdSystemSource struct{ root string }
 
@@ -111,7 +111,10 @@ func (s *SystemdUserSource) Collect() ([]*models.AutorunEntry, error) {
 		entries = append(entries, found...)
 	}
 	for _, home := range allUsers() {
-		found, _ := collectSystemdDir(filepath.Join(home, ".config/systemd/user"), models.CategorySystemdUser)
+		found, _ := collectSystemdDir(
+			filepath.Join(home, ".config/systemd/user"),
+			models.CategorySystemdUser,
+		)
 		entries = append(entries, found...)
 	}
 	return entries, nil
@@ -188,25 +191,34 @@ func parseSystemdUnit(path string, category models.AutorunCategory) (*models.Aut
 	return e, nil
 }
 
-// ── Cron ─────────────────────────────────────────────────────
+// ── Cron ──────────────────────────────────────────────────────
 
 type CronSystemSource struct{ root string }
 
 func (s *CronSystemSource) Name() string { return "cron_system" }
 func (s *CronSystemSource) Collect() ([]*models.AutorunEntry, error) {
 	var entries []*models.AutorunEntry
-	entries = append(entries, parseCrontab(filepath.Join(s.root, "etc/crontab"), models.CategoryCronSystem)...)
+	entries = append(entries, parseCrontab(
+		filepath.Join(s.root, "etc/crontab"),
+		models.CategoryCronSystem,
+	)...)
 
 	files, err := os.ReadDir(filepath.Join(s.root, "etc/cron.d"))
 	if err == nil {
 		for _, f := range files {
 			if !f.IsDir() {
-				entries = append(entries, parseCrontab(filepath.Join(s.root, "etc/cron.d", f.Name()), models.CategoryCronSystem)...)
+				entries = append(entries, parseCrontab(
+					filepath.Join(s.root, "etc/cron.d", f.Name()),
+					models.CategoryCronSystem,
+				)...)
 			}
 		}
 	}
 
-	for _, d := range []string{"etc/cron.hourly", "etc/cron.daily", "etc/cron.weekly", "etc/cron.monthly"} {
+	for _, d := range []string{
+		"etc/cron.hourly", "etc/cron.daily",
+		"etc/cron.weekly", "etc/cron.monthly",
+	} {
 		scripts, err := os.ReadDir(filepath.Join(s.root, d))
 		if err != nil {
 			continue
@@ -240,7 +252,10 @@ func (s *CronUserSource) Collect() ([]*models.AutorunEntry, error) {
 	var entries []*models.AutorunEntry
 	for _, f := range files {
 		if !f.IsDir() {
-			entries = append(entries, parseCrontab(filepath.Join(s.spoolDir, f.Name()), models.CategoryCronUser)...)
+			entries = append(entries, parseCrontab(
+				filepath.Join(s.spoolDir, f.Name()),
+				models.CategoryCronUser,
+			)...)
 		}
 	}
 	return entries, nil
@@ -295,8 +310,10 @@ type ShellProfileSource struct{ root string }
 func (s *ShellProfileSource) Name() string { return "shell_profile" }
 func (s *ShellProfileSource) Collect() ([]*models.AutorunEntry, error) {
 	var entries []*models.AutorunEntry
-
-	for _, rel := range []string{"etc/profile", "etc/bash.bashrc", "etc/zsh/zshrc", "etc/zsh/zprofile"} {
+	for _, rel := range []string{
+		"etc/profile", "etc/bash.bashrc",
+		"etc/zsh/zshrc", "etc/zsh/zprofile",
+	} {
 		if e := profileEntry(filepath.Join(s.root, rel), models.CategoryShellProfile); e != nil {
 			entries = append(entries, e)
 		}
@@ -306,7 +323,10 @@ func (s *ShellProfileSource) Collect() ([]*models.AutorunEntry, error) {
 	if err == nil {
 		for _, sc := range scripts {
 			if !sc.IsDir() {
-				if e := profileEntry(filepath.Join(s.root, "etc/profile.d", sc.Name()), models.CategoryShellProfile); e != nil {
+				if e := profileEntry(
+					filepath.Join(s.root, "etc/profile.d", sc.Name()),
+					models.CategoryShellProfile,
+				); e != nil {
 					entries = append(entries, e)
 				}
 			}
@@ -314,7 +334,10 @@ func (s *ShellProfileSource) Collect() ([]*models.AutorunEntry, error) {
 	}
 
 	for _, home := range allUsers() {
-		for _, rel := range []string{".bashrc", ".bash_profile", ".bash_login", ".profile", ".zshrc", ".zprofile", ".zlogin"} {
+		for _, rel := range []string{
+			".bashrc", ".bash_profile", ".bash_login",
+			".profile", ".zshrc", ".zprofile", ".zlogin",
+		} {
 			if e := profileEntry(filepath.Join(home, rel), models.CategoryShellProfile); e != nil {
 				entries = append(entries, e)
 			}
@@ -416,7 +439,9 @@ func parseDesktopFile(path string) (*models.AutorunEntry, error) {
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if strings.HasPrefix(line, "Exec=") {
-			val := regexp.MustCompile(`%[a-zA-Z]`).ReplaceAllString(strings.TrimPrefix(line, "Exec="), "")
+			val := regexp.MustCompile(`%[a-zA-Z]`).ReplaceAllString(
+				strings.TrimPrefix(line, "Exec="), "",
+			)
 			exe, args := parseShellWords(strings.TrimSpace(val))
 			e.ImagePath = exe
 			e.ImageName = filepath.Base(exe)
@@ -518,7 +543,10 @@ type AnacronSource struct{ root string }
 
 func (s *AnacronSource) Name() string { return "anacron" }
 func (s *AnacronSource) Collect() ([]*models.AutorunEntry, error) {
-	return parseCrontab(filepath.Join(s.root, "etc/anacrontab"), models.CategoryAnacron), nil
+	return parseCrontab(
+		filepath.Join(s.root, "etc/anacrontab"),
+		models.CategoryAnacron,
+	), nil
 }
 
 // ── LD Preload ────────────────────────────────────────────────
@@ -609,18 +637,14 @@ func parsePAMFile(path string) ([]*models.AutorunEntry, error) {
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) < 3 {
-			continue
-		}
-		module := fields[2]
-		if !strings.HasPrefix(module, "/") {
+		if len(fields) < 3 || !strings.HasPrefix(fields[2], "/") {
 			continue
 		}
 		e := &models.AutorunEntry{
 			Category:  models.CategoryPAM,
 			Location:  path,
-			ImagePath: module,
-			ImageName: filepath.Base(module),
+			ImagePath: fields[2],
+			ImageName: filepath.Base(fields[2]),
 		}
 		hashEntry(e)
 		entries = append(entries, e)

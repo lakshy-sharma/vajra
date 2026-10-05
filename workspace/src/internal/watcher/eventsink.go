@@ -1,11 +1,11 @@
-// internal/jobs/eventsink.go
+// internal/watcher/eventsink.go
 //
-// Copyright © 2025 Lakshy Sharma lakshy.d.sharma@gmail.com
+// Copyright © 2026 Lakshy Sharma lakshy.d.sharma@gmail.com
 // AGPL-3.0 License
 
 //go:build linux
 
-package jobs
+package watcher
 
 import (
 	"context"
@@ -22,13 +22,8 @@ import (
 )
 
 var highValuePorts = map[uint16]bool{
-	22:    true,
-	23:    true,
-	3389:  true,
-	5900:  true,
-	4444:  true,
-	4445:  true,
-	31337: true,
+	22: true, 23: true, 3389: true,
+	5900: true, 4444: true, 4445: true, 31337: true,
 }
 
 type memDedupKey struct {
@@ -42,6 +37,10 @@ type memDedupEntry struct {
 
 const memDedupWindow = 30 * time.Second
 
+// EventSink records raw kernel telemetry — network, memory, security,
+// module events. No analysis, no detection logic. Heuristic severity
+// only. Detection logic lives in watchers and scanners that produce
+// Finding values through FindingWriter.
 type EventSink struct {
 	logger  *zerolog.Logger
 	netQ    *queries.NetworkQueries
@@ -66,6 +65,10 @@ func NewEventSink(
 	}
 }
 
+func (es *EventSink) Name() string { return "event_sink" }
+
+// Run spawns one goroutine per channel. Each goroutine counts against
+// the caller's WaitGroup — Run itself does not block.
 func (es *EventSink) Run(ctx context.Context, wg *sync.WaitGroup, ch *ebpf.Channels) {
 	wg.Add(1)
 	go es.consumeNetwork(ctx, wg, ch.Network)
@@ -83,7 +86,6 @@ func (es *EventSink) consumeNetwork(ctx context.Context, wg *sync.WaitGroup, ch 
 	for {
 		select {
 		case <-ctx.Done():
-			es.logger.Info().Msg("event sink: network consumer stopped")
 			return
 		case event, ok := <-ch:
 			if !ok {
@@ -112,22 +114,18 @@ func (es *EventSink) handleNetwork(event ebpf.NetworkEvent) {
 	}
 
 	if err := es.netQ.Insert(record); err != nil {
-		es.logger.Error().Err(err).Uint32("pid", event.PID).Str("dst", record.DstAddr).Msg("event sink: network insert failed")
+		es.logger.Error().Err(err).Uint32("pid", event.PID).Msg("event sink: network insert failed")
 		return
 	}
 
-	if record.Severity == models.SeverityHigh || record.Severity == models.SeverityCritical {
+	if record.Severity >= models.SeverityHigh {
 		es.logger.Warn().
 			Uint32("pid", event.PID).
 			Str("process", record.ProcessName).
-			Str("dst_addr", record.DstAddr).
+			Str("dst", record.DstAddr).
 			Uint16("dst_port", record.DstPort).
-			Str("severity", string(record.Severity)).
 			Msg("event sink: high-value network connection")
-		return
 	}
-
-	es.logger.Debug().Uint32("pid", event.PID).Str("dst", record.DstAddr).Msg("event sink: network event recorded")
 }
 
 func (es *EventSink) consumeMemory(ctx context.Context, wg *sync.WaitGroup, ch <-chan ebpf.MmapEvent) {
@@ -135,13 +133,12 @@ func (es *EventSink) consumeMemory(ctx context.Context, wg *sync.WaitGroup, ch <
 	es.logger.Info().Msg("event sink: memory consumer started")
 
 	dedup := make(map[memDedupKey]memDedupEntry)
-	cleanupTicker := time.NewTicker(30 * time.Second)
+	cleanupTicker := time.NewTicker(memDedupWindow)
 	defer cleanupTicker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			es.logger.Info().Msg("event sink: memory consumer stopped")
 			return
 		case <-cleanupTicker.C:
 			now := time.Now()
@@ -165,14 +162,8 @@ func (es *EventSink) handleMemory(event ebpf.MmapEvent, dedup map[memDedupKey]me
 	if severity != models.SeverityCritical {
 		key := memDedupKey{pid: event.PID, prot: event.Prot}
 		now := time.Now()
-		if entry, seen := dedup[key]; seen {
-			if now.Sub(entry.lastSeen) < memDedupWindow {
-				es.logger.Debug().
-					Uint32("pid", event.PID).
-					Uint32("prot", event.Prot).
-					Msg("event sink: memory event deduplicated")
-				return
-			}
+		if entry, seen := dedup[key]; seen && now.Sub(entry.lastSeen) < memDedupWindow {
+			return
 		}
 		dedup[key] = memDedupEntry{lastSeen: now}
 	}
@@ -204,11 +195,8 @@ func (es *EventSink) handleMemory(event ebpf.MmapEvent, dedup map[memDedupKey]me
 			Str("process", record.ProcessName).
 			Uint64("addr", event.Addr).
 			Uint32("prot", event.Prot).
-			Msg("event sink: CRITICAL memory protection flags detected")
-		return
+			Msg("event sink: W^X memory mapping")
 	}
-
-	es.logger.Debug().Uint32("pid", event.PID).Uint64("addr", event.Addr).Msg("event sink: memory event recorded")
 }
 
 func (es *EventSink) consumeSecurity(ctx context.Context, wg *sync.WaitGroup, ch <-chan ebpf.SecurityEvent) {
@@ -217,7 +205,6 @@ func (es *EventSink) consumeSecurity(ctx context.Context, wg *sync.WaitGroup, ch
 	for {
 		select {
 		case <-ctx.Done():
-			es.logger.Info().Msg("event sink: security consumer stopped")
 			return
 		case event, ok := <-ch:
 			if !ok {
@@ -229,8 +216,6 @@ func (es *EventSink) consumeSecurity(ctx context.Context, wg *sync.WaitGroup, ch
 }
 
 func (es *EventSink) handleSecurity(event ebpf.SecurityEvent) {
-	severity := classifySecuritySeverity(event.EventName)
-
 	record := &models.SecurityEvent{
 		EventTime:   es.sysInfo.EBPFTimestampToUnix(event.Timestamp),
 		EventType:   event.Type,
@@ -240,27 +225,23 @@ func (es *EventSink) handleSecurity(event ebpf.SecurityEvent) {
 		ProcessName: event.Comm,
 		TargetPID:   event.TargetPID,
 		Details:     event.Details,
-		Severity:    severity,
+		Severity:    classifySecuritySeverity(event.EventName),
 		Status:      models.StatusNew,
 		MachineID:   es.sysInfo.MachineID,
 	}
 
 	if err := es.secQ.Insert(record); err != nil {
-		es.logger.Error().Err(err).Uint32("pid", event.PID).Str("event", event.EventName).Msg("event sink: security insert failed")
+		es.logger.Error().Err(err).Uint32("pid", event.PID).Msg("event sink: security insert failed")
 		return
 	}
 
-	if severity == models.SeverityHigh || severity == models.SeverityCritical {
+	if record.Severity >= models.SeverityHigh {
 		es.logger.Warn().
 			Uint32("pid", event.PID).
 			Str("process", event.Comm).
-			Str("event_name", event.EventName).
-			Str("severity", string(severity)).
-			Msg("event sink: security event recorded")
-		return
+			Str("event", event.EventName).
+			Msg("event sink: high-severity security event")
 	}
-
-	es.logger.Debug().Uint32("pid", event.PID).Str("event", event.EventName).Msg("event sink: security event recorded")
 }
 
 func (es *EventSink) consumeModule(ctx context.Context, wg *sync.WaitGroup, ch <-chan ebpf.ModuleEvent) {
@@ -269,7 +250,6 @@ func (es *EventSink) consumeModule(ctx context.Context, wg *sync.WaitGroup, ch <
 	for {
 		select {
 		case <-ctx.Done():
-			es.logger.Info().Msg("event sink: module consumer stopped")
 			return
 		case event, ok := <-ch:
 			if !ok {
@@ -282,7 +262,6 @@ func (es *EventSink) consumeModule(ctx context.Context, wg *sync.WaitGroup, ch <
 
 func (es *EventSink) handleModule(event ebpf.ModuleEvent) {
 	moduleName := ebpf.CStringToGo(event.Name[:])
-
 	record := &models.SecurityEvent{
 		EventTime:   es.sysInfo.EBPFTimestampToUnix(event.Timestamp),
 		EventType:   event.Type,
@@ -297,15 +276,15 @@ func (es *EventSink) handleModule(event ebpf.ModuleEvent) {
 	}
 
 	if err := es.secQ.Insert(record); err != nil {
-		es.logger.Error().Err(err).Uint32("pid", event.PID).Str("module", moduleName).Msg("event sink: module insert failed")
+		es.logger.Error().Err(err).Uint32("pid", event.PID).Msg("event sink: module insert failed")
 		return
 	}
 
 	es.logger.Warn().
 		Uint32("pid", event.PID).
 		Str("process", record.ProcessName).
-		Str("module_name", moduleName).
-		Msg("event sink: kernel module load recorded")
+		Str("module", moduleName).
+		Msg("event sink: kernel module load")
 }
 
 // ── Severity classifiers ──────────────────────────────────────
@@ -347,7 +326,7 @@ func classifySecuritySeverity(eventName string) models.EventSeverity {
 	}
 }
 
-// ── Helpers ───────────────────────────────────────────────────
+// ── Network helpers ───────────────────────────────────────────
 
 func formatIP(addr [16]byte, family uint8) string {
 	const (

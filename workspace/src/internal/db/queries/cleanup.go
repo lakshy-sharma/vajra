@@ -1,6 +1,6 @@
 // internal/db/queries/cleanup.go
 //
-// Copyright © 2025 Lakshy Sharma lakshy.d.sharma@gmail.com
+// Copyright © 2026 Lakshy Sharma lakshy.d.sharma@gmail.com
 // AGPL-3.0 License
 
 package queries
@@ -21,10 +21,9 @@ func NewCleanupQueries(d *db.DB) *CleanupQueries {
 }
 
 type CleanupResult struct {
-	FileScanRowsDeleted    int64
-	ProcessScanRowsDeleted int64
-	NetworkRowsDeleted     int64
-	MemoryRowsDeleted      int64
+	DetectionsDeleted  int64
+	NetworkRowsDeleted int64
+	MemoryRowsDeleted  int64
 }
 
 func (q *CleanupQueries) RunCleanup(retentionDays int) (CleanupResult, error) {
@@ -36,14 +35,9 @@ func (q *CleanupQueries) RunCleanup(retentionDays int) (CleanupResult, error) {
 	var result CleanupResult
 	var err error
 
-	result.FileScanRowsDeleted, err = NewFileQueries(q.db).DeleteResolvedBefore(cutoff)
+	result.DetectionsDeleted, err = NewDetectionQueries(q.db).DeleteResolvedBefore(cutoff)
 	if err != nil {
-		return result, fmt.Errorf("cleanup: file_scan_results: %w", err)
-	}
-
-	result.ProcessScanRowsDeleted, err = NewProcessQueries(q.db).DeleteResolvedBefore(cutoff)
-	if err != nil {
-		return result, fmt.Errorf("cleanup: process_scan_results: %w", err)
+		return result, fmt.Errorf("cleanup: detections: %w", err)
 	}
 
 	result.NetworkRowsDeleted, err = NewNetworkQueries(q.db).DeleteLowSeverityBefore(cutoff)

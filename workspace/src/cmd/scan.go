@@ -18,8 +18,9 @@ import (
 	"vajra/internal/analyzer"
 	"vajra/internal/db"
 	"vajra/internal/db/queries"
-	"vajra/internal/jobs"
-	"vajra/internal/scanner"
+	"vajra/internal/detect"
+	"vajra/internal/findings"
+	"vajra/internal/scanner/yara"
 	"vajra/internal/utilities"
 )
 
@@ -55,7 +56,6 @@ func runScan(cmd *cobra.Command, args []string) error {
 	if len(args) == 1 && args[0] != "" {
 		targetDir = args[0]
 	}
-
 	if _, err := os.Stat(targetDir); err != nil {
 		return fmt.Errorf("scan: target directory %q: %w", targetDir, err)
 	}
@@ -67,22 +67,18 @@ func runScan(cmd *cobra.Command, args []string) error {
 	}
 	defer database.Close()
 
-	fq := queries.NewFileQueries(database)
-
-	rulesCompiler := scanner.NewRulesCompiler(logger)
-
+	compiler := yara.NewCompiler(logger)
 	extractDir := filepath.Join(cfg.GenericSettings.WorkDirectory, "rules-extracted")
-	if err := rulesCompiler.ExtractRules(cfg.RulesSettings.RulesFilepath, extractDir); err != nil {
+	if err := compiler.ExtractRules(cfg.RulesSettings.RulesFilepath, extractDir); err != nil {
 		return fmt.Errorf("scan: extract rules: %w", err)
 	}
-
-	rules, err := rulesCompiler.CompileRules(extractDir)
+	yaraRules, err := compiler.CompileRules(extractDir)
 	if err != nil {
 		return fmt.Errorf("scan: compile rules: %w", err)
 	}
 
-	pool := scanner.NewPool(
-		rules,
+	pool := yara.NewPool(
+		yaraRules,
 		cfg.PerformanceSettings.DefaultThreads,
 		cfg.PerformanceSettings.MaxAllowedThreads,
 		cfg.PerformanceSettings.ScanQueueSize,
@@ -92,11 +88,25 @@ func runScan(cmd *cobra.Command, args []string) error {
 	defer pool.Stop()
 
 	cache := analyzer.NewResultCache()
-	yaraAnalyzer := analyzer.NewYARAAnalyzer(pool, logger)
-	pipeline := analyzer.NewPipeline([]analyzer.Analyzer{yaraAnalyzer}, analyzer.WithCache(cache))
+	pipeline := analyzer.NewPipeline(
+		[]analyzer.Analyzer{analyzer.NewYARAAnalyzer(pool, logger)},
+		analyzer.WithCache(cache),
+	)
 
-	filter := scanner.NewExclusionFilter(&cfg)
-	dedup := scanner.NewDedupTracker(time.Duration(cfg.TimingSettings.DedupWindowMin) * time.Minute)
+	filter := utilities.NewExclusionFilter(&cfg)
+	dedupWindow := time.Duration(cfg.TimingSettings.DedupWindowMin) * time.Minute
+
+	fw := findings.NewFindingWriter(
+		logger,
+		queries.NewDetectionQueries(database),
+		queries.NewArtifactQueries(database),
+		queries.NewDetectionNetworkQueries(database),
+		queries.NewSecretQueries(database),
+		queries.NewExtensionQueries(database),
+		queries.NewEvidenceQueries(database),
+		dedupWindow,
+		sysInfo,
+	)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -112,37 +122,34 @@ func runScan(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Starting scan: %s\n\n", targetDir)
 	start := time.Now()
 
-	summary, err := jobs.RunFullScan(ctx, targetDir, pipeline, filter, dedup, fq, sysInfo, logger)
+	summary, err := detect.RunFullScan(ctx, targetDir, pipeline, filter, fw, sysInfo, logger)
 	if err != nil {
 		return fmt.Errorf("scan: %w", err)
 	}
 
 	elapsed := time.Since(start).Round(time.Second)
-
+	status := "Scan complete"
 	if summary.Interrupted {
-		fmt.Printf("Scan interrupted after %s: %s files scanned, %s hits found\n",
-			elapsed,
-			formatCount(summary.FilesScanned),
-			formatCount(summary.HitsFound),
-		)
-	} else {
-		fmt.Printf("Scan complete in %s: %s files scanned, %s hits found\n",
-			elapsed,
-			formatCount(summary.FilesScanned),
-			formatCount(summary.HitsFound),
-		)
+		status = "Scan interrupted"
 	}
 
+	fmt.Printf("%s in %s: %s executable files scanned of ~%s candidates, %s hits found\n",
+		status,
+		elapsed,
+		formatCount(summary.FilesScanned),
+		formatCount(summary.Candidates),
+		formatCount(summary.HitsFound),
+	)
+
+	fw.LogMetrics(logger)
 	return nil
 }
 
-// formatCount formats an int64 with thousands separators for readability.
 func formatCount(n int64) string {
 	s := fmt.Sprintf("%d", n)
 	if len(s) <= 3 {
 		return s
 	}
-
 	out := make([]byte, 0, len(s)+len(s)/3)
 	for i, c := range s {
 		if i > 0 && (len(s)-i)%3 == 0 {

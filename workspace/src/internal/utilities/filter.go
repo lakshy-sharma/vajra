@@ -1,9 +1,9 @@
-// internal/scanner/filter.go
+// internal/utilities/filter.go
 //
-// Copyright © 2025 Lakshy Sharma lakshy.d.sharma@gmail.com
+// Copyright © 2026 Lakshy Sharma lakshy.d.sharma@gmail.com
 // AGPL-3.0 License
 
-package scanner
+package utilities
 
 import (
 	"path/filepath"
@@ -11,14 +11,10 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"vajra/internal/utilities"
 )
 
-// ============================================================
-// ExclusionFilter — path, extension, pattern filtering
-// ============================================================
-
+// ExclusionFilter decides whether a file path should be scanned.
+// Thread-safe — paths can be added at runtime.
 type ExclusionFilter struct {
 	mu         sync.RWMutex
 	paths      []string
@@ -26,7 +22,7 @@ type ExclusionFilter struct {
 	patterns   []string
 }
 
-func NewExclusionFilter(cfg *utilities.Config) *ExclusionFilter {
+func NewExclusionFilter(cfg *Config) *ExclusionFilter {
 	return &ExclusionFilter{
 		paths:      cfg.ScanSettings.ExclusionRules.ExcludePaths,
 		extensions: cfg.ScanSettings.ExclusionRules.ExcludeExtensions,
@@ -34,7 +30,6 @@ func NewExclusionFilter(cfg *utilities.Config) *ExclusionFilter {
 	}
 }
 
-// ShouldScan returns true if the path passes all exclusion rules.
 func (f *ExclusionFilter) ShouldScan(filePath string) bool {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -44,20 +39,17 @@ func (f *ExclusionFilter) ShouldScan(filePath string) bool {
 			return false
 		}
 	}
-
 	ext := filepath.Ext(filePath)
 	for _, e := range f.extensions {
 		if ext == e {
 			return false
 		}
 	}
-
 	for _, pattern := range f.patterns {
 		if strings.Contains(filePath, pattern) {
 			return false
 		}
 	}
-
 	return true
 }
 
@@ -67,38 +59,27 @@ func (f *ExclusionFilter) AddPath(path string) {
 	f.paths = append(f.paths, path)
 }
 
-// ============================================================
-// ProcessFilter — trusted process list
-// ============================================================
-
+// ProcessFilter gates which processes receive the full content pipeline.
+// Trusted processes still run the runtime pipeline — a trusted name
+// exhibiting suspicious behaviour is more alarming, not less.
 type ProcessFilter struct {
 	mu      sync.RWMutex
 	trusted []string
 }
 
-func NewProcessFilter(cfg *utilities.Config) *ProcessFilter {
-	return &ProcessFilter{
-		trusted: cfg.ScanSettings.ExclusionRules.ExcludeProcesses,
-	}
+func NewProcessFilter(cfg *Config) *ProcessFilter {
+	return &ProcessFilter{trusted: cfg.ScanSettings.ExclusionRules.ExcludeProcesses}
 }
 
-// IsTrusted returns true when the process is on the exclusion list.
 func (f *ProcessFilter) IsTrusted(processName string) bool {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return slices.Contains(f.trusted, processName)
 }
 
-// ReduceMonitoring is an alias kept for call-site readability:
-// trusted processes only get scanned for executable files.
-func (f *ProcessFilter) ReduceMonitoring(processName string) bool {
-	return f.IsTrusted(processName)
-}
-
-// ============================================================
-// RecentScanTracker — deduplication TTL cache
-// ============================================================
-
+// RecentScanTracker is a TTL cache that prevents rescanning files
+// that were seen within the window. Keyed on hash when available,
+// path otherwise — catches in-place binary replacement via QuickHash.
 type RecentScanTracker struct {
 	mu    sync.RWMutex
 	scans map[string]time.Time
@@ -106,49 +87,35 @@ type RecentScanTracker struct {
 }
 
 func NewRecentScanTracker(ttl time.Duration) *RecentScanTracker {
-	rst := &RecentScanTracker{
-		scans: make(map[string]time.Time),
-		ttl:   ttl,
-	}
+	rst := &RecentScanTracker{scans: make(map[string]time.Time), ttl: ttl}
 	go rst.cleanup()
 	return rst
 }
 
-// WasRecentlyScanned returns true if this file/hash was seen
-// within the TTL window. Prefers hash as key; falls back to path.
 func (rst *RecentScanTracker) WasRecentlyScanned(filePath, fileHash string) bool {
 	rst.mu.RLock()
 	defer rst.mu.RUnlock()
-
 	key := fileHash
 	if key == "" {
 		key = filePath
 	}
-
-	if t, ok := rst.scans[key]; ok {
-		return time.Since(t) < rst.ttl
-	}
-
-	return false
+	t, ok := rst.scans[key]
+	return ok && time.Since(t) < rst.ttl
 }
 
-// MarkScanned records the current time for this file/hash.
 func (rst *RecentScanTracker) MarkScanned(filePath, fileHash string) {
 	rst.mu.Lock()
 	defer rst.mu.Unlock()
-
 	key := fileHash
 	if key == "" {
 		key = filePath
 	}
-
 	rst.scans[key] = time.Now()
 }
 
 func (rst *RecentScanTracker) cleanup() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
-
 	for range ticker.C {
 		rst.mu.Lock()
 		now := time.Now()

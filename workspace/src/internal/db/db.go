@@ -1,6 +1,6 @@
 // internal/db/db.go
 //
-// Copyright © 2025 Lakshy Sharma lakshy.d.sharma@gmail.com
+// Copyright © 2026 Lakshy Sharma lakshy.d.sharma@gmail.com
 // AGPL-3.0 License
 
 package db
@@ -26,26 +26,21 @@ func Open(path string, logger *zerolog.Logger) (*DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, fmt.Errorf("db: create directory: %w", err)
 	}
-
 	sqlDB, err := sql.Open("sqlite3", path)
 	if err != nil {
 		return nil, fmt.Errorf("db: open: %w", err)
 	}
-
 	sqlDB.SetMaxOpenConns(1)
 
 	d := &DB{sql: sqlDB, logger: logger}
-
 	if err := d.applyPragmas(); err != nil {
 		sqlDB.Close()
 		return nil, err
 	}
-
 	if err := d.migrate(); err != nil {
 		sqlDB.Close()
 		return nil, err
 	}
-
 	logger.Info().Str("path", path).Msg("database ready")
 	return d, nil
 }
@@ -66,9 +61,7 @@ func (d *DB) Close() error {
 	return nil
 }
 
-func (d *DB) Ping() error {
-	return d.sql.Ping()
-}
+func (d *DB) Ping() error { return d.sql.Ping() }
 
 func (d *DB) applyPragmas() error {
 	pragmas := []string{
@@ -88,83 +81,149 @@ func (d *DB) applyPragmas() error {
 
 func (d *DB) migrate() error {
 	stmts := []string{
-		// ── file_scan_results ─────────────────────────────────
-		`CREATE TABLE IF NOT EXISTS file_scan_results (
-			id           INTEGER PRIMARY KEY AUTOINCREMENT,
-			machine_id   TEXT     NOT NULL DEFAULT '',
-			scan_time    INTEGER  NOT NULL,
-			file_path    TEXT     NOT NULL,
-			file_size    INTEGER,
-			file_hash    TEXT,
-			yara_matches TEXT,
-			severity     TEXT     NOT NULL DEFAULT 'LOW',
-			status       TEXT     NOT NULL DEFAULT 'NEW',
-			event_type   INTEGER,
-			trigger_pid  INTEGER,
-			trigger_uid  INTEGER,
-			trigger_comm TEXT,
-			dedup_count  INTEGER  NOT NULL DEFAULT 0,
-			notes        TEXT,
-			created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
-			updated_at   DATETIME DEFAULT CURRENT_TIMESTAMP
+		// ── detections ────────────────────────────────────────
+		// Unified table for all non-clean findings regardless of source.
+		// The UI, sync watermarks, and response system all reference this.
+		`CREATE TABLE IF NOT EXISTS detections (
+			id              INTEGER PRIMARY KEY AUTOINCREMENT,
+			machine_id      TEXT    NOT NULL DEFAULT '',
+			detection_time  INTEGER NOT NULL,
+			source          TEXT    NOT NULL,
+			severity        TEXT    NOT NULL DEFAULT 'LOW',
+			status          TEXT    NOT NULL DEFAULT 'NEW',
+			pid             INTEGER,
+			ppid            INTEGER,
+			uid             INTEGER,
+			gid             INTEGER,
+			euid            INTEGER,
+			egid            INTEGER,
+			process_name    TEXT,
+			exe_path        TEXT,
+			cmdline         TEXT,
+			cwd             TEXT,
+			target_path     TEXT,
+			rule_id         TEXT,
+			mitre_technique TEXT,
+			notes           TEXT,
+			dedup_count     INTEGER NOT NULL DEFAULT 0,
+			created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_fsr_machine_id ON file_scan_results(machine_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_fsr_scan_time  ON file_scan_results(scan_time)`,
-		`CREATE INDEX IF NOT EXISTS idx_fsr_file_path  ON file_scan_results(file_path)`,
-		`CREATE INDEX IF NOT EXISTS idx_fsr_file_hash  ON file_scan_results(file_hash)`,
-		`CREATE INDEX IF NOT EXISTS idx_fsr_severity   ON file_scan_results(severity)`,
-		`CREATE INDEX IF NOT EXISTS idx_fsr_status     ON file_scan_results(status)`,
-		`CREATE INDEX IF NOT EXISTS idx_fsr_event_type ON file_scan_results(event_type)`,
+		`CREATE INDEX IF NOT EXISTS idx_det_machine_id     ON detections(machine_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_det_detection_time ON detections(detection_time)`,
+		`CREATE INDEX IF NOT EXISTS idx_det_source         ON detections(source)`,
+		`CREATE INDEX IF NOT EXISTS idx_det_severity       ON detections(severity)`,
+		`CREATE INDEX IF NOT EXISTS idx_det_status         ON detections(status)`,
+		`CREATE INDEX IF NOT EXISTS idx_det_target_path    ON detections(target_path)`,
+		`CREATE INDEX IF NOT EXISTS idx_det_rule_id        ON detections(rule_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_det_pid            ON detections(pid)`,
 
-		// ── process_scan_results ──────────────────────────────
-		`CREATE TABLE IF NOT EXISTS process_scan_results (
+		// ── detection_artifacts ───────────────────────────────
+		// File hash and YARA matches for file/process detections.
+		`CREATE TABLE IF NOT EXISTS detection_artifacts (
 			id           INTEGER PRIMARY KEY AUTOINCREMENT,
-			machine_id   TEXT     NOT NULL DEFAULT '',
-			scan_time    INTEGER  NOT NULL,
-			pid          INTEGER  NOT NULL,
-			ppid         INTEGER,
-			uid          INTEGER  NOT NULL,
-			gid          INTEGER,
-			euid         INTEGER,
-			egid         INTEGER,
-			process_name TEXT     NOT NULL,
-			exe_path     TEXT,
-			cmdline      TEXT,
-			cwd          TEXT,
+			detection_id INTEGER NOT NULL REFERENCES detections(id),
 			file_hash    TEXT,
-			yara_matches TEXT,
-			severity     TEXT     NOT NULL DEFAULT 'LOW',
-			status       TEXT     NOT NULL DEFAULT 'NEW',
-			event_type   INTEGER,
-			dedup_count  INTEGER  NOT NULL DEFAULT 0,
-			notes        TEXT,
-			created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
-			updated_at   DATETIME DEFAULT CURRENT_TIMESTAMP
+			file_size    INTEGER,
+			yara_matches TEXT
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_psr_machine_id ON process_scan_results(machine_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_psr_scan_time  ON process_scan_results(scan_time)`,
-		`CREATE INDEX IF NOT EXISTS idx_psr_pid        ON process_scan_results(pid)`,
-		`CREATE INDEX IF NOT EXISTS idx_psr_severity   ON process_scan_results(severity)`,
-		`CREATE INDEX IF NOT EXISTS idx_psr_status     ON process_scan_results(status)`,
-		`CREATE INDEX IF NOT EXISTS idx_psr_name       ON process_scan_results(process_name)`,
-		`CREATE INDEX IF NOT EXISTS idx_psr_file_hash  ON process_scan_results(file_hash)`,
+		`CREATE INDEX IF NOT EXISTS idx_da_detection_id ON detection_artifacts(detection_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_da_file_hash    ON detection_artifacts(file_hash)`,
+
+		// ── detection_network ─────────────────────────────────
+		// Socket details for reverse shell detections.
+		`CREATE TABLE IF NOT EXISTS detection_network (
+			id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			detection_id INTEGER NOT NULL REFERENCES detections(id),
+			remote_addr  TEXT,
+			remote_port  INTEGER,
+			protocol     TEXT,
+			socket_inode INTEGER,
+			old_fd       INTEGER,
+			new_fd       INTEGER
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_dn_detection_id ON detection_network(detection_id)`,
+
+		// ── detection_secrets ─────────────────────────────────
+		// Betterleaks finding detail. Raw secret value never stored.
+		`CREATE TABLE IF NOT EXISTS detection_secrets (
+			id            INTEGER PRIMARY KEY AUTOINCREMENT,
+			detection_id  INTEGER NOT NULL REFERENCES detections(id),
+			rule_id       TEXT    NOT NULL,
+			secret_hash   TEXT    NOT NULL,
+			start_line    INTEGER NOT NULL,
+			end_line      INTEGER NOT NULL,
+			match_context TEXT
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_ds_detection_id ON detection_secrets(detection_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_ds_secret_hash  ON detection_secrets(secret_hash)`,
+		`CREATE INDEX IF NOT EXISTS idx_ds_rule_id      ON detection_secrets(rule_id)`,
+
+		// ── detection_extensions ──────────────────────────────
+		// Key/value escape hatch for source-specific fields that don't
+		// warrant a dedicated column. Each key is a separate row so
+		// searches on key+value are index-assisted without JSON parsing.
+		`CREATE TABLE IF NOT EXISTS detection_extensions (
+			id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			detection_id INTEGER NOT NULL REFERENCES detections(id),
+			key          TEXT    NOT NULL,
+			value        TEXT    NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_de_detection_id ON detection_extensions(detection_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_de_key          ON detection_extensions(key)`,
+		`CREATE INDEX IF NOT EXISTS idx_de_key_value    ON detection_extensions(key, value)`,
+
+		// ── evidence_snapshots ────────────────────────────────
+		// Live process state captured immediately on HIGH/CRITICAL.
+		// Process state goes stale within seconds — timing is critical.
+		`CREATE TABLE IF NOT EXISTS evidence_snapshots (
+			id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			detection_id INTEGER NOT NULL REFERENCES detections(id),
+			captured_at  INTEGER NOT NULL,
+			open_fds     TEXT,
+			maps         TEXT,
+			environ      TEXT,
+			status       TEXT
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_es_detection_id ON evidence_snapshots(detection_id)`,
+
+		// ── audit_log ─────────────────────────────────────────
+		// Component lifecycle and health events. Append-only —
+		// never touched by retention cleanup.
+		`CREATE TABLE IF NOT EXISTS audit_log (
+			id              INTEGER PRIMARY KEY AUTOINCREMENT,
+			machine_id      TEXT    NOT NULL DEFAULT '',
+			logged_at       INTEGER NOT NULL,
+			component       TEXT    NOT NULL,
+			event_type      TEXT    NOT NULL,
+			status          TEXT    NOT NULL DEFAULT 'ok',
+			details         TEXT,
+			duration_ms     INTEGER,
+			items_processed INTEGER
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_al_machine_id  ON audit_log(machine_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_al_logged_at   ON audit_log(logged_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_al_component   ON audit_log(component)`,
+		`CREATE INDEX IF NOT EXISTS idx_al_event_type  ON audit_log(event_type)`,
+		`CREATE INDEX IF NOT EXISTS idx_al_status      ON audit_log(status)`,
 
 		// ── network_events ────────────────────────────────────
+		// Raw telemetry — every connection including noise.
 		`CREATE TABLE IF NOT EXISTS network_events (
 			id           INTEGER PRIMARY KEY AUTOINCREMENT,
-			machine_id   TEXT     NOT NULL DEFAULT '',
-			event_time   INTEGER  NOT NULL,
-			event_type   INTEGER  NOT NULL,
-			pid          INTEGER  NOT NULL,
-			uid          INTEGER  NOT NULL,
-			process_name TEXT     NOT NULL,
+			machine_id   TEXT    NOT NULL DEFAULT '',
+			event_time   INTEGER NOT NULL,
+			event_type   INTEGER NOT NULL,
+			pid          INTEGER NOT NULL,
+			uid          INTEGER NOT NULL,
+			process_name TEXT    NOT NULL,
 			src_addr     TEXT,
 			dst_addr     TEXT,
 			src_port     INTEGER,
 			dst_port     INTEGER,
 			protocol     TEXT,
-			severity     TEXT     NOT NULL DEFAULT 'LOW',
-			status       TEXT     NOT NULL DEFAULT 'NEW',
+			severity     TEXT    NOT NULL DEFAULT 'LOW',
+			status       TEXT    NOT NULL DEFAULT 'NEW',
 			notes        TEXT,
 			created_at   DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
@@ -175,20 +234,21 @@ func (d *DB) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_ne_severity   ON network_events(severity)`,
 
 		// ── security_events ───────────────────────────────────
+		// Raw telemetry — ptrace, capset, namespace, dns, reverse shell.
 		`CREATE TABLE IF NOT EXISTS security_events (
 			id           INTEGER PRIMARY KEY AUTOINCREMENT,
-			machine_id   TEXT     NOT NULL DEFAULT '',
-			event_time   INTEGER  NOT NULL,
-			event_type   INTEGER  NOT NULL,
-			event_name   TEXT     NOT NULL,
-			pid          INTEGER  NOT NULL,
-			uid          INTEGER  NOT NULL,
-			process_name TEXT     NOT NULL,
+			machine_id   TEXT    NOT NULL DEFAULT '',
+			event_time   INTEGER NOT NULL,
+			event_type   INTEGER NOT NULL,
+			event_name   TEXT    NOT NULL,
+			pid          INTEGER NOT NULL,
+			uid          INTEGER NOT NULL,
+			process_name TEXT    NOT NULL,
 			target_pid   INTEGER,
 			target_path  TEXT,
 			details      TEXT,
-			severity     TEXT     NOT NULL DEFAULT 'MEDIUM',
-			status       TEXT     NOT NULL DEFAULT 'NEW',
+			severity     TEXT    NOT NULL DEFAULT 'MEDIUM',
+			status       TEXT    NOT NULL DEFAULT 'NEW',
 			yara_matches TEXT,
 			action_taken TEXT,
 			notes        TEXT,
@@ -203,21 +263,22 @@ func (d *DB) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_se_status     ON security_events(status)`,
 
 		// ── memory_events ─────────────────────────────────────
+		// Raw telemetry — mmap/mprotect PROT_EXEC events.
 		`CREATE TABLE IF NOT EXISTS memory_events (
 			id           INTEGER PRIMARY KEY AUTOINCREMENT,
-			machine_id   TEXT     NOT NULL DEFAULT '',
-			event_time   INTEGER  NOT NULL,
-			event_type   INTEGER  NOT NULL,
-			pid          INTEGER  NOT NULL,
-			uid          INTEGER  NOT NULL,
-			process_name TEXT     NOT NULL,
+			machine_id   TEXT    NOT NULL DEFAULT '',
+			event_time   INTEGER NOT NULL,
+			event_type   INTEGER NOT NULL,
+			pid          INTEGER NOT NULL,
+			uid          INTEGER NOT NULL,
+			process_name TEXT    NOT NULL,
 			address      INTEGER,
 			length       INTEGER,
 			protection   INTEGER,
 			flags        INTEGER,
 			file_path    TEXT,
-			severity     TEXT     NOT NULL DEFAULT 'MEDIUM',
-			status       TEXT     NOT NULL DEFAULT 'NEW',
+			severity     TEXT    NOT NULL DEFAULT 'MEDIUM',
+			status       TEXT    NOT NULL DEFAULT 'NEW',
 			notes        TEXT,
 			created_at   DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
@@ -229,17 +290,17 @@ func (d *DB) migrate() error {
 		// ── autoruns ──────────────────────────────────────────
 		`CREATE TABLE IF NOT EXISTS autoruns (
 			id           INTEGER PRIMARY KEY AUTOINCREMENT,
-			category     TEXT     NOT NULL,
-			location     TEXT     NOT NULL,
+			category     TEXT    NOT NULL,
+			location     TEXT    NOT NULL,
 			image_path   TEXT,
 			image_name   TEXT,
 			arguments    TEXT,
 			md5          TEXT,
 			sha1         TEXT,
 			sha256       TEXT,
-			is_active    BOOLEAN  NOT NULL DEFAULT 1,
-			first_seen   INTEGER  NOT NULL,
-			last_seen    INTEGER  NOT NULL,
+			is_active    BOOLEAN NOT NULL DEFAULT 1,
+			first_seen   INTEGER NOT NULL,
+			last_seen    INTEGER NOT NULL,
 			created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
 			updated_at   DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
@@ -252,17 +313,19 @@ func (d *DB) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_ar_last_seen  ON autoruns(last_seen)`,
 
 		// ── quarantined_files ─────────────────────────────────
+		// related_id references detections.id — response actions
+		// always attach to a unified detection record.
 		`CREATE TABLE IF NOT EXISTS quarantined_files (
 			id              INTEGER PRIMARY KEY AUTOINCREMENT,
-			original_path   TEXT     NOT NULL,
-			quarantine_path TEXT     NOT NULL,
-			file_hash       TEXT     NOT NULL,
+			original_path   TEXT    NOT NULL,
+			quarantine_path TEXT    NOT NULL,
+			file_hash       TEXT    NOT NULL,
 			file_size       INTEGER,
-			quarantine_time INTEGER  NOT NULL,
-			related_scan_id INTEGER,
-			severity        TEXT     NOT NULL,
-			reason          TEXT     NOT NULL,
-			restored        BOOLEAN  NOT NULL DEFAULT 0,
+			quarantine_time INTEGER NOT NULL,
+			related_id      INTEGER REFERENCES detections(id),
+			severity        TEXT    NOT NULL,
+			reason          TEXT    NOT NULL,
+			restored        BOOLEAN NOT NULL DEFAULT 0,
 			restored_time   INTEGER,
 			notes           TEXT,
 			created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -284,21 +347,16 @@ func (d *DB) migrate() error {
 		)`,
 
 		// ── sync_state ────────────────────────────────────────
-		// Watermark table for remote sync. One row per event table.
-		// last_synced_id tracks the highest ID shipped to the server.
-		// Purge job deletes rows with id <= last_synced_id older than retention.
 		`CREATE TABLE IF NOT EXISTS sync_state (
 			table_name     TEXT    PRIMARY KEY,
 			last_synced_id INTEGER NOT NULL DEFAULT 0,
 			last_synced_at INTEGER NOT NULL DEFAULT 0,
 			synced_rows    INTEGER NOT NULL DEFAULT 0
 		)`,
+
 		// ── process_tree ──────────────────────────────────────
-		// Adjacency list of every execve event. Written on every
-		// process execution regardless of scan result or dedup.
-		// The server reconstructs full execution forests via recursive
-		// CTE on (machine_id, ppid, pid). Never pruned by retention
-		// cleanup — tree completeness matters more than disk space.
+		// Every execve, never pruned. Complete tree required for
+		// server-side recursive CTE traversal.
 		`CREATE TABLE IF NOT EXISTS process_tree (
 			id         INTEGER PRIMARY KEY AUTOINCREMENT,
 			machine_id TEXT    NOT NULL DEFAULT '',
@@ -309,12 +367,11 @@ func (d *DB) migrate() error {
 			cmdline    TEXT    NOT NULL DEFAULT '',
 			event_time INTEGER NOT NULL
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_pt_machine_id ON process_tree(machine_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_pt_pid        ON process_tree(pid)`,
-		`CREATE INDEX IF NOT EXISTS idx_pt_ppid       ON process_tree(ppid)`,
-		`CREATE INDEX IF NOT EXISTS idx_pt_event_time ON process_tree(event_time)`,
-		// Composite index for the recursive CTE query pattern.
-		`CREATE INDEX IF NOT EXISTS idx_pt_machine_ppid_pid ON process_tree(machine_id, ppid, pid)`,
+		`CREATE INDEX IF NOT EXISTS idx_pt_machine_id        ON process_tree(machine_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_pt_pid               ON process_tree(pid)`,
+		`CREATE INDEX IF NOT EXISTS idx_pt_ppid              ON process_tree(ppid)`,
+		`CREATE INDEX IF NOT EXISTS idx_pt_event_time        ON process_tree(event_time)`,
+		`CREATE INDEX IF NOT EXISTS idx_pt_machine_ppid_pid  ON process_tree(machine_id, ppid, pid)`,
 	}
 
 	for _, stmt := range stmts {
