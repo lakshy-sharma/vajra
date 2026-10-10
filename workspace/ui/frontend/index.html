@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vajra EDR</title>
+    <script>
+      // Apply dark/light theme before first paint to avoid flash.
+      // Reads from localStorage; falls back to OS preference.
+      (function () {
+        try {
+          var stored = localStorage.getItem('vajra-theme');
+          if (stored === 'dark' || stored === 'light') {
+            document.documentElement.setAttribute('data-theme', stored);
+          } else {
+            var prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+            document.documentElement.setAttribute('data-theme', prefersDark ? 'dark' : 'light');
+          }
+        } catch (_) {}
+      })();
+    </script>
+  </head>
+  <body class="bg-[--bg] text-[--fg] antialiased">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

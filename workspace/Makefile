@@ -1,6 +1,7 @@
 # Build variables
 RELEASE_DIR  := ./release
-SRC          := ./src
+SRC          := ./daemon
+UI_SRC       := ./ui
 EBPF_SRC     := $(SRC)/internal/ebpf/c
 EBPF_OUT     := $(SRC)/internal/ebpf
 DEB_SKEL     := ./deb_skel
@@ -58,16 +59,18 @@ generate-ebpf: generate-vmlinux
 #   internal/ebpf/bpf_arm64_bpfel.go + bpf_arm64_bpfel.o
 
 # ── amd64 build ──────────────────────────────────────────────
+# GOAMD64=v3 targets x86-64-v3 (AVX2, BMI1/2, FMA, etc.)
+# Requires Haswell (Intel) or Zen 1+ (AMD) — do not use on older hardware.
 
 .PHONY: linux_amd64
-linux_amd64: ARCH    := amd64
+linux_amd64: ARCH     := amd64
 linux_amd64: DEB_BASE := ./$(PACKAGE_NAME)_$(VERSION)_amd64
 linux_amd64:
-	@echo "Building $(PACKAGE_NAME) — version: $(VERSION) arch: amd64"
+	@echo "Building $(PACKAGE_NAME) — version: $(VERSION) arch: amd64 (x86-64-v3)"
 	@echo "============================================"
 	cd $(SRC) && \
-		GOOS=linux GOARCH=amd64 \
-		go build -ldflags="-s -w" -o $(PACKAGE_NAME) main.go
+		GOOS=linux GOARCH=amd64 GOAMD64=v3 \
+		go build -ldflags="-s -w" -o $(PACKAGE_NAME) .
 	mkdir -p $(RELEASE_DIR)
 	mv $(SRC)/$(PACKAGE_NAME) $(RELEASE_DIR)/$(PACKAGE_NAME)
 	$(MAKE) _deb ARCH=amd64 DEB_BASE=$(DEB_BASE)
@@ -77,14 +80,14 @@ linux_amd64:
 # ── arm64 build ──────────────────────────────────────────────
 
 .PHONY: linux_arm64
-linux_arm64: ARCH    := arm64
+linux_arm64: ARCH     := arm64
 linux_arm64: DEB_BASE := ./$(PACKAGE_NAME)_$(VERSION)_arm64
 linux_arm64:
 	@echo "Building $(PACKAGE_NAME) — version: $(VERSION) arch: arm64"
 	@echo "============================================"
 	cd $(SRC) && \
 		GOOS=linux GOARCH=arm64 \
-		go build -ldflags="-s -w" -o $(PACKAGE_NAME) main.go
+		go build -ldflags="-s -w" -o $(PACKAGE_NAME) .
 	mkdir -p $(RELEASE_DIR)
 	mv $(SRC)/$(PACKAGE_NAME) $(RELEASE_DIR)/$(PACKAGE_NAME)
 	$(MAKE) _deb ARCH=arm64 DEB_BASE=$(DEB_BASE)
@@ -106,6 +109,24 @@ _deb:
 	mv $(DEB_BASE).deb $(RELEASE_DIR)/
 	rm -rf $(DEB_BASE)
 
+# ── UI build ─────────────────────────────────────────────────
+# Requires:
+#   wails v2  (go install github.com/wailsapp/wails/v2/cmd/wails@latest)
+#   node >= 20, npm
+
+.PHONY: ui
+ui:
+	@echo "Building vajra-ui..."
+	cd $(UI_SRC) && wails build -tags webkit2_41 -o vajra-ui
+	mkdir -p $(RELEASE_DIR)
+	mv $(UI_SRC)/build/bin/vajra-ui $(RELEASE_DIR)/vajra-ui
+	@echo "UI binary: $(RELEASE_DIR)/vajra-ui"
+
+.PHONY: ui-dev
+ui-dev:
+	@echo "Starting vajra-ui dev server (hot-reload)..."
+	cd $(UI_SRC) && wails dev -tags webkit2_41
+
 # ── Development helpers ───────────────────────────────────────
 
 # Run the agent locally without packaging (requires root for eBPF).
@@ -117,12 +138,14 @@ run:
 .PHONY: test
 test:
 	cd $(SRC) && go test ./...
+	cd $(UI_SRC) && go test ./...
 
 # Vet + staticcheck.
 .PHONY: lint
 lint:
 	cd $(SRC) && go vet ./...
 	cd $(SRC) && staticcheck ./...
+	cd $(UI_SRC) && go vet ./...
 
 # Remove release artifacts. Does NOT remove generated eBPF files
 # because those are committed and expensive to regenerate.
@@ -146,12 +169,15 @@ help:
 	@echo ""
 	@echo "Vajra EDR — build targets"
 	@echo ""
-	@echo "  make                  Build for linux/amd64 (default)"
-	@echo "  make linux_amd64      Build binary + deb for amd64"
+	@echo "  make                  Build for linux/amd64 (x86-64-v3, default)"
+	@echo "  make linux_amd64      Build binary + deb for amd64 (x86-64-v3)"
 	@echo "  make linux_arm64      Build binary + deb for arm64"
 	@echo ""
 	@echo "  make generate-vmlinux Generate vmlinux.h from running kernel"
 	@echo "  make generate-ebpf    Generate vmlinux.h + run bpf2go"
+	@echo ""
+	@echo "  make ui               Build desktop UI (needs wails + node)"
+	@echo "  make ui-dev           Start UI hot-reload dev server"
 	@echo ""
 	@echo "  make run              Run agent locally (needs root)"
 	@echo "  make test             Run all tests"

@@ -1,0 +1,49 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+  CSS custom properties — the canonical source of all colours.
+  Tailwind reads these through the semantic tokens defined in tailwind.config.js.
+  Dark-mode values are set on [data-theme="dark"]; light-mode on :root.
+  The inline script in index.html sets data-theme before first paint.
+*/
+:root,
+[data-theme="light"] {
+  --bg:        255 255 255;
+  --fg:        15  23  42;
+  --surface:   248 250 252;
+  --surface-2: 241 245 249;
+  --border:    226 232 240;
+  --muted:     100 116 139;
+  --accent:    99  102 241;  /* indigo-500 */
+}
+
+[data-theme="dark"] {
+  --bg:        10  10  10;
+  --fg:        241 245 249;
+  --surface:   24  24  27;
+  --surface-2: 39  39  42;
+  --border:    63  63  70;
+  --muted:     161 161 170;
+  --accent:    129 140 248;  /* indigo-400 */
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background-color: rgb(var(--bg));
+  color: rgb(var(--fg));
+}
+
+/* Scrollbar styling — minimal track, matches theme */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgb(var(--border));
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(var(--muted));
+}

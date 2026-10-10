@@ -1,97 +1,149 @@
-# Vajra EDR — Roadmap
+# Vajra EDR — TODO
 
-## Completed
+Priority order within each phase reflects dependency and detection value.
 
-- eBPF event collection — process, file, network, memory, namespace, module, dup2/dup3 events
-- eBPF dispatcher — typed channel fan-out from raw perf events
-- Event sink — network, memory, security, module → raw telemetry tables with heuristic severity
-- Memory event dedup — pid+prot keyed, 30s window, W^X always inserted
-- YARA file scanner — eBPF-driven, three-condition eligibility (execute bit, magic bytes, interpreter trigger)
-- YARA process scanner — two-pipeline split: content (cached, filter-aware) + runtime (always runs)
-- Analyzer interface — Pipeline, RunUncached, MergeResults, ResultCache, PID + SHA256 context helpers
-- YARAAnalyzer, LDPreloadAnalyzer, CapabilityAnalyzer
-- HashAnalyzer — Bloom filter loaded from MalwareBazaar dataset; short-circuits content pipeline on CRITICAL; gracefully disabled when filter absent
-- MalwareBazaar integration — HashSyncer job; downloads full CSV, builds Bloom filter; `vajra hashes update/status` CLI
-- DupWatcher — dup2/dup3 driven reverse shell detection; pid+inode dedup 30s window
-- Unified detection schema — detections + detection_artifacts + detection_network + detection_secrets + detection_extensions + evidence_snapshots
-- FindingWriter — single insertion point for all detection output; dedup, schema routing, evidence capture
-- Process tree — adjacency list on every execve, never pruned, composite index for recursive CTE
-- Autorun scanner — all 12 Linux persistence categories, diffs against DB state
-- Secrets scanner — betterleaks v2 SDK; prefilter with configurable path segment exclusions and browser cache toggle; fingerprint-based ignore list; `vajra secrets ignore/export-ignore` CLI
-- Audit log table — append-only component lifecycle and health events
-- DB retention cleanup job
-- Rule syncer — GitHub API tag check, download, zip verify, 7-generation archive rotation
-- Deb packaging — amd64 and arm64
-- CLI — vajra scan [dir], vajra rules update/status, vajra hashes update/status, vajra secrets ignore/export-ignore
-- Framework refactor — watcher/scanner/job/analyzer layer separation; utilities package with generic dedup, filter, hasher, severity; scanner/yara package
-- RuleMatch interface — engine-agnostic severity classification
-- Evidence snapshot — /proc state captured on HIGH/CRITICAL
-- sendmsg DNS fix — bpf_probe_read_user for msg_name
+---
 
-## Phase 1: Detection (remaining)
+## Phase 1 — Detection (Immediate)
 
-1. **LOLBin analyzer** — `internal/analyzer/lolbin.go`; cmdline pattern matching; shallow parent lookup via `ProcessTreeQueries.GetByPID`; config-driven rule list; fires HIGH
+### 1. LOLBin Analyzer — `internal/analyzer/lolbin.go`
 
-2. **Running process scanner** — `internal/detect/procwalk.go`; walk `/proc/PID/exe` on startup; submit to content pipeline via FindingWriter; dedup against RecentScanTracker
+Config-driven set of living-off-the-land binaries (`AlertPolicy.LOLBins`). On a process event, check if `comm` or `exe_path` basename matches the list. Do a shallow parent lookup via `ProcessTreeQueries.GetByPID` to check whether the parent is a known interpreter or another LOLBin. Fires HIGH. No false positives on bare invocation — only flag when the parent chain is suspicious.
 
-3. **Container tagging** — parse `/proc/PID/cgroup` on execve; `container_id TEXT` and `container_runtime TEXT` on detections; empty for host processes
+### 2. Container Tagging
 
-4. **EventStatistic aggregation job** — hourly ticker; upsert into event_statistics grouped by source and date; needed before dashboard is useful
+On every execve, read `/proc/PID/cgroup` and parse the container ID and runtime (docker, containerd, podman, lxc). Add `container_id TEXT` and `container_runtime TEXT` columns to `detections` and `process_tree`. Empty string for host processes. Required for the Phase 3 server to distinguish host detections from container detections.
 
-5. **User profile scanner** — `internal/detect/userprofile.go`; reads passwd/shadow/sudoers/ssh keys/groups/login history; diffs against user_inventory; flags policy violations
+### 3. EventStatistic Aggregation Job — `internal/job/statsync.go`
 
-## Phase 2: Hardening and Visibility
+Already wired in service.go. The `StatisticsQueries.Aggregate` method needs to perform the actual upsert: group raw telemetry and detection rows by source and date (Unix epoch day start UTC), write into `event_statistics`. Without this the dashboard is empty.
 
-1. **File integrity monitoring** — fsnotify on critical paths; CRITICAL alert with before/after hash and modifying PID; fim_events table
-2. **USB monitoring** — udev netlink; vendor/product/class/serial; USB mass storage → HIGH; usb_events table
-3. **Kernel integrity check** — /proc/modules vs /sys/module; detect hidden modules; baseline on first run
-4. **Binary changed after exec** — periodic SHA256 comparison of /proc/PID/exe for long-running processes; discrepancy = CRITICAL
-5. **Coverage telemetry** — 15-minute health ticker; pool workers, queue depth, events processed, uptime to audit_log
-6. **Tamper protection** — watchdog goroutine; chattr +i on binary and config
-7. **VirusTotal enrichment** — optional API key; SHA256 lookup on HIGH/CRITICAL; cached in known_bad_hashes
+### 4. User Profile Scanner — `internal/detect/userprofile.go`
 
-## Phase 3: Remote Sync
+Pull-based scanner. Reads `/etc/passwd`, `/etc/shadow` (root only), `/etc/sudoers` and `/etc/sudoers.d/*`, `/etc/group`, `~/.ssh/authorized_keys` for all users. Diffs against a `user_inventory` table (first run: baseline; subsequent runs: alert on changes). Flags: new sudo grants, new SSH keys, UID 0 accounts that aren't root, accounts with no password lock. Medium by default, High for UID 0 changes.
 
-1. **Remote server REST API** — receives telemetry, detections, heartbeats; pushes config and rule updates
-2. **Agent-to-server delta sync** — sync_state watermarks; compressed; retry; purge after shipping
-3. **Hash feed server-side** — server aggregates MalwareBazaar and licensed feeds; pushes Bloom filter to agents; replaces direct abuse.ch dependency
-4. **Over-the-air agent updates** — signed binary; rollback on failure
-5. **SIEM export** — JSON over syslog; Elasticsearch/Splunk/Loki direct HTTP
-6. **STIX/TAXII ingestion** — server-side; populate known_bad_hashes; stix_id column already in schema
+---
 
-## Phase 4: UI
+## Phase 2 — Hardening and Visibility
 
-1. **Wails desktop UI** — separate binary, read-only SQLite
-2. **Dashboard** — severity trends from event_statistics, agent health from audit_log
-3. **Alert list** — detections table, all sources unified
-4. **Alert detail** — JOIN detection_artifacts, detection_network, evidence_snapshots
-5. **Process tree view** — recursive CTE on process_tree
-6. **Autorun viewer**, **User profile view**, **FIM view**, **Evidence viewer**
-7. **Secrets ignore workflow** — mark findings as noise in UI, export ignore list with one click
+### 5. File Integrity Monitoring — `internal/detect/fim.go`
 
-## Phase 5: Response System
+Watch critical paths (`/etc/passwd`, `/etc/shadow`, `/etc/crontab`, `/bin`, `/usr/bin`, `/sbin`, etc.) via fsnotify. On modification: capture before/after SHA256 and the PID from the process_tree. Alert CRITICAL. Schema: `fim_events(id, path, old_hash, new_hash, modified_by_pid, event_time)`.
 
-1. **File quarantine** — move/lock/restore; quarantined_files table exists
-2. **Process termination** — kill by PID; audit logged
-3. **Network isolation** — iptables/nftables; reversible; audit logged
-4. **Automated response rules** — per severity threshold; audit mode prerequisite
-5. **Audit mode vs prevention mode** — global toggle; audit default
+### 6. USB Monitoring — `internal/detect/usb.go`
 
-## Phase 6: Intelligence
+Subscribe to udev netlink events. Capture vendor ID, product ID, device class, serial number. USB mass storage class → HIGH. Schema: `usb_events(id, vendor_id, product_id, device_class, serial, action, event_time)`. Read-only media classes (HID, audio) → LOW.
 
-1. **Sigma rule engine** — server-side; cross-endpoint log sequences
-2. **systemd journal integration** — journald socket; feeds Sigma; prerequisite for auth correlation
-3. **MITRE ATT&CK mapping** — technique IDs on detections
-4. **Alert correlation into incidents** — process tree + time window + shared indicators
-5. **Behavioral correlation** — download→exec→network chains; requires months of baseline
-6. **Compliance report generation** — `vajra report`; CIS Benchmark, PCI-DSS, SOC2
+### 7. Binary Changed After Exec
 
-## Dropped or Deferred
+Periodic SHA256 comparison of `/proc/PID/exe` for long-running processes against their baseline hash stored at execve time in `process_tree`. Discrepancy = CRITICAL. Catches in-memory patching and binary replacement attacks. Add a ticker to the process scanner or a dedicated `internal/detect/binarywatch.go`.
 
-- **Password rotation enforcement** — operationally dangerous; belongs in IAM
-- **fanotify FAN_OPEN_EXEC** — deferred; three-condition eligibility sufficient for now
-- **fentry for finit_module** — bpf_d_path unavailable in tracepoints; deferred
-- **Full Windows / macOS support** — deferred until Linux feature set complete
-- **ML/AI file scoring** — deferred until YARA+hash false negative rate is measurable
-- **SSH brute force** — becomes a Sigma rule in Phase 6
-- **known_bad_hashes SQLite table** — replaced by Bloom filter; SQLite lookup too slow for pipeline hot path
+### 8. Coverage Telemetry
+
+15-minute health ticker writing to `audit_log`: YARA pool worker count, queue depth, events processed since last tick, dedup rate, FindingWriter metrics (written, deduped, errors), uptime. Enables the server-side health dashboard in Phase 3.
+
+### 9. Tamper Protection
+
+Watchdog goroutine that monitors its own binary path (`/proc/self/exe`) and config path for changes. `chattr +i` on the daemon binary and `/etc/vajra/config.yaml` after startup (requires root). Alert CRITICAL if either is removed or changed while the daemon is running.
+
+### 10. Pool Shrink
+
+`autotune` in `internal/scanner/yara/pool.go` logs "shrink pending" but cannot act — workers are started as goroutines with no individual cancel. Fix: give each worker a cancel function stored in a slice on Pool; shrink removes the last one.
+
+---
+
+## Phase 3 — Remote Sync
+
+### 11. Remote Server REST API
+
+Receive telemetry, detections, and heartbeats from agents. Push config and rule updates. JWT auth. TLS only. Endpoints: `POST /telemetry`, `POST /detections`, `POST /heartbeat`, `GET /config`, `GET /rules/latest`.
+
+### 12. Agent-to-Server Delta Sync
+
+Watermark table (`sync_state`) tracks last synced row ID per table. Sync job compresses and ships rows above the watermark. Retry with exponential backoff. Purge local rows after server ACKs receipt (respecting local retention policy).
+
+### 13. Bloom Filter Server Push
+
+Server aggregates MalwareBazaar and licensed hash feeds, builds a Bloom filter, and pushes it to agents on update. Replaces the direct `abuse.ch` dependency. Agent no longer needs an API key. `HashSyncer` becomes a receiver rather than a downloader.
+
+### 14. Over-the-Air Agent Updates
+
+Server signs binary with Ed25519. Agent verifies signature before replacing itself. Rolls back if the new binary exits within 60 seconds of start. Audit logged.
+
+### 15. SIEM Export
+
+JSON over syslog-compatible TCP/UDP to Elasticsearch, Splunk, or Loki. Configurable format. Fires on every FindingWriter write above a configurable severity threshold.
+
+---
+
+## Phase 4 — UI
+
+The Wails desktop UI binary is separate from the daemon. All queries are read-only against the SQLite WAL.
+
+### 16. Alert Detail View
+
+JOIN `detections` with `detection_artifacts`, `detection_network`, `detection_secrets`, `evidence_snapshots`. Show YARA match strings with hex snapshots, network socket details, and the captured `/proc` state side by side.
+
+### 17. Process Tree View
+
+Recursive CTE on `process_tree` with PID as root. Render as an expandable tree. Highlight PIDs that appear in `detections`.
+
+### 18. Secrets Ignore Workflow
+
+In the Secrets detection detail view, a single "Mark as noise" button calls `GetConfig` → `vajra secrets ignore <id>` → refreshes the list. An "Export ignore list" button triggers `vajra secrets export-ignore`. Removes the need for CLI access for operators.
+
+### 19. Evidence Viewer
+
+Expand an evidence snapshot inline: tabbed view of open file descriptors, memory maps, environment variables, and process status. Hex-decode any SnapshotHex YARA string matches inline.
+
+### 20. Live Reload for Secrets Ignore List
+
+Pass the ignore list file path to a `fsnotify` watcher in the daemon. On change, rebuild the betterleaks scanner with the new fingerprints. Currently requires restart.
+
+---
+
+## Phase 5 — Response System
+
+### 21. File Quarantine
+
+Move detected file to a quarantine directory. Lock with `chattr +i`. Record in `quarantined_files(id, original_path, quarantine_path, sha256, detection_id, quarantined_at)`. `vajra quarantine restore <id>` reverses.
+
+### 22. Process Termination
+
+`kill(pid, SIGKILL)` on operator command. Audit logged. Never automatic — requires explicit operator action or a configured response rule.
+
+### 23. Network Isolation
+
+Drop all outbound traffic except to the server via a temporary nftables/iptables ruleset. Reversible. Audit logged. Prerequisite: enforcement mode.
+
+### 24. Automated Response Rules
+
+Per-severity threshold: `severity >= CRITICAL AND source == 'dup_watcher'` → isolate network. Audit mode is the prerequisite — never enforce without first verifying detection quality over a baseline period.
+
+---
+
+## Phase 6 — Intelligence
+
+### 25. Sigma Rule Engine
+
+Server-side. Consume the telemetry stream from all agents. Evaluate Sigma rules against correlated log sequences. Emit incidents back to agents via the sync channel.
+
+### 26. MITRE ATT&CK Mapping
+
+Populate `detections.mitre_technique` column from a config-driven map of `rule_id → technique_id`. Initial mappings: T1059 (interpreters), T1548 (capability abuse), T1105 (ingress tool transfer via DupWatcher), T1053 (cron autoruns).
+
+### 27. Alert Correlation into Incidents
+
+Group detections sharing a process tree subtree, a time window, or a common indicator (same SHA256 or network address) into an incident. Schema: `incidents(id, first_seen, last_seen, severity, detection_ids JSON)`.
+
+---
+
+## Known Issues (deferred from code review)
+
+- **F1** — `Finding` flat struct with three mutually exclusive payload fields. Should be `ArtifactDetail`, `NetworkDetail`, `SecretDetail` sub-structs. Deferred: high disruption, zero compile risk in current form.
+- **F5** — Detection + sub-table writes not in a single transaction. `TODO(F5)` comment in `writer.go`. Deferred until query interface is confirmed stable.
+- **Pool shrink** — autotune logs intent but per-worker cancel not implemented. Tracked above as item 10.
+- **Module name always empty** — `bpf_d_path` unavailable in tracepoint programs. Requires fentry migration.
+- **Bloom filter not reloaded on daemon update** — requires signal-based or fsnotify reload. Deferred to Phase 3.
+- **Boot epoch drift** — NTP clock steps after startup skew `EBPFTimestampToUnix`. Rare; defer.
+- **Hash.go A10** — `strings.ToLower` per bloom check. Now lowercased at insert time in `hashsync.go`. Remove the `ToLower` call in `hash.go.Analyze` once hashsync is confirmed to have been regenerating the filter.
