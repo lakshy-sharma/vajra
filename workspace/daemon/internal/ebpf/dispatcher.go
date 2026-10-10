@@ -1,6 +1,6 @@
 // internal/ebpf/dispatcher.go
 //
-// Copyright © 2025 Lakshy Sharma lakshy.d.sharma@gmail.com
+// Copyright © 2026 Lakshy Sharma lakshy.d.sharma@gmail.com
 // AGPL-3.0 License
 
 //go:build linux
@@ -9,35 +9,36 @@ package ebpf
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/rs/zerolog"
 )
 
-// Dispatcher reads RawEvents from the listener and fans them
-// out onto the typed channels in Channels. It translates
-// PtraceEvent, CapsetEvent, and NamespaceEvent into
-// SecurityEvent before forwarding — those three all land in
-// the security_events table and share the same consumer.
+// Dispatcher reads RawEvents from the listener and fans them out onto the
+// typed channels in Channels. It translates PtraceEvent, CapsetEvent,
+// NamespaceEvent, and DNSEvent into SecurityEvent before forwarding.
 type Dispatcher struct {
 	logger *zerolog.Logger
+	drops  atomic.Int64 // E5: counts channel-full drops
 }
 
-// NewDispatcher creates a Dispatcher.
 func NewDispatcher(logger *zerolog.Logger) *Dispatcher {
 	return &Dispatcher{logger: logger}
 }
 
-// Run reads from rawCh and fans out to ch until ctx is cancelled
-// or rawCh is closed. Intended to run as a goroutine.
-// The caller owns all channels and is responsible for draining
-// consumers before relying on shutdown to be clean.
+// Drops returns the number of events dropped due to full typed channels
+// since the dispatcher was created. Safe to call from any goroutine.
+func (d *Dispatcher) Drops() int64 {
+	return d.drops.Load()
+}
+
 func (d *Dispatcher) Run(ctx context.Context, rawCh <-chan RawEvent, ch *Channels) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-
 		case event, ok := <-rawCh:
 			if !ok {
 				return
@@ -47,250 +48,212 @@ func (d *Dispatcher) Run(ctx context.Context, rawCh <-chan RawEvent, ch *Channel
 	}
 }
 
-// route sends a single RawEvent to the correct typed channel.
-// Unrecognised event types are logged at debug level and dropped.
+// route sends a RawEvent to the correct typed channel.
+// E2: reads concrete fields directly — no type assertions needed.
 func (d *Dispatcher) route(event RawEvent, ch *Channels) {
 	switch event.Type {
 
-	// ── Dup stdio → Dup channel ───────────────────────────────
-	// Raw DupEvent sent directly to DupWatcher. Not converted to
-	// SecurityEvent here — DupWatcher performs the socket check and
-	// writes to security_events itself only on confirmed detections.
 	case EventTypeProcessDupStdio:
-		e, ok := event.Data.(DupEvent)
-		if !ok {
-			d.logBadType(event.Type, "DupEvent")
-			return
-		}
 		select {
-		case ch.Dup <- e:
+		case ch.Dup <- event.Dup:
 		default:
-			d.logDrop(event.Type)
+			d.drop(event.Type)
 		}
-	// ── Process events → Process channel ─────────────────────
+
 	case EventTypeProcessExec,
 		EventTypeProcessSetuid,
 		EventTypeProcessSetgid,
 		EventTypeProcessMemfd:
-		e, ok := event.Data.(ProcessEvent)
-		if !ok {
-			d.logBadType(event.Type, "ProcessEvent")
-			return
-		}
 		select {
-		case ch.Process <- e:
+		case ch.Process <- event.Process:
 		default:
-			d.logDrop(event.Type)
+			d.drop(event.Type)
 		}
 
-	// ── Mmap / mprotect → Memory channel ─────────────────────
 	case EventTypeProcessMmap,
 		EventTypeProcessMprotect:
-		e, ok := event.Data.(MmapEvent)
-		if !ok {
-			d.logBadType(event.Type, "MmapEvent")
-			return
-		}
 		select {
-		case ch.Memory <- e:
+		case ch.Memory <- event.Memory:
 		default:
-			d.logDrop(event.Type)
+			d.drop(event.Type)
 		}
 
-	// ── Ptrace → Security channel ─────────────────────────────
 	case EventTypeProcessPtrace:
-		e, ok := event.Data.(PtraceEvent)
-		if !ok {
-			d.logBadType(event.Type, "PtraceEvent")
-			return
-		}
+		details, _ := json.Marshal(ptraceDetails{Request: event.Ptrace.Request})
 		sec := SecurityEvent{
 			Type:      event.Type,
 			EventName: "ptrace",
-			PID:       e.PID,
-			UID:       e.UID,
-			Comm:      CStringToGo(e.Comm[:]),
-			TargetPID: e.TargetPID,
-			Details:   fmt.Sprintf(`{"request":%d}`, e.Request),
-			Timestamp: e.Timestamp,
+			PID:       event.Ptrace.PID,
+			UID:       event.Ptrace.UID,
+			Comm:      CStringToGo(event.Ptrace.Comm[:]),
+			TargetPID: event.Ptrace.TargetPID,
+			Details:   string(details),
+			Timestamp: event.Ptrace.Timestamp,
 		}
 		select {
 		case ch.Security <- sec:
 		default:
-			d.logDrop(event.Type)
+			d.drop(event.Type)
 		}
 
-	// ── Capset → Security channel ─────────────────────────────
 	case EventTypeProcessCapset:
-		e, ok := event.Data.(CapsetEvent)
-		if !ok {
-			d.logBadType(event.Type, "CapsetEvent")
-			return
-		}
+		details, _ := json.Marshal(capsetDetails{
+			Effective:   event.Capset.Effective,
+			Permitted:   event.Capset.Permitted,
+			Inheritable: event.Capset.Inheritable,
+		})
 		sec := SecurityEvent{
 			Type:      event.Type,
 			EventName: "capset",
-			PID:       e.PID,
-			UID:       e.UID,
-			Comm:      CStringToGo(e.Comm[:]),
-			Details: fmt.Sprintf(
-				`{"effective":%d,"permitted":%d,"inheritable":%d}`,
-				e.Effective, e.Permitted, e.Inheritable,
-			),
-			Timestamp: e.Timestamp,
+			PID:       event.Capset.PID,
+			UID:       event.Capset.UID,
+			Comm:      CStringToGo(event.Capset.Comm[:]),
+			Details:   string(details),
+			Timestamp: event.Capset.Timestamp,
 		}
 		select {
 		case ch.Security <- sec:
 		default:
-			d.logDrop(event.Type)
+			d.drop(event.Type)
 		}
 
-	// ── File events → File channel ────────────────────────────
 	case EventTypeFileOpen,
 		EventTypeFileDelete,
 		EventTypeFileRename,
 		EventTypeFileChmod:
-		e, ok := event.Data.(FileEvent)
-		if !ok {
-			d.logBadType(event.Type, "FileEvent")
-			return
-		}
 		select {
-		case ch.File <- e:
+		case ch.File <- event.File:
 		default:
-			d.logDrop(event.Type)
+			d.drop(event.Type)
 		}
 
-	// ── Network events → Network channel ─────────────────────
 	case EventTypeNetConnect,
 		EventTypeNetBind,
 		EventTypeNetRawSock,
 		EventTypeNetPacket:
-		e, ok := event.Data.(NetworkEvent)
-		if !ok {
-			d.logBadType(event.Type, "NetworkEvent")
-			return
-		}
 		select {
-		case ch.Network <- e:
+		case ch.Network <- event.Network:
 		default:
-			d.logDrop(event.Type)
+			d.drop(event.Type)
 		}
 
-	// ── DNS → Network channel ─────────────────────────────────
-	// DNS is a DNSEvent not a NetworkEvent — consumers on the
-	// Network channel must handle both types. We wrap it in a
-	// NetworkEvent with Type=EventTypeNetDNS so the channel
-	// stays single-typed, storing the parsed data in Details.
-	// Alternative: add a separate DNS channel. For now one
-	// channel keeps the consumer count low.
 	case EventTypeNetDNS:
-		dns, ok := event.Data.(DNSEvent)
-		if !ok {
-			d.logBadType(event.Type, "DNSEvent")
+		if event.DNS == nil {
+			d.logger.Error().Msg("dispatcher: nil DNS event")
 			return
 		}
-		// Store DNS as a SecurityEvent so the security job can
-		// log C2-related DNS queries without a separate channel.
 		sec := SecurityEvent{
 			Type:      event.Type,
 			EventName: "dns",
-			PID:       dns.PID,
-			UID:       dns.UID,
-			Comm:      dns.Comm,
-			Details:   dnsDetails(dns),
-			Timestamp: dns.Timestamp,
+			PID:       event.DNS.PID,
+			UID:       event.DNS.UID,
+			Comm:      event.DNS.Comm,
+			Details:   dnsDetails(*event.DNS),
+			Timestamp: event.DNS.Timestamp,
 		}
 		select {
 		case ch.Security <- sec:
 		default:
-			d.logDrop(event.Type)
+			d.drop(event.Type)
 		}
 
-	// ── Module events → Module channel ───────────────────────
 	case EventTypeModuleLoad:
-		e, ok := event.Data.(ModuleEvent)
-		if !ok {
-			d.logBadType(event.Type, "ModuleEvent")
-			return
-		}
 		select {
-		case ch.Module <- e:
+		case ch.Module <- event.Module:
 		default:
-			d.logDrop(event.Type)
+			d.drop(event.Type)
 		}
 
-	// ── Namespace events → Security channel ──────────────────
 	case EventTypeNamespaceCreate,
 		EventTypeNamespaceEnter:
-		e, ok := event.Data.(NamespaceEvent)
-		if !ok {
-			d.logBadType(event.Type, "NamespaceEvent")
-			return
-		}
 		name := "namespace_create"
 		if event.Type == EventTypeNamespaceEnter {
 			name = "namespace_enter"
 		}
+		details, _ := json.Marshal(namespaceDetails{
+			NSType: event.Namespace.NSType,
+			Flags:  event.Namespace.Flags,
+		})
 		sec := SecurityEvent{
 			Type:      event.Type,
 			EventName: name,
-			PID:       e.PID,
-			UID:       e.UID,
-			Comm:      CStringToGo(e.Comm[:]),
-			Details:   fmt.Sprintf(`{"ns_type":%d,"flags":%d}`, e.NSType, e.Flags),
-			Timestamp: e.Timestamp,
+			PID:       event.Namespace.PID,
+			UID:       event.Namespace.UID,
+			Comm:      CStringToGo(event.Namespace.Comm[:]),
+			Details:   string(details),
+			Timestamp: event.Namespace.Timestamp,
 		}
 		select {
 		case ch.Security <- sec:
 		default:
-			d.logDrop(event.Type)
+			d.drop(event.Type)
 		}
 
 	default:
-		d.logger.Debug().
-			Uint32("type", event.Type).
-			Msg("dispatcher: unknown event type dropped")
+		d.logger.Debug().Uint32("type", event.Type).Msg("dispatcher: unknown event type dropped")
 	}
 }
 
-// dnsDetails builds a compact JSON string from a parsed DNSEvent
-// for storage in SecurityEvent.Details.
-func dnsDetails(dns DNSEvent) string {
-	if len(dns.Questions) == 0 {
-		return `{"questions":[]}`
-	}
-	// Build a minimal representation without importing encoding/json
-	// to keep this hot path allocation-light.
-	out := `{"questions":[`
-	for i, q := range dns.Questions {
-		if i > 0 {
-			out += ","
-		}
-		out += fmt.Sprintf(`{"name":%q,"type":%q}`, q.Name, q.Type)
-	}
-	out += `],"answers":[`
-	for i, a := range dns.Answers {
-		if i > 0 {
-			out += ","
-		}
-		out += fmt.Sprintf(`{"name":%q,"ip":%q,"ttl":%d}`, a.Name, a.IP, a.TTL)
-	}
-	out += `]}`
-	return out
-}
-
-func (d *Dispatcher) logBadType(eventType uint32, expected string) {
-	d.logger.Error().
-		Uint32("event_type", eventType).
-		Str("expected", expected).
-		Msg("dispatcher: type assertion failed — likely a deserialization bug")
-}
-
-// In dispatcher.go — replace logDrop
-func (d *Dispatcher) logDrop(eventType uint32) {
+// drop counts and logs a channel-full event.
+// E5: atomic counter tracks total drops; callers can read Drops() for metrics.
+func (d *Dispatcher) drop(eventType uint32) {
+	d.drops.Add(1)
 	d.logger.Debug().
 		Uint32("event_type", eventType).
 		Str("event_name", EventTypeName(eventType)).
 		Msg("dispatcher: typed channel full — event dropped")
+}
+
+// ── Details structs for encoding/json ────────────────────────────────────────
+// E4: replaced fmt.Sprintf JSON string building with encoding/json structs.
+
+type ptraceDetails struct {
+	Request uint32 `json:"request"`
+}
+
+type capsetDetails struct {
+	Effective   uint64 `json:"effective"`
+	Permitted   uint64 `json:"permitted"`
+	Inheritable uint64 `json:"inheritable"`
+}
+
+type namespaceDetails struct {
+	NSType uint32 `json:"ns_type"`
+	Flags  uint32 `json:"flags"`
+}
+
+type dnsDetailsPayload struct {
+	Questions []dnsQuestionJSON `json:"questions"`
+	Answers   []dnsAnswerJSON   `json:"answers"`
+}
+
+type dnsQuestionJSON struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+type dnsAnswerJSON struct {
+	Name string `json:"name"`
+	IP   string `json:"ip"`
+	TTL  uint32 `json:"ttl"`
+}
+
+// dnsDetails serialises a DNSEvent into a JSON string for SecurityEvent.Details.
+// E4: replaced += string concatenation loop with encoding/json.
+func dnsDetails(dns DNSEvent) string {
+	payload := dnsDetailsPayload{
+		Questions: make([]dnsQuestionJSON, len(dns.Questions)),
+		Answers:   make([]dnsAnswerJSON, len(dns.Answers)),
+	}
+	for i, q := range dns.Questions {
+		payload.Questions[i] = dnsQuestionJSON{Name: q.Name, Type: q.Type}
+	}
+	for i, a := range dns.Answers {
+		payload.Answers[i] = dnsAnswerJSON{Name: a.Name, IP: a.IP, TTL: a.TTL}
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Sprintf(`{"questions":[],"answers":[],"error":%q}`, err.Error())
+	}
+	return string(b)
 }

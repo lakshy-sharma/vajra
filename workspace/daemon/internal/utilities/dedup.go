@@ -6,6 +6,7 @@
 package utilities
 
 import (
+	"strings"
 	"sync"
 	"time"
 
@@ -35,15 +36,23 @@ type DedupTracker struct {
 	mu      sync.Mutex
 	entries map[DedupKey]*DedupEntry
 	window  time.Duration
+	done    chan struct{}
 }
 
 func NewDedupTracker(window time.Duration) *DedupTracker {
 	dt := &DedupTracker{
 		entries: make(map[DedupKey]*DedupEntry),
 		window:  window,
+		done:    make(chan struct{}),
 	}
 	go dt.cleanup()
 	return dt
+}
+
+// Stop terminates the background cleanup goroutine.
+// Must be called when the tracker is no longer needed to avoid a goroutine leak.
+func (dt *DedupTracker) Stop() {
+	close(dt.done)
 }
 
 // CheckAndRecord returns whether this detection should be inserted.
@@ -90,10 +99,10 @@ func RuleFromMatch(notes string, matches []models.YaraMatch) string {
 	if len(matches) > 1 {
 		return "yara:multi"
 	}
-	for i, c := range notes {
-		if c == ':' {
-			return notes[:i]
-		}
+	// Notes strings use "prefix:detail" convention — the prefix is the key.
+	prefix, _, found := strings.Cut(notes, ":")
+	if found {
+		return prefix
 	}
 	return notes
 }
@@ -101,14 +110,19 @@ func RuleFromMatch(notes string, matches []models.YaraMatch) string {
 func (dt *DedupTracker) cleanup() {
 	ticker := time.NewTicker(dt.window)
 	defer ticker.Stop()
-	for range ticker.C {
-		dt.mu.Lock()
-		now := time.Now()
-		for key, entry := range dt.entries {
-			if now.Sub(entry.FirstSeen) >= dt.window {
-				delete(dt.entries, key)
+	for {
+		select {
+		case <-dt.done:
+			return
+		case <-ticker.C:
+			dt.mu.Lock()
+			now := time.Now()
+			for key, entry := range dt.entries {
+				if now.Sub(entry.FirstSeen) >= dt.window {
+					delete(dt.entries, key)
+				}
 			}
+			dt.mu.Unlock()
 		}
-		dt.mu.Unlock()
 	}
 }

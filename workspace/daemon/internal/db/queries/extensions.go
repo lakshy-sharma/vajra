@@ -6,6 +6,8 @@
 package queries
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 
 	sq "github.com/Masterminds/squirrel"
@@ -14,15 +16,14 @@ import (
 )
 
 type ExtensionQueries struct {
-	db *shareddb.DB
+	db shareddb.DBConn
 }
 
-func NewExtensionQueries(d *shareddb.DB) *ExtensionQueries {
+func NewExtensionQueries(d shareddb.DBConn) *ExtensionQueries {
 	return &ExtensionQueries{db: d}
 }
 
-// Insert writes one key/value extension row for a detection.
-func (q *ExtensionQueries) Insert(e *models.DetectionExtension) error {
+func (q *ExtensionQueries) Insert(ctx context.Context, e *models.DetectionExtension) error {
 	sqlStr, args, err := sq.
 		Insert("detection_extensions").
 		Columns("detection_id", "key", "value").
@@ -31,16 +32,16 @@ func (q *ExtensionQueries) Insert(e *models.DetectionExtension) error {
 	if err != nil {
 		return fmt.Errorf("extensions.Insert: build: %w", err)
 	}
-	_, err = q.db.SQL().Exec(sqlStr, args...)
+	_, err = q.db.ExecContext(ctx, sqlStr, args...)
 	return err
 }
 
-// InsertAll writes all extensions for a detection in one transaction.
-func (q *ExtensionQueries) InsertAll(detectionID int64, extensions map[string]string) error {
+// InsertAll writes all extensions for one detection atomically.
+func (q *ExtensionQueries) InsertAll(ctx context.Context, detectionID int64, extensions map[string]string) error {
 	if len(extensions) == 0 {
 		return nil
 	}
-	tx, err := q.db.SQL().Begin()
+	tx, err := q.db.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
 		return fmt.Errorf("extensions.InsertAll: begin: %w", err)
 	}
@@ -53,17 +54,16 @@ func (q *ExtensionQueries) InsertAll(detectionID int64, extensions map[string]st
 			Values(detectionID, key, value).
 			ToSql()
 		if err != nil {
-			return fmt.Errorf("extensions.InsertAll: build: %w", err)
+			return fmt.Errorf("extensions.InsertAll: build key %q: %w", key, err)
 		}
-		if _, err := tx.Exec(sqlStr, args...); err != nil {
+		if _, err := tx.ExecContext(ctx, sqlStr, args...); err != nil {
 			return fmt.Errorf("extensions.InsertAll: exec key %q: %w", key, err)
 		}
 	}
 	return tx.Commit()
 }
 
-// GetByDetectionID returns all extension rows for a detection.
-func (q *ExtensionQueries) GetByDetectionID(detectionID int64) ([]models.DetectionExtension, error) {
+func (q *ExtensionQueries) GetByDetectionID(ctx context.Context, detectionID int64) ([]models.DetectionExtension, error) {
 	sqlStr, args, err := sq.
 		Select("id", "detection_id", "key", "value").
 		From("detection_extensions").
@@ -72,7 +72,7 @@ func (q *ExtensionQueries) GetByDetectionID(detectionID int64) ([]models.Detecti
 	if err != nil {
 		return nil, fmt.Errorf("extensions.GetByDetectionID: build: %w", err)
 	}
-	rows, err := q.db.SQL().Query(sqlStr, args...)
+	rows, err := q.db.QueryContext(ctx, sqlStr, args...)
 	if err != nil {
 		return nil, err
 	}

@@ -8,7 +8,6 @@
 package detect
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -41,15 +40,12 @@ type ProcWalkSummary struct {
 // The tracker is shared with ProcessScanner so binaries already seen by
 // the eBPF watcher since agent start are not re-scanned. Pass nil to skip
 // tracker checks entirely (e.g. standalone CLI invocation).
-//
-// This function is synchronous — it blocks until the walk completes or ctx
-// is cancelled. service.go runs it in a goroutine.
 func RunProcWalk(
 	ctx context.Context,
 	pipeline *analyzer.Pipeline,
 	writer *findings.FindingWriter,
 	filter *utilities.ProcessFilter,
-	tracker *utilities.RecentScanTracker, // may be nil
+	tracker *utilities.RecentScanTracker,
 	sysInfo utilities.SystemInfo,
 	logger *zerolog.Logger,
 ) (ProcWalkSummary, error) {
@@ -96,8 +92,6 @@ func RunProcWalk(
 	return summary, nil
 }
 
-// scanPID resolves, filters, hashes and pipeline-scans one process.
-// Returns (hit, skipped, err).
 func scanPID(
 	ctx context.Context,
 	pid uint32,
@@ -110,7 +104,6 @@ func scanPID(
 ) (hit bool, skipped bool, err error) {
 	exePath, err := resolveExeForPID(pid)
 	if err != nil || exePath == "" {
-		// Process exited between listPIDs and now — normal, not an error.
 		return false, true, nil
 	}
 
@@ -126,7 +119,6 @@ func scanPID(
 
 	fileHash, err := utilities.FullSHA256(exePath)
 	if err != nil {
-		// Binary may have been replaced between readlink and hash — skip quietly.
 		return false, true, nil
 	}
 
@@ -140,8 +132,6 @@ func scanPID(
 		return false, false, fmt.Errorf("pipeline: %w", err)
 	}
 
-	// Always mark scanned — even CLEAN results should not be re-evaluated
-	// by ProcessScanner when the same binary execves later in the session.
 	if tracker != nil {
 		tracker.MarkScanned(exePath, fileHash)
 	}
@@ -150,21 +140,25 @@ func scanPID(
 		return false, false, nil
 	}
 
+	// W12: read /proc/PID/status once for all fields — was called separately
+	// for PPID, UID, and GID, opening the file three times.
+	status := utilities.ReadProcStatus(pid)
 	ruleID := utilities.RuleFromMatch(result.Notes, result.YaraMatches)
 
 	f := findings.Finding{
 		Source:      findings.SourceProcessScanner,
 		Severity:    result.Severity,
 		Status:      models.StatusNew,
-		MachineID:   sysInfo.MachineID,
 		DetectedAt:  time.Now().Unix(),
 		PID:         pid,
-		PPID:        ppidForPID(pid),
-		UID:         uidForPID(pid),
-		GID:         gidForPID(pid),
+		PPID:        status.PPID,
+		UID:         status.UID,
+		GID:         status.GID,
+		EUID:        status.EUID,
+		EGID:        status.EGID,
 		ProcessName: comm,
 		ExePath:     exePath,
-		CmdLine:     cmdlineForPID(pid),
+		CmdLine:     utilities.ReadCmdline(pid), // W13: shared implementation
 		CWD:         cwdForPID(pid),
 		TargetPath:  exePath,
 		RuleID:      ruleID,
@@ -189,13 +183,11 @@ func scanPID(
 		return true, false, nil
 	}
 
-	// id == 0 means deduped by FindingWriter — not a new detection.
 	return false, false, nil
 }
 
 // ── /proc helpers ─────────────────────────────────────────────
 
-// listPIDs returns all numeric PID directories under /proc.
 func listPIDs() ([]uint32, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
@@ -215,9 +207,7 @@ func listPIDs() ([]uint32, error) {
 	return pids, nil
 }
 
-// resolveExeForPID reads /proc/PID/exe via the symlink in /proc.
-// We stat the symlink itself (Lstat) to confirm the process still exists,
-// then Readlink to get the target. Strips the " (deleted)" suffix the kernel
+// resolveExeForPID reads /proc/PID/exe. Strips " (deleted)" which the kernel
 // appends when the on-disk binary has been replaced — the inode is still
 // readable through the fd.
 func resolveExeForPID(pid uint32) (string, error) {
@@ -236,7 +226,6 @@ func resolveExeForPID(pid uint32) (string, error) {
 	return target, nil
 }
 
-// commForPID reads /proc/PID/comm — process name, kernel-truncated to 15 chars.
 func commForPID(pid uint32) string {
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
 	if err != nil {
@@ -245,69 +234,10 @@ func commForPID(pid uint32) string {
 	return strings.TrimRight(string(data), "\n")
 }
 
-// cmdlineForPID reads null-delimited /proc/PID/cmdline into a space-separated string.
-func cmdlineForPID(pid uint32) string {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
-	if err != nil || len(data) == 0 {
-		return ""
-	}
-	parts := bytes.Split(bytes.TrimRight(data, "\x00"), []byte{0})
-	result := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if len(p) > 0 {
-			result = append(result, string(p))
-		}
-	}
-	return strings.Join(result, " ")
-}
-
-// cwdForPID resolves /proc/PID/cwd.
 func cwdForPID(pid uint32) string {
 	cwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", pid))
 	if err != nil {
 		return ""
 	}
 	return cwd
-}
-
-// ppidForPID reads PPid from /proc/PID/status.
-func ppidForPID(pid uint32) uint32 {
-	return uint32(readStatusUint(pid, "PPid:"))
-}
-
-// uidForPID reads the real UID from /proc/PID/status.
-func uidForPID(pid uint32) uint32 {
-	return uint32(readStatusUint(pid, "Uid:"))
-}
-
-// gidForPID reads the real GID from /proc/PID/status.
-func gidForPID(pid uint32) uint32 {
-	return uint32(readStatusUint(pid, "Gid:"))
-}
-
-// readStatusUint scans /proc/PID/status for a labelled field and returns
-// the first numeric token after the label. Returns 0 on any error.
-func readStatusUint(pid uint32, field string) uint64 {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
-	if err != nil {
-		return 0
-	}
-	needle := []byte(field)
-	lines := bytes.Split(data, []byte{'\n'})
-	for _, line := range lines {
-		if !bytes.HasPrefix(line, needle) {
-			continue
-		}
-		// Format: "PPid:\t1234" or "Uid:\t1000\t1000\t1000\t1000"
-		fields := bytes.Fields(line)
-		if len(fields) < 2 {
-			return 0
-		}
-		n, err := strconv.ParseUint(string(fields[1]), 10, 64)
-		if err != nil {
-			return 0
-		}
-		return n
-	}
-	return 0
 }

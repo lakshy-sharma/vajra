@@ -7,15 +7,17 @@ package analyzer
 
 import (
 	"context"
-	"sync"
+	"fmt"
+	"strings"
 
+	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/rs/zerolog"
+	"vajra/internal/utilities"
 	"vajra/shared/models"
 )
 
 // Analyzer is the interface every detection stage implements.
 // Stateless — safe to reuse across scans and goroutines.
-// Path is the file or exe path being analysed. PID context
-// is available via CtxWithPID for process-specific analyzers.
 type Analyzer interface {
 	Name() string
 	Analyze(ctx context.Context, path string) (Result, error)
@@ -31,24 +33,26 @@ type Result struct {
 	Skip bool
 }
 
-// ── PID context ───────────────────────────────────────────────
+// ── Context keys ──────────────────────────────────────────────────────────────
 
-type ctxKey int
+// ctxKeyType is an unexported struct used as a context key type.
+// A struct type prevents key collisions with other packages that might
+// independently define integer or string keys with the same underlying value.
+type ctxKeyType struct{ name string }
 
-const pidKey ctxKey = 0
+var (
+	pidKey    = ctxKeyType{"pid"}
+	sha256Key = ctxKeyType{"sha256"}
+)
 
-// CtxWithPID stores a PID for process analyzers to read.
 func CtxWithPID(ctx context.Context, pid uint32) context.Context {
 	return context.WithValue(ctx, pidKey, pid)
 }
 
-// PIDFromCtx retrieves the PID stored by CtxWithPID.
 func PIDFromCtx(ctx context.Context) (uint32, bool) {
 	pid, ok := ctx.Value(pidKey).(uint32)
 	return pid, ok
 }
-
-const sha256Key ctxKey = 1
 
 func CtxWithSHA256(ctx context.Context, sha256 string) context.Context {
 	return context.WithValue(ctx, sha256Key, sha256)
@@ -59,52 +63,59 @@ func SHA256FromCtx(ctx context.Context) (string, bool) {
 	return sha256, ok
 }
 
-// ── Result cache ──────────────────────────────────────────────
+// ── Result cache ──────────────────────────────────────────────────────────────
 
 // ResultCache stores content-analysis results keyed on SHA256.
 // Only used for file-content analyzers (YARA, hash lookup).
-// Runtime analyzers are never cached — their findings depend on
-// live process state, not file content.
+// Runtime analyzers are never cached — their findings depend on live
+// process state, not file content.
+//
+// The underlying LRU is thread-safe; no additional locking is needed.
 type ResultCache struct {
-	mu    sync.RWMutex
-	items map[string]Result
+	cache *lru.Cache[string, Result]
 }
 
-func NewResultCache() *ResultCache {
-	return &ResultCache{items: make(map[string]Result)}
+// NewResultCache creates a cache bounded to capacity entries.
+// capacity should come from cfg.PerformanceSettings.ResultCacheSize.
+func NewResultCache(capacity int) (*ResultCache, error) {
+	c, err := lru.New[string, Result](capacity)
+	if err != nil {
+		return nil, fmt.Errorf("analyzer: result cache: %w", err)
+	}
+	return &ResultCache{cache: c}, nil
 }
 
 func (c *ResultCache) Get(sha256 string) (Result, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	r, ok := c.items[sha256]
-	return r, ok
+	return c.cache.Get(sha256)
 }
 
 func (c *ResultCache) Set(sha256 string, r Result) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.items[sha256] = r
+	c.cache.Add(sha256, r)
 }
 
 func (c *ResultCache) Len() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return len(c.items)
+	return c.cache.Len()
 }
 
-// ── Pipeline ──────────────────────────────────────────────────
+// ── Pipeline ──────────────────────────────────────────────────────────────────
 
 // Pipeline runs a list of Analyzers in order, short-circuiting on CRITICAL.
 type Pipeline struct {
 	analyzers []Analyzer
 	cache     *ResultCache
+	logger    *zerolog.Logger
 }
 
 type PipelineOption func(*Pipeline)
 
 func WithCache(c *ResultCache) PipelineOption {
 	return func(p *Pipeline) { p.cache = c }
+}
+
+// WithLogger attaches a logger so failed analyzer stages are recorded rather
+// than silently skipped.
+func WithLogger(l *zerolog.Logger) PipelineOption {
+	return func(p *Pipeline) { p.logger = l }
 }
 
 func NewPipeline(analyzers []Analyzer, opts ...PipelineOption) *Pipeline {
@@ -145,25 +156,31 @@ func (p *Pipeline) RunUncached(ctx context.Context, path string) (Result, error)
 
 func (p *Pipeline) run(ctx context.Context, path string) Result {
 	merged := Result{Severity: models.SeverityClean}
+	var notes strings.Builder
 	for _, a := range p.analyzers {
 		result, err := a.Analyze(ctx, path)
 		if err != nil {
+			// Log and continue — one failed stage must not void the others.
+			if p.logger != nil {
+				p.logger.Error().Err(err).Str("analyzer", a.Name()).Str("path", path).Msg("analyzer: stage failed")
+			}
 			continue
 		}
-		if severityRank(result.Severity) > severityRank(merged.Severity) {
+		if utilities.SeverityRank(result.Severity) > utilities.SeverityRank(merged.Severity) {
 			merged.Severity = result.Severity
 		}
 		merged.YaraMatches = append(merged.YaraMatches, result.YaraMatches...)
 		if result.Notes != "" {
-			if merged.Notes != "" {
-				merged.Notes += "; "
+			if notes.Len() > 0 {
+				notes.WriteString("; ")
 			}
-			merged.Notes += result.Notes
+			notes.WriteString(result.Notes)
 		}
 		if result.Severity == models.SeverityCritical {
 			break
 		}
 	}
+	merged.Notes = notes.String()
 	return merged
 }
 
@@ -173,35 +190,21 @@ func (p *Pipeline) run(ctx context.Context, path string) Result {
 // overridden if runtime analysis finds something.
 func MergeResults(a, b Result) Result {
 	merged := a
-	if severityRank(b.Severity) > severityRank(merged.Severity) {
+	if utilities.SeverityRank(b.Severity) > utilities.SeverityRank(merged.Severity) {
 		merged.Severity = b.Severity
 	}
 	merged.YaraMatches = append(merged.YaraMatches, b.YaraMatches...)
 	if b.Notes != "" {
-		if merged.Notes != "" {
-			merged.Notes += "; "
+		var notes strings.Builder
+		notes.WriteString(merged.Notes)
+		if notes.Len() > 0 {
+			notes.WriteString("; ")
 		}
-		merged.Notes += b.Notes
+		notes.WriteString(b.Notes)
+		merged.Notes = notes.String()
 	}
 	if b.Severity != models.SeverityClean {
 		merged.Skip = false
 	}
 	return merged
-}
-
-func severityRank(s models.EventSeverity) int {
-	switch s {
-	case models.SeverityClean:
-		return 0
-	case models.SeverityLow:
-		return 1
-	case models.SeverityMedium:
-		return 2
-	case models.SeverityHigh:
-		return 3
-	case models.SeverityCritical:
-		return 4
-	default:
-		return 0
-	}
 }

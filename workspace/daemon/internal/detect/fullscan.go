@@ -34,7 +34,8 @@ type ScanSummary struct {
 }
 
 // RunFullScan performs a blocking filesystem walk followed by a /proc walk.
-// Both results are reflected in ScanSummary and reported to the CLI caller.
+// maxFileSizeBytes and interpreters come from config — fullscan does not
+// import the config package directly to keep CLI and daemon paths independent.
 func RunFullScan(
 	ctx context.Context,
 	targetDir string,
@@ -44,7 +45,16 @@ func RunFullScan(
 	writer *findings.FindingWriter,
 	sysInfo utilities.SystemInfo,
 	logger *zerolog.Logger,
+	maxFileSizeBytes int64,
+	interpreters []string,
 ) (ScanSummary, error) {
+	// Build interpreter lookup once — checked per file in the walk.
+	interpMap := make(map[string]bool, len(interpreters)*2)
+	for _, interp := range interpreters {
+		interpMap[interp] = true
+		interpMap[filepath.Base(interp)] = true
+	}
+
 	logger.Info().Str("target", targetDir).Msg("full scan: counting eligible files")
 
 	countBar := progressbar.NewOptions(
@@ -56,7 +66,9 @@ func RunFullScan(
 	)
 
 	countStart := time.Now()
-	total, err := countEligible(ctx, targetDir, filter, countBar)
+	// W19: countEligible uses the same size/mode criteria as the scan walk
+	// so the progress bar total closely matches files actually processed.
+	total, err := countEligible(ctx, targetDir, filter, maxFileSizeBytes, countBar)
 	if err != nil {
 		logger.Info().Str("target", targetDir).Msg("full scan: count interrupted, proceeding without total")
 	}
@@ -86,8 +98,6 @@ func RunFullScan(
 		progressbar.OptionSetPredictTime(true),
 	)
 
-	// Full scan tracker is not shared with the daemon — CLI scan always
-	// re-evaluates every file and process regardless of daemon state.
 	tracker := utilities.NewRecentScanTracker(5 * time.Minute)
 
 	var summary ScanSummary
@@ -117,7 +127,12 @@ func RunFullScan(
 			return nil
 		}
 
-		eligible, _ := isEligibleForWalk(path)
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
+		eligible, _ := isEligibleForWalk(path, info, maxFileSizeBytes, interpMap)
 		if !eligible {
 			return nil
 		}
@@ -143,9 +158,6 @@ func RunFullScan(
 		return summary, walkErr
 	}
 
-	// ── Process walk ──────────────────────────────────────────
-	// Run even if the file walk was interrupted — the operator may have
-	// cancelled just the file portion and still wants process coverage.
 	if ctx.Err() == nil {
 		fmt.Println("Scanning running processes...")
 		procSummary, procErr := RunProcWalk(
@@ -153,7 +165,7 @@ func RunFullScan(
 			pipeline,
 			writer,
 			processFilter,
-			tracker, // share tracker so a binary hit during file walk is not re-scanned
+			tracker,
 			sysInfo,
 			logger,
 		)
@@ -166,9 +178,6 @@ func RunFullScan(
 
 	return summary, nil
 }
-
-// scanFile, isEligibleForWalk, hasExecutableMagicBytes, countEligible
-// are unchanged from original — reproduced in full to avoid partial file.
 
 func scanFile(
 	ctx context.Context,
@@ -198,7 +207,7 @@ func scanFile(
 		return false, nil
 	}
 
-	fileSize := int64(0)
+	var fileSize int64
 	if info, err := os.Stat(filePath); err == nil {
 		fileSize = info.Size()
 	}
@@ -233,57 +242,51 @@ func scanFile(
 	return false, nil
 }
 
-func isEligibleForWalk(filePath string) (bool, string) {
-	info, err := os.Stat(filePath)
-	if err != nil {
-		return false, "stat_failed"
-	}
+// isEligibleForWalk checks file eligibility using an already-fetched FileInfo
+// to avoid a redundant stat inside the walk callback.
+// W20: interpreter binary check added.
+// W8: uses utilities.HasExecutableMagic instead of a local duplicate.
+func isEligibleForWalk(filePath string, info fs.FileInfo, maxSize int64, interpreters map[string]bool) (bool, string) {
 	if info.IsDir() {
 		return false, "is_directory"
 	}
 	if info.Size() < 10 {
 		return false, "too_small"
 	}
+	if maxSize > 0 && info.Size() > maxSize {
+		return false, "too_large"
+	}
 	if info.Mode()&0o111 != 0 {
 		return true, ""
 	}
-	if hasExecutableMagicBytes(filePath) {
+	// Interpreter binaries may not have the executable bit set in all
+	// environments (e.g. container base images) — check the path explicitly.
+	if interpreters[filePath] || interpreters[filepath.Base(filePath)] {
+		return true, ""
+	}
+	// Magic byte check requires opening the file — only reached when the
+	// executable bit is not set and the path is not a known interpreter.
+	f, err := os.Open(filePath)
+	if err != nil {
+		return false, "open_failed"
+	}
+	defer f.Close()
+	if utilities.HasExecutableMagic(f) {
 		return true, ""
 	}
 	return false, "not_executable"
 }
 
-func hasExecutableMagicBytes(filePath string) bool {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return false
-	}
-	defer f.Close()
-
-	magic := make([]byte, 4)
-	n, err := f.Read(magic)
-	if err != nil || n < 2 {
-		return false
-	}
-	if n >= 4 && magic[0] == 0x7f && magic[1] == 0x45 && magic[2] == 0x4c && magic[3] == 0x46 {
-		return true
-	}
-	if magic[0] == '#' && magic[1] == '!' {
-		return true
-	}
-	if magic[0] == 0x4d && magic[1] == 0x5a {
-		return true
-	}
-	if n >= 4 && magic[0] == 0xca && magic[1] == 0xfe && magic[2] == 0xba && magic[3] == 0xbe {
-		return true
-	}
-	return false
-}
-
+// countEligible pre-counts eligible files for the progress bar.
+// Uses executable bit and size only — magic byte inspection would require
+// opening every file, making the count pass as expensive as the scan pass.
+// The bar total is a close approximation; files passing magic check but
+// not the executable bit will be scanned but not pre-counted.
 func countEligible(
 	ctx context.Context,
 	targetDir string,
 	filter *utilities.ExclusionFilter,
+	maxSize int64,
 	bar *progressbar.ProgressBar,
 ) (int64, error) {
 	var count int64
@@ -310,7 +313,11 @@ func countEligible(
 		if err != nil {
 			return nil
 		}
-		if !info.IsDir() && info.Size() >= 10 {
+		size := info.Size()
+		if size < 10 || (maxSize > 0 && size > maxSize) {
+			return nil
+		}
+		if info.Mode()&0o111 != 0 {
 			count++
 		}
 		return nil

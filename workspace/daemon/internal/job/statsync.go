@@ -9,12 +9,10 @@ import (
 	"context"
 	"sync"
 	"time"
-	"vajra/internal/db/queries"
 
 	"github.com/rs/zerolog"
+	"vajra/internal/db/queries"
 )
-
-const statSyncDefaultInterval = time.Hour
 
 // StatSyncer drives periodic aggregation of raw event counts into the
 // event_statistics table. All SQL lives in StatisticsQueries.
@@ -24,11 +22,16 @@ type StatSyncer struct {
 	interval time.Duration
 }
 
-func NewStatSyncer(logger *zerolog.Logger, statsQ *queries.StatisticsQueries) *StatSyncer {
+// NewStatSyncer creates a StatSyncer with the aggregation interval from config.
+// J11: was hardcoded to time.Hour regardless of StatsSyncIntervalMin.
+func NewStatSyncer(logger *zerolog.Logger, statsQ *queries.StatisticsQueries, intervalMin int) *StatSyncer {
+	if intervalMin <= 0 {
+		intervalMin = 5 // safe floor — zero would spin-loop
+	}
 	return &StatSyncer{
 		logger:   logger,
 		statsQ:   statsQ,
-		interval: statSyncDefaultInterval,
+		interval: time.Duration(intervalMin) * time.Minute,
 	}
 }
 
@@ -36,9 +39,9 @@ func (s *StatSyncer) Name() string { return "stat_syncer" }
 
 func (s *StatSyncer) Run(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
-
 	s.logger.Info().Msg("stat syncer started")
-	s.runOnce()
+
+	s.runOnce(ctx)
 
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
@@ -48,19 +51,19 @@ func (s *StatSyncer) Run(ctx context.Context, wg *sync.WaitGroup) {
 			s.logger.Info().Msg("stat syncer stopped")
 			return
 		case <-ticker.C:
-			s.runOnce()
+			s.runOnce(ctx)
 		}
 	}
 }
 
 // RunOnce runs a single aggregation cycle — exposed for future CLI use.
-func (s *StatSyncer) RunOnce() { s.runOnce() }
+func (s *StatSyncer) RunOnce() { s.runOnce(context.Background()) }
 
-func (s *StatSyncer) runOnce() {
+func (s *StatSyncer) runOnce(ctx context.Context) {
 	start := time.Now()
 	s.logger.Debug().Msg("stat syncer: starting aggregation")
 
-	n, err := s.statsQ.Aggregate()
+	n, err := s.statsQ.Aggregate(ctx)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("stat syncer: aggregation failed")
 		return

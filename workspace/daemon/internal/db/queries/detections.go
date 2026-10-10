@@ -6,8 +6,8 @@
 package queries
 
 import (
+	"context"
 	"fmt"
-	"time"
 
 	sq "github.com/Masterminds/squirrel"
 	shareddb "vajra/shared/db"
@@ -15,37 +15,35 @@ import (
 )
 
 type DetectionQueries struct {
-	db *shareddb.DB
+	db shareddb.DBConn
 }
 
-func NewDetectionQueries(d *shareddb.DB) *DetectionQueries {
+func NewDetectionQueries(d shareddb.DBConn) *DetectionQueries {
 	return &DetectionQueries{db: d}
 }
 
-// Insert writes a detection record and populates d.ID via LastInsertId.
-func (q *DetectionQueries) Insert(d *models.Detection) error {
+func (q *DetectionQueries) Insert(ctx context.Context, d *models.Detection, now int64) error {
 	sqlStr, args, err := sq.
 		Insert("detections").
 		Columns(
 			"machine_id", "detection_time", "source", "severity", "status",
 			"pid", "ppid", "uid", "gid", "euid", "egid",
-			"process_name", "exe_path", "cmdline", "cwd",
+			"process_name", "exe_path", "cmd_line", "cwd",
 			"target_path", "rule_id", "mitre_technique",
-			"notes", "dedup_count",
+			"notes", "dedup_count", "created_at", "updated_at",
 		).
 		Values(
 			d.MachineID, d.DetectionTime, d.Source, string(d.Severity), string(d.Status),
 			d.PID, d.PPID, d.UID, d.GID, d.EUID, d.EGID,
 			d.ProcessName, d.ExePath, d.CmdLine, d.CWD,
 			d.TargetPath, d.RuleID, d.MITRETechnique,
-			d.Notes, d.DedupCount,
+			d.Notes, d.DedupCount, now, now,
 		).
 		ToSql()
 	if err != nil {
 		return fmt.Errorf("detections.Insert: build: %w", err)
 	}
-
-	res, err := q.db.SQL().Exec(sqlStr, args...)
+	res, err := q.db.ExecContext(ctx, sqlStr, args...)
 	if err != nil {
 		return fmt.Errorf("detections.Insert: exec: %w", err)
 	}
@@ -57,39 +55,36 @@ func (q *DetectionQueries) Insert(d *models.Detection) error {
 	return nil
 }
 
-// IncrementDedupCount bumps the dedup counter on an existing detection.
-func (q *DetectionQueries) IncrementDedupCount(id int64) error {
+func (q *DetectionQueries) IncrementDedupCount(ctx context.Context, id int64, now int64) error {
 	sqlStr, args, err := sq.
 		Update("detections").
 		Set("dedup_count", sq.Expr("dedup_count + 1")).
-		Set("updated_at", time.Now().UTC()).
+		Set("updated_at", now).
 		Where(sq.Eq{"id": id}).
 		ToSql()
 	if err != nil {
 		return fmt.Errorf("detections.IncrementDedupCount: build: %w", err)
 	}
-	_, err = q.db.SQL().Exec(sqlStr, args...)
+	_, err = q.db.ExecContext(ctx, sqlStr, args...)
 	return err
 }
 
-// UpdateStatus sets status and notes on an existing detection.
-func (q *DetectionQueries) UpdateStatus(id int64, status models.EventStatus, notes string) error {
+func (q *DetectionQueries) UpdateStatus(ctx context.Context, id int64, status models.EventStatus, notes string, now int64) error {
 	sqlStr, args, err := sq.
 		Update("detections").
 		Set("status", string(status)).
 		Set("notes", notes).
-		Set("updated_at", time.Now().UTC()).
+		Set("updated_at", now).
 		Where(sq.Eq{"id": id}).
 		ToSql()
 	if err != nil {
 		return fmt.Errorf("detections.UpdateStatus: build: %w", err)
 	}
-	_, err = q.db.SQL().Exec(sqlStr, args...)
+	_, err = q.db.ExecContext(ctx, sqlStr, args...)
 	return err
 }
 
-// ListBySeverity returns detections filtered by one or more severities.
-func (q *DetectionQueries) ListBySeverity(limit uint64, severities ...models.EventSeverity) ([]models.Detection, error) {
+func (q *DetectionQueries) ListBySeverity(ctx context.Context, limit uint64, severities ...models.EventSeverity) ([]models.Detection, error) {
 	vals := make([]interface{}, len(severities))
 	for i, s := range severities {
 		vals[i] = string(s)
@@ -98,7 +93,7 @@ func (q *DetectionQueries) ListBySeverity(limit uint64, severities ...models.Eve
 		Select(
 			"id", "machine_id", "detection_time", "source", "severity", "status",
 			"pid", "ppid", "uid", "gid", "euid", "egid",
-			"process_name", "exe_path", "cmdline", "cwd",
+			"process_name", "exe_path", "cmd_line", "cwd",
 			"target_path", "rule_id", "mitre_technique",
 			"notes", "dedup_count", "created_at", "updated_at",
 		).
@@ -112,11 +107,10 @@ func (q *DetectionQueries) ListBySeverity(limit uint64, severities ...models.Eve
 	if err != nil {
 		return nil, fmt.Errorf("detections.ListBySeverity: build: %w", err)
 	}
-	return q.scanRows(sqlStr, args...)
+	return q.scanRows(ctx, sqlStr, args...)
 }
 
-// DeleteResolvedBefore removes resolved detections older than cutoff.
-func (q *DetectionQueries) DeleteResolvedBefore(cutoff int64) (int64, error) {
+func (q *DetectionQueries) DeleteResolvedBefore(ctx context.Context, cutoff int64) (int64, error) {
 	sqlStr, args, err := sq.
 		Delete("detections").
 		Where(sq.And{
@@ -127,15 +121,15 @@ func (q *DetectionQueries) DeleteResolvedBefore(cutoff int64) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("detections.DeleteResolvedBefore: build: %w", err)
 	}
-	res, err := q.db.SQL().Exec(sqlStr, args...)
+	res, err := q.db.ExecContext(ctx, sqlStr, args...)
 	if err != nil {
 		return 0, err
 	}
 	return res.RowsAffected()
 }
 
-func (q *DetectionQueries) scanRows(sqlStr string, args ...interface{}) ([]models.Detection, error) {
-	rows, err := q.db.SQL().Query(sqlStr, args...)
+func (q *DetectionQueries) scanRows(ctx context.Context, sqlStr string, args ...interface{}) ([]models.Detection, error) {
+	rows, err := q.db.QueryContext(ctx, sqlStr, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -144,13 +138,12 @@ func (q *DetectionQueries) scanRows(sqlStr string, args ...interface{}) ([]model
 	var results []models.Detection
 	for rows.Next() {
 		var d models.Detection
-		var createdAt, updatedAt string
 		if err := rows.Scan(
 			&d.ID, &d.MachineID, &d.DetectionTime, &d.Source, &d.Severity, &d.Status,
 			&d.PID, &d.PPID, &d.UID, &d.GID, &d.EUID, &d.EGID,
 			&d.ProcessName, &d.ExePath, &d.CmdLine, &d.CWD,
 			&d.TargetPath, &d.RuleID, &d.MITRETechnique,
-			&d.Notes, &d.DedupCount, &createdAt, &updatedAt,
+			&d.Notes, &d.DedupCount, &d.CreatedAt, &d.UpdatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("detections.scanRows: scan: %w", err)
 		}

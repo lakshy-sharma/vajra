@@ -8,9 +8,8 @@
 package job
 
 import (
+	"archive/zip"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -24,6 +23,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"vajra/internal/utilities"
 	sharedconfig "vajra/shared/config"
 )
 
@@ -31,6 +31,11 @@ const (
 	yaraForgeAPIURL  = "https://api.github.com/repos/YARAHQ/yara-forge/releases/latest"
 	rulesTagFilename = ".rules_version"
 )
+
+// yaraForgeClient is reused across fetchLatestTag calls.
+// J9: was created fresh on every call — unnecessary allocation and no
+// connection reuse.
+var yaraForgeClient = &http.Client{Timeout: 30 * time.Second}
 
 type githubRelease struct {
 	TagName string `json:"tag_name"`
@@ -53,7 +58,9 @@ func (rs *RuleSyncer) Run(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 	rs.logger.Info().Int("interval_hours", rs.cfg.RulesSyncIntervalHour).Msg("rule syncer started")
 
-	rs.sync()
+	if err := rs.sync(ctx); err != nil {
+		rs.logger.Error().Err(err).Msg("rule syncer: initial sync failed")
+	}
 
 	ticker := time.NewTicker(time.Duration(rs.cfg.RulesSyncIntervalHour) * time.Hour)
 	defer ticker.Stop()
@@ -64,24 +71,28 @@ func (rs *RuleSyncer) Run(ctx context.Context, wg *sync.WaitGroup) {
 			rs.logger.Info().Msg("rule syncer stopped")
 			return
 		case <-ticker.C:
-			rs.sync()
+			if err := rs.sync(ctx); err != nil {
+				rs.logger.Error().Err(err).Msg("rule syncer: sync failed")
+			}
 		}
 	}
 }
 
 // RunOnce is the CLI entry point for vajra rules update.
 func (rs *RuleSyncer) RunOnce() error {
-	return rs.sync()
+	return rs.sync(context.Background())
 }
 
+// LocalHash returns the SHA256 of the current rules file.
+// J8: was a local hashFile function duplicating utilities.FullSHA256.
 func (rs *RuleSyncer) LocalHash() (string, error) {
-	return hashFile(rs.cfg.RulesFilepath)
+	return utilities.FullSHA256(rs.cfg.RulesFilepath)
 }
 
-func (rs *RuleSyncer) sync() error {
+func (rs *RuleSyncer) sync(ctx context.Context) error {
 	rs.logger.Info().Msg("rule syncer: checking for updates")
 
-	remoteTag, err := rs.fetchLatestTag()
+	remoteTag, err := rs.fetchLatestTag(ctx)
 	if err != nil {
 		rs.logger.Error().Err(err).Msg("rule syncer: fetch tag failed, skipping")
 		return fmt.Errorf("rulesync: fetch tag: %w", err)
@@ -96,7 +107,7 @@ func (rs *RuleSyncer) sync() error {
 	rs.logger.Info().Str("local", localTag).Str("remote", remoteTag).Msg("rule syncer: update available")
 
 	stagingPath := rs.cfg.RulesFilepath + ".staging"
-	if err := rs.download(rs.cfg.RulesRemoteURL, stagingPath); err != nil {
+	if err := rs.download(ctx, rs.cfg.RulesRemoteURL, stagingPath); err != nil {
 		os.Remove(stagingPath)
 		return fmt.Errorf("rulesync: download: %w", err)
 	}
@@ -133,16 +144,17 @@ func (rs *RuleSyncer) sync() error {
 	return nil
 }
 
-func (rs *RuleSyncer) fetchLatestTag() (string, error) {
-	client := &http.Client{Timeout: 30 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, yaraForgeAPIURL, nil)
+// fetchLatestTag queries the GitHub API for the latest YARA Forge release tag.
+// J9: uses package-level yaraForgeClient instead of creating a new one per call.
+func (rs *RuleSyncer) fetchLatestTag(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, yaraForgeAPIURL, nil)
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("User-Agent", "vajra-edr")
 	req.Header.Set("Accept", "application/vnd.github+json")
 
-	resp, err := client.Do(req)
+	resp, err := yaraForgeClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -178,30 +190,37 @@ func (rs *RuleSyncer) writeLocalTag(tag string) error {
 	return os.WriteFile(rs.tagFilePath(), []byte(tag), 0o644)
 }
 
+// verifyZip validates the downloaded rules archive by opening its central
+// directory. J7: the previous check only verified magic bytes — a truncated
+// download would pass the magic check but fail to extract.
 func (rs *RuleSyncer) verifyZip(path string) error {
-	f, err := os.Open(path)
+	zr, err := zip.OpenReader(path)
 	if err != nil {
-		return err
+		return fmt.Errorf("verifyZip: invalid ZIP: %w", err)
 	}
-	defer f.Close()
-
-	magic := make([]byte, 4)
-	if _, err := io.ReadFull(f, magic); err != nil {
-		return err
-	}
-	// PK\x03\x04
-	if magic[0] != 0x50 || magic[1] != 0x4b || magic[2] != 0x03 || magic[3] != 0x04 {
-		return fmt.Errorf("not a valid ZIP (magic: %x)", magic)
+	defer zr.Close()
+	// zip.OpenReader validates the central directory; an empty archive is
+	// also invalid — a legitimate YARA Forge bundle always has rule files.
+	if len(zr.File) == 0 {
+		return fmt.Errorf("verifyZip: ZIP contains no files")
 	}
 	return nil
 }
 
-func (rs *RuleSyncer) download(url, destPath string) error {
+// download fetches a file from url to destPath with context support.
+// J6: the previous download had no context parameter, making cancellation impossible.
+func (rs *RuleSyncer) download(ctx context.Context, url, destPath string) error {
 	if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
 		return err
 	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+
 	client := &http.Client{Timeout: 10 * time.Minute}
-	resp, err := client.Get(url)
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -286,17 +305,4 @@ func (rs *RuleSyncer) restartAgent() error {
 		return fmt.Errorf("%w — output: %s", err, string(out))
 	}
 	return nil
-}
-
-func hashFile(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
 }

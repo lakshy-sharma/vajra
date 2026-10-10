@@ -5,7 +5,11 @@
 
 package utilities
 
-import "vajra/shared/models"
+import (
+	"strings"
+
+	"vajra/shared/models"
+)
 
 // RuleMatch is the minimal interface any scanning engine must implement
 // to participate in severity classification. YARA, betterleaks, and hash
@@ -35,16 +39,16 @@ func ClassifySeverity(matches []RuleMatch) models.EventSeverity {
 	for _, m := range matches {
 		id := m.RuleID()
 		switch {
-		case hasPrefix(id, "APT_"),
-			hasPrefix(id, "MALWARE_"),
-			hasPrefix(id, "MAL_"),
-			hasPrefix(id, "Ransomware"):
+		case strings.HasPrefix(id, "APT_"),
+			strings.HasPrefix(id, "MALWARE_"),
+			strings.HasPrefix(id, "MAL_"),
+			strings.HasPrefix(id, "Ransomware"):
 			return models.SeverityCritical
-		case hasPrefix(id, "HKTL_"),
-			hasPrefix(id, "Exploit"),
-			hasPrefix(id, "EXPL_"):
+		case strings.HasPrefix(id, "HKTL_"),
+			strings.HasPrefix(id, "Exploit"),
+			strings.HasPrefix(id, "EXPL_"):
 			return models.SeverityHigh
-		case hasPrefix(id, "SUSP_"):
+		case strings.HasPrefix(id, "SUSP_"):
 			return models.SeverityMedium
 		}
 	}
@@ -55,7 +59,22 @@ func ClassifySeverity(matches []RuleMatch) models.EventSeverity {
 	return models.SeverityMedium
 }
 
-// hasPrefix is a bounds-safe prefix check without importing strings.
-func hasPrefix(s, prefix string) bool {
-	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+// SeverityRank returns a numeric rank for severity comparison.
+// Higher values are more severe. Used by analyzers to merge multiple results
+// without importing the full analyzer package.
+func SeverityRank(s models.EventSeverity) int {
+	switch s {
+	case models.SeverityClean:
+		return 0
+	case models.SeverityLow:
+		return 1
+	case models.SeverityMedium:
+		return 2
+	case models.SeverityHigh:
+		return 3
+	case models.SeverityCritical:
+		return 4
+	default:
+		return 0
+	}
 }

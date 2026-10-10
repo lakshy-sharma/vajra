@@ -8,13 +8,12 @@
 package watcher
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
+	"time"
 
 	"github.com/rs/zerolog"
 	"vajra/internal/analyzer"
@@ -46,7 +45,7 @@ func NewProcessScanner(
 	writer *findings.FindingWriter,
 	treeQ *queries.ProcessTreeQueries,
 	filter *utilities.ProcessFilter,
-	tracker *utilities.RecentScanTracker, // injected — shared with RunProcWalk
+	tracker *utilities.RecentScanTracker,
 	sysInfo utilities.SystemInfo,
 ) *ProcessScanner {
 	return &ProcessScanner{
@@ -60,6 +59,7 @@ func NewProcessScanner(
 		sysInfo:         sysInfo,
 	}
 }
+
 func (ps *ProcessScanner) Name() string { return "process_scanner" }
 
 func (ps *ProcessScanner) Run(ctx context.Context, wg *sync.WaitGroup, ch <-chan ebpf.ProcessEvent) {
@@ -81,15 +81,16 @@ func (ps *ProcessScanner) Run(ctx context.Context, wg *sync.WaitGroup, ch <-chan
 
 func (ps *ProcessScanner) handle(ctx context.Context, event ebpf.ProcessEvent) {
 	comm := ebpf.CStringToGo(event.Comm[:])
+	now := time.Now().Unix()
 
-	// Process tree write is unconditional — every execve, before any
-	// filtering. Holes in the tree break server-side CTE traversal.
-	cmdLine := readCmdline(event.PID)
+	// Process tree write is unconditional — every execve, before any filtering.
+	// Holes in the tree break server-side CTE ancestry traversal.
+	cmdLine := utilities.ReadCmdline(event.PID)
 	if cmdLine == "" {
 		cmdLine = ebpf.CStringToGo(event.Args[:])
 	}
 
-	if err := ps.treeQ.Insert(&models.ProcessTreeEntry{
+	if err := ps.treeQ.Insert(ctx, &models.ProcessTreeEntry{
 		MachineID: ps.sysInfo.MachineID,
 		PID:       event.PID,
 		PPID:      event.PPID,
@@ -97,7 +98,7 @@ func (ps *ProcessScanner) handle(ctx context.Context, event ebpf.ProcessEvent) {
 		ExePath:   ebpf.CStringToGo(event.Filename[:]),
 		CmdLine:   cmdLine,
 		EventTime: ps.sysInfo.EBPFTimestampToUnix(event.Timestamp),
-	}); err != nil {
+	}, now); err != nil {
 		// Non-fatal — analysis continues even if tree write fails.
 		ps.logger.Error().Err(err).Uint32("pid", event.PID).Msg("process scanner: tree insert failed")
 	}
@@ -107,10 +108,12 @@ func (ps *ProcessScanner) handle(ctx context.Context, event ebpf.ProcessEvent) {
 		return
 	}
 
-	if ps.tracker.WasRecentlyScanned(exePath, "") {
+	// W11: use content hash as tracker key so the tracker correctly identifies
+	// the same binary even if it moves or is replaced between scans.
+	quickHash, _ := utilities.QuickHash(exePath)
+	if ps.tracker.WasRecentlyScanned(exePath, quickHash) {
 		return
 	}
-	ps.tracker.MarkScanned(exePath, "")
 
 	pCtx := analyzer.CtxWithPID(ctx, event.PID)
 
@@ -119,9 +122,11 @@ func (ps *ProcessScanner) handle(ctx context.Context, event ebpf.ProcessEvent) {
 		ps.logger.Error().Err(err).Str("exe", exePath).Msg("process scanner: runtime pipeline error")
 	}
 
+	// W10: compute SHA256 once — reused for both the pipeline and the finding.
+	var fileHash string
 	contentResult := analyzer.Result{Severity: models.SeverityClean}
 	if !ps.filter.IsTrusted(comm) {
-		fileHash, err := utilities.FullSHA256(exePath)
+		fileHash, err = utilities.FullSHA256(exePath)
 		if err != nil {
 			ps.logger.Debug().Err(err).Str("exe", exePath).Msg("process scanner: hash failed, skipping content pipeline")
 		} else {
@@ -132,6 +137,10 @@ func (ps *ProcessScanner) handle(ctx context.Context, event ebpf.ProcessEvent) {
 		}
 	}
 
+	// Mark before return so ProcessScanner and FileScanner don't re-scan
+	// the same binary even when the result is CLEAN.
+	ps.tracker.MarkScanned(exePath, fileHash)
+
 	merged := analyzer.MergeResults(contentResult, runtimeResult)
 	if merged.Skip || merged.Severity == models.SeverityClean {
 		return
@@ -140,11 +149,6 @@ func (ps *ProcessScanner) handle(ctx context.Context, event ebpf.ProcessEvent) {
 	cwd := readCWD(event.PID)
 	if cwd == "" {
 		cwd = ebpf.CStringToGo(event.CWD[:])
-	}
-
-	fileHash := ""
-	if h, err := utilities.FullSHA256(exePath); err == nil {
-		fileHash = h
 	}
 
 	ruleID := utilities.RuleFromMatch(merged.Notes, merged.YaraMatches)
@@ -184,7 +188,6 @@ func (ps *ProcessScanner) handle(ctx context.Context, event ebpf.ProcessEvent) {
 		Msg("PROCESS DETECTION")
 }
 
-// resolveExePath reads /proc/PID/exe, falling back to the eBPF filename.
 func resolveExePath(pid uint32, filenameBuf []byte) string {
 	resolved, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
 	if err == nil && resolved != "" {
@@ -203,24 +206,6 @@ func resolveExePath(pid uint32, filenameBuf []byte) string {
 	return name
 }
 
-// readCmdline reads /proc/PID/cmdline. The file is null-delimited —
-// bytes.Split is correct here, not string manipulation.
-func readCmdline(pid uint32) string {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
-	if err != nil || len(data) == 0 {
-		return ""
-	}
-	parts := bytes.Split(bytes.TrimRight(data, "\x00"), []byte{0})
-	result := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if len(p) > 0 {
-			result = append(result, string(p))
-		}
-	}
-	return strings.Join(result, " ")
-}
-
-// readCWD resolves /proc/PID/cwd to the full working directory.
 func readCWD(pid uint32) string {
 	cwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", pid))
 	if err != nil {

@@ -35,17 +35,17 @@ func GetSources() []Source {
 	}
 }
 
+// hashEntry sets the SHA256 field on an AutorunEntry.
+// Only SHA256 is stored — AutorunEntry has no SHA1 or MD5 fields.
 func hashEntry(e *models.AutorunEntry) {
 	if e.ImagePath == "" {
 		return
 	}
-	sha256h, sha1h, md5h, err := utilities.HashFile(e.ImagePath)
+	sha256, err := utilities.FullSHA256(e.ImagePath)
 	if err != nil {
 		return
 	}
-	e.SHA256 = sha256h
-	e.SHA1 = sha1h
-	e.MD5 = md5h
+	e.SHA256 = sha256
 }
 
 func parseShellWords(line string) (exe, args string) {
@@ -120,7 +120,12 @@ func (s *SystemdUserSource) Collect() ([]*models.AutorunEntry, error) {
 	return entries, nil
 }
 
+// reSection matches ini-style section headers like [Service] or [D-BUS Service].
 var reSection = regexp.MustCompile(`^\[.*\]$`)
+
+// reDesktopExecTokens matches .desktop file field-code substitution tokens (%f, %u etc.).
+// W22: compiled once at package level — was recompiled per parseDesktopFile call.
+var reDesktopExecTokens = regexp.MustCompile(`%[a-zA-Z]`)
 
 func collectSystemdDir(dir string, category models.AutorunCategory) ([]*models.AutorunEntry, error) {
 	dirEntries, err := os.ReadDir(dir)
@@ -439,7 +444,8 @@ func parseDesktopFile(path string) (*models.AutorunEntry, error) {
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if strings.HasPrefix(line, "Exec=") {
-			val := regexp.MustCompile(`%[a-zA-Z]`).ReplaceAllString(
+			// W22: reDesktopExecTokens is compiled once at package level.
+			val := reDesktopExecTokens.ReplaceAllString(
 				strings.TrimPrefix(line, "Exec="), "",
 			)
 			exe, args := parseShellWords(strings.TrimSpace(val))

@@ -1,13 +1,13 @@
 // internal/db/queries/autoruns.go
 //
-// Copyright © 2025 Lakshy Sharma lakshy.d.sharma@gmail.com
+// Copyright © 2026 Lakshy Sharma lakshy.d.sharma@gmail.com
 // AGPL-3.0 License
 
 package queries
 
 import (
+	"context"
 	"fmt"
-	"time"
 
 	sq "github.com/Masterminds/squirrel"
 	shareddb "vajra/shared/db"
@@ -15,116 +15,103 @@ import (
 )
 
 type AutorunQueries struct {
-	db *shareddb.DB
+	db shareddb.DBConn
 }
 
-func NewAutorunQueries(d *shareddb.DB) *AutorunQueries {
+func NewAutorunQueries(d shareddb.DBConn) *AutorunQueries {
 	return &AutorunQueries{db: d}
 }
 
-// Insert adds a new autorun entry.
-func (q *AutorunQueries) Insert(e *models.AutorunEntry) error {
+func (q *AutorunQueries) Insert(ctx context.Context, e *models.AutorunEntry, now int64) error {
 	sqlStr, args, err := sq.
 		Insert("autoruns").
 		Columns(
-			"category", "location", "image_path", "image_name", "arguments",
-			"md5", "sha1", "sha256", "is_active", "first_seen", "last_seen",
+			"machine_id", "category", "location", "image_path", "image_name",
+			"arguments", "sha256", "is_active", "first_seen", "last_seen",
+			"created_at", "updated_at",
 		).
 		Values(
-			string(e.Category), e.Location, e.ImagePath, e.ImageName, e.Arguments,
-			e.MD5, e.SHA1, e.SHA256, e.IsActive, e.FirstSeen, e.LastSeen,
+			e.MachineID, string(e.Category), e.Location, e.ImagePath, e.ImageName,
+			e.Arguments, e.SHA256, e.IsActive, e.FirstSeen, e.LastSeen,
+			now, now,
 		).
 		ToSql()
 	if err != nil {
-		return fmt.Errorf("autoruns.Insert: build query: %w", err)
+		return fmt.Errorf("autoruns.Insert: build: %w", err)
 	}
-
-	_, err = q.db.SQL().Exec(sqlStr, args...)
-	return err
+	res, err := q.db.ExecContext(ctx, sqlStr, args...)
+	if err != nil {
+		return fmt.Errorf("autoruns.Insert: exec: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return fmt.Errorf("autoruns.Insert: last id: %w", err)
+	}
+	e.ID = id
+	return nil
 }
 
-// MarkInactive sets is_active=0 and updates last_seen for a
-// specific entry identified by its unique key fields.
-func (q *AutorunQueries) MarkInactive(e *models.AutorunEntry, timestamp int64) error {
-	builder := sq.
+// MarkInactive sets is_active=0 for an entry no longer present on the system.
+// The composite key (category+location+image_path) is always used — sha256
+// alone does not uniquely identify a persistence location.
+func (q *AutorunQueries) MarkInactive(ctx context.Context, e *models.AutorunEntry, now int64) error {
+	sqlStr, args, err := sq.
 		Update("autoruns").
 		Set("is_active", 0).
-		Set("last_seen", timestamp).
-		Set("updated_at", time.Now().UTC())
-
-	// Match by SHA256 when available; fall back to composite key.
-	if e.SHA256 != "" {
-		builder = builder.Where(sq.Eq{"sha256": e.SHA256})
-	} else {
-		builder = builder.Where(sq.And{
+		Set("last_seen", now).
+		Set("updated_at", now).
+		Where(sq.And{
 			sq.Eq{"category": string(e.Category)},
 			sq.Eq{"location": e.Location},
 			sq.Eq{"image_path": e.ImagePath},
-		})
-	}
-
-	sqlStr, args, err := builder.ToSql()
+		}).
+		ToSql()
 	if err != nil {
-		return fmt.Errorf("autoruns.MarkInactive: build query: %w", err)
+		return fmt.Errorf("autoruns.MarkInactive: build: %w", err)
 	}
-
-	_, err = q.db.SQL().Exec(sqlStr, args...)
+	_, err = q.db.ExecContext(ctx, sqlStr, args...)
 	return err
 }
 
-// UpdateLastSeen bumps the last_seen timestamp for an entry
-// that was observed again on the current scan cycle.
-func (q *AutorunQueries) UpdateLastSeen(e *models.AutorunEntry, timestamp int64) error {
-	builder := sq.
+func (q *AutorunQueries) UpdateLastSeen(ctx context.Context, e *models.AutorunEntry, now int64) error {
+	sqlStr, args, err := sq.
 		Update("autoruns").
-		Set("last_seen", timestamp).
-		Set("updated_at", time.Now().UTC())
-
-	if e.SHA256 != "" {
-		builder = builder.Where(sq.Eq{"sha256": e.SHA256})
-	} else {
-		builder = builder.Where(sq.And{
+		Set("last_seen", now).
+		Set("updated_at", now).
+		Where(sq.And{
 			sq.Eq{"category": string(e.Category)},
 			sq.Eq{"location": e.Location},
 			sq.Eq{"image_path": e.ImagePath},
-		})
-	}
-
-	sqlStr, args, err := builder.ToSql()
+		}).
+		ToSql()
 	if err != nil {
-		return fmt.Errorf("autoruns.UpdateLastSeen: build query: %w", err)
+		return fmt.Errorf("autoruns.UpdateLastSeen: build: %w", err)
 	}
-
-	_, err = q.db.SQL().Exec(sqlStr, args...)
+	_, err = q.db.ExecContext(ctx, sqlStr, args...)
 	return err
 }
 
-// LoadActive returns all currently active autorun entries.
-// Used to seed the in-memory state on startup.
-func (q *AutorunQueries) LoadActive() ([]models.AutorunEntry, error) {
+func (q *AutorunQueries) LoadActive(ctx context.Context) ([]models.AutorunEntry, error) {
 	sqlStr, args, err := sq.
 		Select(
-			"id", "category", "location", "image_path", "image_name", "arguments",
-			"md5", "sha1", "sha256", "is_active", "first_seen", "last_seen",
+			"id", "machine_id", "category", "location", "image_path", "image_name",
+			"arguments", "sha256", "is_active", "first_seen", "last_seen",
 			"created_at", "updated_at",
 		).
 		From("autoruns").
 		Where(sq.Eq{"is_active": 1}).
 		ToSql()
 	if err != nil {
-		return nil, fmt.Errorf("autoruns.LoadActive: build query: %w", err)
+		return nil, fmt.Errorf("autoruns.LoadActive: build: %w", err)
 	}
-
-	return q.scanRows(sqlStr, args...)
+	return q.scanRows(ctx, sqlStr, args...)
 }
 
-// ListByCategory returns all entries (active or not) for a
-// given persistence category.
-func (q *AutorunQueries) ListByCategory(cat models.AutorunCategory) ([]models.AutorunEntry, error) {
+func (q *AutorunQueries) ListByCategory(ctx context.Context, cat models.AutorunCategory) ([]models.AutorunEntry, error) {
 	sqlStr, args, err := sq.
 		Select(
-			"id", "category", "location", "image_path", "image_name", "arguments",
-			"md5", "sha1", "sha256", "is_active", "first_seen", "last_seen",
+			"id", "machine_id", "category", "location", "image_path", "image_name",
+			"arguments", "sha256", "is_active", "first_seen", "last_seen",
 			"created_at", "updated_at",
 		).
 		From("autoruns").
@@ -132,14 +119,13 @@ func (q *AutorunQueries) ListByCategory(cat models.AutorunCategory) ([]models.Au
 		OrderBy("first_seen DESC").
 		ToSql()
 	if err != nil {
-		return nil, fmt.Errorf("autoruns.ListByCategory: build query: %w", err)
+		return nil, fmt.Errorf("autoruns.ListByCategory: build: %w", err)
 	}
-
-	return q.scanRows(sqlStr, args...)
+	return q.scanRows(ctx, sqlStr, args...)
 }
 
-func (q *AutorunQueries) scanRows(sqlStr string, args ...interface{}) ([]models.AutorunEntry, error) {
-	rows, err := q.db.SQL().Query(sqlStr, args...)
+func (q *AutorunQueries) scanRows(ctx context.Context, sqlStr string, args ...interface{}) ([]models.AutorunEntry, error) {
+	rows, err := q.db.QueryContext(ctx, sqlStr, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -148,18 +134,14 @@ func (q *AutorunQueries) scanRows(sqlStr string, args ...interface{}) ([]models.
 	var entries []models.AutorunEntry
 	for rows.Next() {
 		var e models.AutorunEntry
-		var createdAt, updatedAt string
-
 		if err := rows.Scan(
-			&e.ID, &e.Category, &e.Location, &e.ImagePath, &e.ImageName, &e.Arguments,
-			&e.MD5, &e.SHA1, &e.SHA256, &e.IsActive, &e.FirstSeen, &e.LastSeen,
-			&createdAt, &updatedAt,
+			&e.ID, &e.MachineID, &e.Category, &e.Location, &e.ImagePath, &e.ImageName,
+			&e.Arguments, &e.SHA256, &e.IsActive, &e.FirstSeen, &e.LastSeen,
+			&e.CreatedAt, &e.UpdatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("autoruns.scanRows: scan: %w", err)
 		}
-
 		entries = append(entries, e)
 	}
-
 	return entries, rows.Err()
 }

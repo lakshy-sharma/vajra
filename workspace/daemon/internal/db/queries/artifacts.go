@@ -6,6 +6,7 @@
 package queries
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 
@@ -15,15 +16,14 @@ import (
 )
 
 type ArtifactQueries struct {
-	db *shareddb.DB
+	db shareddb.DBConn
 }
 
-func NewArtifactQueries(d *shareddb.DB) *ArtifactQueries {
+func NewArtifactQueries(d shareddb.DBConn) *ArtifactQueries {
 	return &ArtifactQueries{db: d}
 }
 
-// Insert writes file hash and YARA matches for a detection.
-func (q *ArtifactQueries) Insert(a *models.DetectionArtifact) error {
+func (q *ArtifactQueries) Insert(ctx context.Context, a *models.DetectionArtifact) error {
 	yaraJSON, err := json.Marshal(a.YaraMatches)
 	if err != nil {
 		return fmt.Errorf("artifacts.Insert: marshal yara: %w", err)
@@ -36,12 +36,11 @@ func (q *ArtifactQueries) Insert(a *models.DetectionArtifact) error {
 	if err != nil {
 		return fmt.Errorf("artifacts.Insert: build: %w", err)
 	}
-	_, err = q.db.SQL().Exec(sqlStr, args...)
+	_, err = q.db.ExecContext(ctx, sqlStr, args...)
 	return err
 }
 
-// GetByDetectionID returns the artifact record for a detection.
-func (q *ArtifactQueries) GetByDetectionID(detectionID int64) (*models.DetectionArtifact, error) {
+func (q *ArtifactQueries) GetByDetectionID(ctx context.Context, detectionID int64) (*models.DetectionArtifact, error) {
 	sqlStr, args, err := sq.
 		Select("id", "detection_id", "file_hash", "file_size", "yara_matches").
 		From("detection_artifacts").
@@ -50,7 +49,7 @@ func (q *ArtifactQueries) GetByDetectionID(detectionID int64) (*models.Detection
 	if err != nil {
 		return nil, fmt.Errorf("artifacts.GetByDetectionID: build: %w", err)
 	}
-	row := q.db.SQL().QueryRow(sqlStr, args...)
+	row := q.db.QueryRowContext(ctx, sqlStr, args...)
 	var a models.DetectionArtifact
 	var yaraJSON string
 	if err := row.Scan(&a.ID, &a.DetectionID, &a.FileHash, &a.FileSize, &yaraJSON); err != nil {

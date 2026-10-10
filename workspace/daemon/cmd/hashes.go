@@ -8,6 +8,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+
 	"vajra/internal/job"
 	"vajra/internal/utilities"
 
@@ -27,8 +28,9 @@ var hashesUpdateCmd = &cobra.Command{
 	Long: `Downloads the MalwareBazaar full CSV export, extracts SHA256 hashes,
 and writes a Bloom filter to the path configured in threat_intel_settings.
 
-Requires malware_bazaar_auth_key to be set in config.
-The existing zip is reused if present — delete it to force a fresh download.
+Requires api_key to be set in threat_intel_settings.
+The existing zip is always removed after a successful build — the next
+run will download a fresh export.
 The daemon must be restarted for the new filter to take effect.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, err := sharedconfig.LoadConfig(configPath)
@@ -36,13 +38,17 @@ The daemon must be restarted for the new filter to take effect.`,
 			return fmt.Errorf("hashes update: load config: %w", err)
 		}
 
-		if cfg.ThreatIntelSettings.MalwareBazaarAuthKey == "" {
-			fmt.Fprintln(os.Stderr, "hashes update: malware_bazaar_auth_key not set in config")
-			return fmt.Errorf("no auth key configured")
+		if cfg.ThreatIntelSettings.APIKey == "" {
+			fmt.Fprintln(os.Stderr, "hashes update: threat_intel_settings.api_key not set in config")
+			return fmt.Errorf("no API key configured")
 		}
 
-		logger := utilities.GetLogger(&cfg)
-		syncer := job.NewHashSyncer(logger, cfg.ThreatIntelSettings)
+		logger, err := utilities.GetLogger(&cfg)
+		if err != nil {
+			return fmt.Errorf("hashes update: setup logger: %w", err)
+		}
+
+		syncer := job.NewHashSyncer(logger, cfg.ThreatIntelSettings, cfg.TimingSettings.HashSyncIntervalHour)
 
 		fmt.Println("Syncing malware hashes...")
 		if err := syncer.RunOnce(); err != nil {
@@ -76,7 +82,7 @@ var hashesStatusCmd = &cobra.Command{
 		fmt.Printf("Bloom filter : %s\n", path)
 		fmt.Printf("Size         : %.1f MB\n", float64(info.Size())/1024/1024)
 		fmt.Printf("Modified     : %s\n", info.ModTime().Format("2006-01-02 15:04:05"))
-		fmt.Printf("Auth key     : %s\n", maskKey(cfg.ThreatIntelSettings.MalwareBazaarAuthKey))
+		fmt.Printf("Auth key     : %s\n", maskKey(cfg.ThreatIntelSettings.APIKey))
 		return nil
 	},
 }
@@ -87,7 +93,6 @@ func init() {
 	rootCmd.AddCommand(hashesCmd)
 }
 
-// maskKey shows only the first and last 4 characters of the auth key.
 func maskKey(key string) string {
 	if key == "" {
 		return "not configured"

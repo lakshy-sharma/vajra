@@ -8,17 +8,16 @@
 package detect
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"vajra/internal/findings"
-	"vajra/internal/utilities"
-	"vajra/shared/models"
 
 	blconfig "github.com/betterleaks/betterleaks/v2/config"
 	"github.com/betterleaks/betterleaks/v2/fingerprint"
@@ -27,12 +26,11 @@ import (
 	"github.com/betterleaks/betterleaks/v2/sources"
 	"github.com/rs/zerolog"
 
+	"vajra/internal/findings"
+	"vajra/internal/utilities"
 	sharedconfig "vajra/shared/config"
+	"vajra/shared/models"
 )
-
-// IgnoreFileName lives alongside the database and is written by
-// `vajra secrets export-ignore`, read here on construction.
-const IgnoreFileName = "secrets.ignore"
 
 type SecretsScanner struct {
 	logger        *zerolog.Logger
@@ -42,7 +40,7 @@ type SecretsScanner struct {
 	sysInfo       utilities.SystemInfo
 	targets       []string
 	scanInterval  time.Duration
-	usingDefaults bool
+	targetTimeout time.Duration // W18: per-target time budget
 }
 
 func NewSecretsScanner(
@@ -56,23 +54,22 @@ func NewSecretsScanner(
 		return nil, fmt.Errorf("secrets scanner: load betterleaks config: %w", err)
 	}
 
-	ignoredHashes, err := loadIgnoreFile(
-		filepath.Join(cfg.GenericSettings.DBDirectory, IgnoreFileName),
-		logger,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("secrets scanner: load ignore file: %w", err)
-	}
-
 	scanOpts := []scan.Option{
-		scan.WithMinimumConfidence(scan.ConfidenceMedium),
-		scan.WithMatchContext("1,1"),
+		scan.WithMinimumConfidence(confidenceLevel(cfg.SecretsSettings.MinimumConfidence)), // W15
+		scan.WithMatchContext(contextLines(cfg.SecretsSettings.MatchContextLines)),
 		scan.WithPrecompile(),
 	}
-	if len(ignoredHashes) > 0 {
-		scanOpts = append(scanOpts, scan.WithIgnoredFingerprints(ignoredHashes...))
-		logger.Info().Int("count", len(ignoredHashes)).
-			Msg("secrets scanner: loaded ignored fingerprints")
+
+	// W16: ignore file path comes from config, not a hardcoded constant.
+	if cfg.SecretsSettings.IgnoreFile != "" {
+		ignoredHashes, err := loadIgnoreFile(cfg.SecretsSettings.IgnoreFile, logger)
+		if err != nil {
+			return nil, fmt.Errorf("secrets scanner: load ignore file: %w", err)
+		}
+		if len(ignoredHashes) > 0 {
+			scanOpts = append(scanOpts, scan.WithIgnoredFingerprints(ignoredHashes...))
+			logger.Info().Int("count", len(ignoredHashes)).Msg("secrets scanner: loaded ignored fingerprints")
+		}
 	}
 
 	blScanner, err := scan.New(blCfg, scanOpts...)
@@ -80,29 +77,21 @@ func NewSecretsScanner(
 		return nil, fmt.Errorf("secrets scanner: build betterleaks scanner: %w", err)
 	}
 
-	segments := cfg.ScanSettings.Secrets.AllExcludeSegments(cfg.GenericSettings.DBDirectory)
-	pf := buildPrefilter(segments)
+	// Exclude own DB directory plus any operator-configured paths.
+	excludedPaths := append(cfg.SecretsSettings.ExcludedPaths, cfg.GenericSettings.DBDirectory)
+	prefilter := buildPrefilter(excludedPaths)
 
-	logger.Info().
-		Strs("exclude_segments", segments).
-		Msg("secrets scanner: prefilter built")
-
-	usingDefaults := cfg.ScanSettings.Secrets.IsDefaultConfig()
-	targets := expandTargets(
-		logger,
-		cfg.ScanSettings.Secrets.TargetDirectories,
-		cfg.ScanSettings.TargetDirectory,
-	)
+	targets := expandTargets(logger, cfg.SecretsSettings.ScanTargets, cfg.ScanSettings.TargetDirectory)
 
 	return &SecretsScanner{
 		logger:        logger,
 		blScanner:     blScanner,
-		prefilter:     pf,
+		prefilter:     prefilter,
 		writer:        writer,
 		sysInfo:       sysInfo,
 		targets:       targets,
-		scanInterval:  time.Duration(cfg.TimingSettings.AutorunScanTimeMin) * time.Minute,
-		usingDefaults: usingDefaults,
+		scanInterval:  time.Duration(cfg.TimingSettings.SecretsScanIntervalMin) * time.Minute,        // W17
+		targetTimeout: time.Duration(cfg.TimingSettings.SingleTargetSecretsTimeoutMin) * time.Minute, // W18
 	}, nil
 }
 
@@ -110,15 +99,6 @@ func (ss *SecretsScanner) Name() string { return "secrets_scanner" }
 
 func (ss *SecretsScanner) Run(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
-
-	if ss.usingDefaults {
-		ss.logger.Warn().
-			Strs("directories", ss.targets).
-			Msg("secrets scanner: using DEFAULT target directories — " +
-				"edit scan_settings.secrets.target_directories in config.yaml " +
-				"before deploying to production")
-	}
-
 	ss.logger.Info().Strs("targets", ss.targets).Msg("secrets scanner started")
 
 	ss.runOnce(ctx)
@@ -145,10 +125,13 @@ func (ss *SecretsScanner) runOnce(ctx context.Context) {
 		if ctx.Err() != nil {
 			break
 		}
-		n, err := ss.scanTarget(ctx, target)
+		// W18: each target gets its own deadline so a large directory cannot
+		// starve other targets or block the scanner indefinitely.
+		targetCtx, cancel := context.WithTimeout(ctx, ss.targetTimeout)
+		n, err := ss.scanTarget(targetCtx, target)
+		cancel()
 		if err != nil && ctx.Err() == nil {
-			ss.logger.Error().Err(err).Str("target", target).
-				Msg("secrets scanner: target scan error")
+			ss.logger.Error().Err(err).Str("target", target).Msg("secrets scanner: target scan error")
 		}
 		totalFindings += n
 	}
@@ -205,7 +188,6 @@ func (ss *SecretsScanner) handleFinding(ctx context.Context, f report.Finding) e
 		Source:            findings.SourceSecretsScanner,
 		Severity:          blConfidenceToSeverity(f.Confidence),
 		Status:            models.StatusNew,
-		MachineID:         ss.sysInfo.MachineID,
 		DetectedAt:        time.Now().Unix(),
 		TargetPath:        filePath,
 		RuleID:            f.RuleID,
@@ -237,14 +219,13 @@ func (ss *SecretsScanner) handleFinding(ctx context.Context, f report.Finding) e
 
 // ── helpers ───────────────────────────────────────────────────
 
-// buildPrefilter skips files whose path contains any of the given segments.
-func buildPrefilter(segments []string) sources.PrefilterFunc {
+func buildPrefilter(excludedPaths []string) sources.PrefilterFunc {
 	return func(attributes map[string]string) bool {
 		path := attributes[sources.AttrPath]
 		if path == "" {
 			return false
 		}
-		for _, seg := range segments {
+		for _, seg := range excludedPaths {
 			if strings.Contains(path, seg) {
 				return true
 			}
@@ -254,7 +235,7 @@ func buildPrefilter(segments []string) sources.PrefilterFunc {
 }
 
 // loadIgnoreFile parses a betterleaks fingerprint ignore file.
-// Missing file is not an error — first run or not yet exported.
+// Missing file is not an error — first run or ignore file not yet created.
 func loadIgnoreFile(path string, logger *zerolog.Logger) ([]fingerprint.Hash, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -264,7 +245,8 @@ func loadIgnoreFile(path string, logger *zerolog.Logger) ([]fingerprint.Hash, er
 		return nil, fmt.Errorf("loadIgnoreFile: read %s: %w", path, err)
 	}
 
-	hashes, diagnostics, err := fingerprint.Load(strings.NewReader(string(data)))
+	// bytes.NewReader avoids an extra string allocation vs strings.NewReader(string(data)).
+	hashes, diagnostics, err := fingerprint.Load(bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("loadIgnoreFile: parse: %w", err)
 	}
@@ -289,13 +271,11 @@ func expandTargets(logger *zerolog.Logger, configured []string, fallbackDir stri
 		}
 		matches, err := filepath.Glob(pattern)
 		if err != nil {
-			logger.Warn().Str("pattern", pattern).Err(err).
-				Msg("secrets scanner: invalid glob pattern, skipping")
+			logger.Warn().Str("pattern", pattern).Err(err).Msg("secrets scanner: invalid glob pattern, skipping")
 			continue
 		}
 		if len(matches) == 0 {
-			logger.Warn().Str("pattern", pattern).
-				Msg("secrets scanner: glob matched no paths, skipping")
+			logger.Warn().Str("pattern", pattern).Msg("secrets scanner: glob matched no paths, skipping")
 			continue
 		}
 		for _, m := range matches {
@@ -304,8 +284,7 @@ func expandTargets(logger *zerolog.Logger, configured []string, fallbackDir stri
 	}
 
 	if len(result) == 0 {
-		logger.Warn().Str("fallback", fallbackDir).
-			Msg("secrets scanner: no valid target directories resolved, falling back to target_directory")
+		logger.Warn().Str("fallback", fallbackDir).Msg("secrets scanner: no valid target directories resolved, falling back to target_directory")
 		return []string{fallbackDir}
 	}
 	return result
@@ -334,6 +313,29 @@ func hashSecret(value string) string {
 	}
 	sum := sha256.Sum256([]byte(value))
 	return fmt.Sprintf("%x", sum)
+}
+
+// confidenceLevel maps the config int (0–100) to a betterleaks confidence constant.
+// W15: was hardcoded to ConfidenceMedium.
+func confidenceLevel(minConf int) string {
+	switch {
+	case minConf >= 80:
+		return scan.ConfidenceHigh
+	case minConf >= 50:
+		return scan.ConfidenceMedium
+	default:
+		return scan.ConfidenceLow
+	}
+}
+
+// contextLines converts an int line count to the "before,after" string
+// format expected by betterleaks WithMatchContext.
+func contextLines(n int) string {
+	if n <= 0 {
+		n = 1
+	}
+	s := strconv.Itoa(n)
+	return s + "," + s
 }
 
 func blConfidenceToSeverity(confidence string) models.EventSeverity {

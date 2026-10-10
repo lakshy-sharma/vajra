@@ -1,98 +1,250 @@
 # /etc/vajra/config.yaml
+#
+# Vajra EDR — default configuration
+# This file must be owned by root (uid 0) and mode 0600.
+# The daemon rejects configs not meeting these requirements.
+#
+# After editing, restart the daemon:
+#   sudo systemctl restart vajra
+
+# ── General ───────────────────────────────────────────────────────────────────
 
 generic_settings:
-  operation_mode: monitor
-  work_directory: /var/lib/vajra
+  mode: monitor                     # monitor | enforce | diagnose
   db_directory: /var/lib/vajra
   db_filename: vajra.db
+  work_directory: /var/lib/vajra/work
+  machine_id: ""                    # populated automatically from /etc/machine-id on first start
 
-api_settings:
-  host: localhost
-  port: 8086
+# ── Scanning ──────────────────────────────────────────────────────────────────
 
-timing_settings:
-  autorun_scan_time_min: 15
-  database_cleanup_time_hour: 24
-  database_retention_days: 30
-  shutdown_timeout_sec: 30
-  single_file_scan_timeout_sec: 30
-  dedup_window_min: 5
+scan_settings:
+  target_directory: /               # root for full-filesystem and startup /proc scans
+  excluded_paths:                   # specific files to skip — not directories
+    - /proc
+    - /sys
+    - /dev
+    - /run/user
+  excluded_processes:               # process comm names never scanned
+    - gopls
+    - pylsp
+    - rust-analyzer
+    - typescript-language-server
+    - clangd
+    - code
+    - systemd
+    - dbus-daemon
+    - pulseaudio
+  max_file_size_bytes: 104857600    # 100 MiB — larger files are hashed but not YARA-scanned
+  yara_snapshot_bytes: 128          # bytes of matched content stored per YARA string match
+
+# ── Secrets scanner ───────────────────────────────────────────────────────────
+
+secrets_settings:
+  enabled: true
+  scan_targets:
+    - /home
+    - /root
+    - /etc
+    - /opt
+    - /var
+    - /srv
+    - /run
+  excluded_paths:
+    - /proc
+    - /sys
+    - /dev
+    - /run/user
+    - /miniconda
+    - /.local/share/flatpak
+    - /run/flatpak
+  minimum_confidence: 80            # 0–100; betterleaks confidence threshold
+  ignore_file: ""                   # absolute path to fingerprint ignore file; empty = disabled
+  match_context_lines: 3
+
+# ── Performance ───────────────────────────────────────────────────────────────
 
 performance_settings:
-  default_threads: 2
-  max_allowed_threads: 4
-  scan_queue_size: 1000
-  file_scan_buffer_size: 100
+  default_threads: 4                # YARA worker pool steady-state size
+  max_allowed_threads: 16           # autotune ceiling — never exceeded
+  startup_max_threads: 2            # thread count during startup ramp-up window
+  startup_rampup_min: 5             # minutes before pool settles at default_threads
+  scan_queue_size: 512
+  ebpf_perf_ring_pages: 64          # must be a power of two
+  yara_autotune_interval_sec: 60
+  result_cache_size: 10000          # SHA256 → YARA result LRU entries
+  autorun_concurrency: 2            # parallel autorun sources per scan pass
+
+# ── Timing ────────────────────────────────────────────────────────────────────
+
+timing_settings:
+  single_file_scan_timeout_sec: 30
+  dedup_window_min: 15
+  autorun_scan_interval_min: 60
+  rules_sync_interval_hour: 24
+  secrets_scan_interval_min: 60
+  single_target_secrets_timeout_min: 10
+  stats_sync_interval_min: 5
+  cleanup_interval_hour: 24
+  event_retention_days: 30
+  hash_sync_interval_hour: 24
+  startup_procwalk_delay_sec: 30    # delay initial /proc walk to avoid boot CPU spike
+  startup_secrets_delay_min: 5
+  startup_autorun_delay_sec: 15
+
+# ── YARA rules ────────────────────────────────────────────────────────────────
 
 rules_settings:
   rules_filepath: /opt/vajra/rules.zip
-  rules_archive_dir: /opt/vajra/rules-archive
   rules_remote_url: https://github.com/YARAHQ/yara-forge/releases/latest/download/yara-forge-rules-core.zip
-  rules_remote_hash_url: https://github.com/YARAHQ/yara-forge/releases/latest/download/yara-forge-rules-core.zip.sha256
+  rules_archive_dir: /opt/vajra/rules-archive
+  rules_archive_count: 5
   rules_sync_interval_hour: 24
-  rules_archive_count: 7
+
+# ── Threat intelligence ───────────────────────────────────────────────────────
 
 threat_intel_settings:
-  malware_bazaar_auth_key: ""
+  malwarebazaar_url: https://bazaar.abuse.ch/export/csv/full/
+  api_key: ""                       # MalwareBazaar API key — get one free at bazaar.abuse.ch
+                                    # leave blank to disable hash-based detection
   bloom_filter_path: /opt/vajra/hashes.bloom
-  hash_sync_interval_hour: 24
+  bloom_capacity: 10000000          # expected dataset size — affects memory usage
+  bloom_fp_rate: 0.001              # 0.1% false positive rate
 
-scan_settings:
-  target_directory: /
+# ── Detection policy ─────────────────────────────────────────────────────────
+# All lists here are operator-tunable. Changes take effect on daemon restart.
 
-  secrets:
-    target_directories:
-      - /home
-      - /root
-      - /etc
-      - /opt
-      - /var
-      - /srv
-      - /run
-      - /tmp
-    exclude_browser_cache: true
-    exclude_segments:
-      - /miniconda/
-      - /.local/share/flatpak/
-      - /run/flatpak/
-      - /proc/
-      - /sys/
-      - /dev/
+alert_policy:
+  interpreters:
+    - /bin/sh
+    - /bin/bash
+    - /bin/dash
+    - /bin/zsh
+    - /bin/fish
+    - /usr/bin/sh
+    - /usr/bin/bash
+    - /usr/bin/dash
+    - /usr/bin/zsh
+    - /usr/bin/fish
+    - /bin/python
+    - /bin/python2
+    - /bin/python3
+    - /usr/bin/python
+    - /usr/bin/python2
+    - /usr/bin/python3
+    - /usr/bin/perl
+    - /usr/bin/ruby
+    - /usr/bin/lua
+    - /usr/bin/node
+    - /usr/bin/nodejs
 
-  exclusion_rules:
-    exclude_paths:
-      - /proc
-      - /sys
-      - /dev
-      - /run/user
+  lolbins:
+    - awk
+    - base64
+    - bash
+    - busybox
+    - curl
+    - dd
+    - env
+    - find
+    - gdb
+    - grep
+    - install
+    - ld
+    - less
+    - mv
+    - nano
+    - nc
+    - ncat
+    - netcat
+    - nm
+    - nmap
+    - openssl
+    - perl
+    - php
+    - python
+    - python2
+    - python3
+    - ruby
+    - sed
+    - sh
+    - socat
+    - strace
+    - tee
+    - wget
+    - xxd
 
-    exclude_extensions:
-      - .swp
-      - .lock
-      - .pid
-      - .socket
+  dangerous_capabilities:
+    - CAP_SYS_ADMIN
+    - CAP_SYS_PTRACE
+    - CAP_SYS_MODULE
+    - CAP_SYS_RAWIO
+    - CAP_NET_ADMIN
+    - CAP_NET_RAW
+    - CAP_DAC_READ_SEARCH
+    - CAP_DAC_OVERRIDE
+    - CAP_SETUID
+    - CAP_SETGID
+    - CAP_CHOWN
+    - CAP_FOWNER
+    - CAP_KILL
+    - CAP_BPF
+    - CAP_PERFMON
+    - CAP_CHECKPOINT_RESTORE
 
-    exclude_patterns:
+  # Per-process capability exclusions — add entries for software that
+  # legitimately holds dangerous capabilities on your systems.
+  # Example:
+  #   openvpn:
+  #     - CAP_NET_ADMIN
+  #     - CAP_NET_RAW
+  process_capability_exclusions: {}
 
-    exclude_processes:
-      - gopls
-      - pylsp
-      - rust-analyzer
-      - typescript-language-server
-      - clangd
-      - code
-      - systemd
-      - dbus-daemon
-      - pulseaudio
+  high_value_inbound_ports:
+    - 22    # SSH
+    - 23    # Telnet
+    - 3389  # RDP
+    - 5900  # VNC
+    - 5901
+    - 6000  # X11
 
-logging:
-  enable_console: false
-  use_json: true
-  enable_file_logging: true
-  log_directory: /var/log/vajra
-  log_filename: vajra.log
-  max_size_mb: 50
-  max_age_days: 30
+  high_value_outbound_ports:
+    - 4444   # common reverse shell
+    - 1337
+    - 9001
+    - 6667   # IRC
+    - 6697
+    - 31337
+    - 12345
+
+  # LD_PRELOAD / LD_LIBRARY_PATH entries must start with one of these paths
+  # to be considered legitimate. Anything outside this list triggers HIGH.
+  # Snap paths are intentionally excluded — they are user-writable.
+  trusted_ld_paths:
+    - /lib
+    - /lib64
+    - /usr/lib
+    - /usr/lib64
+    - /usr/local/lib
+    - /usr/local/lib64
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+log_settings:
+  directory: /var/log/vajra         # created with mode 0700 on first start
+  filename: vajra.log
+  max_size_mb: 100
   max_backups: 5
-  log_level: info
-  time_format: UNIXMS
+  max_age_days: 30
+  compress: true
+  level: info                       # debug | info | warn | error
+
+# ── Desktop UI ────────────────────────────────────────────────────────────────
+
+ui_settings:
+  default_theme: system             # system | dark | light
+  window_width: 1280
+  window_height: 800
+  min_window_width: 900
+  min_window_height: 600
+  page_size: 50

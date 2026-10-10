@@ -10,8 +10,8 @@ package utilities
 import (
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -26,7 +26,6 @@ type SystemInfo struct {
 	// BootEpoch is the Unix timestamp (seconds) of the last system boot.
 	// Used to convert eBPF timestamps (nanoseconds since boot via
 	// bpf_ktime_get_ns) to wall clock time.
-	// Computed as: time.Now().Unix() - uptime_seconds
 	BootEpoch int64
 }
 
@@ -50,10 +49,18 @@ func LoadSystemInfo() (SystemInfo, error) {
 }
 
 // EBPFTimestampToUnix converts a bpf_ktime_get_ns() timestamp
-// (nanoseconds since boot) to a Unix epoch second using the
-// precomputed BootEpoch.
+// (nanoseconds since boot) to Unix epoch seconds for DB storage.
+// Sub-second precision is truncated — use EBPFTimestampToUnixNano
+// when event ordering within the same second matters.
 func (s SystemInfo) EBPFTimestampToUnix(nsecSinceBoot uint64) int64 {
-	return s.BootEpoch + int64(nsecSinceBoot/1e9)
+	return s.BootEpoch + int64(nsecSinceBoot)/int64(time.Second)
+}
+
+// EBPFTimestampToUnixNano converts a bpf_ktime_get_ns() timestamp to
+// nanoseconds since Unix epoch. Use this for sub-second event ordering
+// in the eBPF dispatcher; EBPFTimestampToUnix is for DB storage.
+func (s SystemInfo) EBPFTimestampToUnixNano(nsecSinceBoot uint64) int64 {
+	return s.BootEpoch*int64(time.Second) + int64(nsecSinceBoot)
 }
 
 func readMachineID() (string, error) {
@@ -68,32 +75,15 @@ func readMachineID() (string, error) {
 	return id, nil
 }
 
-// readBootEpoch reads /proc/uptime and subtracts uptime from the
-// current wall clock to get the Unix timestamp of last boot.
-// /proc/uptime format: "<uptime_seconds> <idle_seconds>"
+// readBootEpoch uses syscall.Sysinfo to get uptime — one syscall with no
+// text parsing, no float conversion, and no allocation. Parsing /proc/uptime
+// as a float would lose precision and require string handling for no gain.
 func readBootEpoch() (int64, error) {
-	data, err := os.ReadFile("/proc/uptime")
-	if err != nil {
-		return 0, fmt.Errorf("read /proc/uptime: %w", err)
+	var si syscall.Sysinfo_t
+	if err := syscall.Sysinfo(&si); err != nil {
+		return 0, fmt.Errorf("sysinfo: %w", err)
 	}
-
-	fields := strings.Fields(strings.TrimSpace(string(data)))
-	if len(fields) == 0 {
-		return 0, fmt.Errorf("empty /proc/uptime")
-	}
-
-	// uptime is a float like "12345.67" — we only need second precision.
-	uptime, err := strconv.ParseFloat(fields[0], 64)
-	if err != nil {
-		return 0, fmt.Errorf("parse uptime %q: %w", fields[0], err)
-	}
-
-	// Use a single time.Now() call to avoid drift between the
-	// uptime read and the wall clock read.
-	nowUnix := nowUnixSeconds()
-	return nowUnix - int64(uptime), nil
-}
-
-func nowUnixSeconds() int64 {
-	return time.Now().Unix()
+	// Subtract in a single expression to minimise the window between
+	// the syscall and the wall clock read.
+	return time.Now().Unix() - si.Uptime, nil
 }

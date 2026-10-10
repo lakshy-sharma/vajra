@@ -1,3 +1,4 @@
+// ui/frontend/src/pages/Detections.tsx
 import { useEffect, useState } from 'react'
 import { GetDetections } from '../wails'
 import Pagination from '../components/Pagination'
@@ -19,7 +20,7 @@ interface DetectionRow {
   notes: string
 }
 
-interface Page {
+interface PageResult {
   items: DetectionRow[]
   totalCount: number
   page: number
@@ -34,8 +35,30 @@ interface Filters {
 
 const SEVERITIES = ['', 'CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'CLEAN']
 const STATUSES   = ['', 'NEW', 'IN_PROGRESS', 'RESOLVED', 'IGNORED']
-const SOURCES    = ['', 'yara', 'secrets', 'network', 'memory']
-const PER_PAGE   = 50
+
+// UI9: actual source strings produced by the daemon's FindingWriter.
+// Each value matches the Source constants in internal/findings/finding.go.
+const SOURCES = [
+  '',
+  'file_scanner',
+  'process_scanner',
+  'dup_watcher',
+  'autorun_scanner',
+  'secrets_scanner',
+  'full_scan',
+]
+
+const SOURCE_LABELS: Record<string, string> = {
+  '':                'All sources',
+  'file_scanner':    'File scanner',
+  'process_scanner': 'Process scanner',
+  'dup_watcher':     'Dup watcher',
+  'autorun_scanner': 'Autorun scanner',
+  'secrets_scanner': 'Secrets scanner',
+  'full_scan':       'Full scan',
+}
+
+const PER_PAGE = 50
 
 function fmtTime(unix: number) {
   if (!unix) return '—'
@@ -44,7 +67,7 @@ function fmtTime(unix: number) {
 
 export default function Detections() {
   const [page, setPage] = useState(1)
-  const [data, setData] = useState<Page | null>(null)
+  const [data, setData] = useState<PageResult | null>(null)
   const [filters, setFilters] = useState<Filters>({ severity: '', status: '', source: '' })
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -70,30 +93,54 @@ export default function Detections() {
         className="flex items-center gap-3 px-6 py-3 border-b shrink-0"
         style={{ borderColor: 'rgb(var(--border))' }}
       >
-        <h1 className="text-base font-semibold mr-auto">Detections</h1>
+        <h1 className="text-base font-semibold mr-auto" style={{ color: 'rgb(var(--fg))' }}>
+          Detections
+        </h1>
 
-        {/* Filters */}
-        {([
-          ['severity', SEVERITIES],
-          ['status',   STATUSES],
-          ['source',   SOURCES],
-        ] as [keyof Filters, string[]][]).map(([key, opts]) => (
-          <select
-            key={key}
-            value={filters[key]}
-            onChange={e => setFilter(key, e.target.value)}
-            className="text-xs rounded-md px-2 py-1.5 border outline-none"
-            style={{
-              background: 'rgb(var(--surface))',
-              borderColor: 'rgb(var(--border))',
-              color: filters[key] ? 'rgb(var(--fg))' : 'rgb(var(--muted))',
-            }}
-          >
-            {opts.map(o => (
-              <option key={o} value={o}>{o || `All ${key}s`}</option>
-            ))}
-          </select>
-        ))}
+        <select
+          value={filters.severity}
+          onChange={e => setFilter('severity', e.target.value)}
+          className="text-xs rounded-md px-2 py-1.5 border outline-none"
+          style={{
+            background: 'rgb(var(--surface))',
+            borderColor: 'rgb(var(--border))',
+            color: filters.severity ? 'rgb(var(--fg))' : 'rgb(var(--muted))',
+          }}
+        >
+          {SEVERITIES.map(o => (
+            <option key={o} value={o}>{o || 'All severities'}</option>
+          ))}
+        </select>
+
+        <select
+          value={filters.status}
+          onChange={e => setFilter('status', e.target.value)}
+          className="text-xs rounded-md px-2 py-1.5 border outline-none"
+          style={{
+            background: 'rgb(var(--surface))',
+            borderColor: 'rgb(var(--border))',
+            color: filters.status ? 'rgb(var(--fg))' : 'rgb(var(--muted))',
+          }}
+        >
+          {STATUSES.map(o => (
+            <option key={o} value={o}>{o || 'All statuses'}</option>
+          ))}
+        </select>
+
+        <select
+          value={filters.source}
+          onChange={e => setFilter('source', e.target.value)}
+          className="text-xs rounded-md px-2 py-1.5 border outline-none"
+          style={{
+            background: 'rgb(var(--surface))',
+            borderColor: 'rgb(var(--border))',
+            color: filters.source ? 'rgb(var(--fg))' : 'rgb(var(--muted))',
+          }}
+        >
+          {SOURCES.map(o => (
+            <option key={o} value={o}>{SOURCE_LABELS[o]}</option>
+          ))}
+        </select>
       </div>
 
       {error && (
@@ -111,8 +158,11 @@ export default function Detections() {
               style={{ background: 'rgb(var(--surface-2))', color: 'rgb(var(--muted))' }}
             >
               {['Time', 'Severity', 'Status', 'Source', 'Process', 'Target / Rule', 'Count'].map(h => (
-                <th key={h} className="px-4 py-2 font-medium border-b whitespace-nowrap"
-                    style={{ borderColor: 'rgb(var(--border))' }}>
+                <th
+                  key={h}
+                  className="px-4 py-2 font-medium border-b whitespace-nowrap"
+                  style={{ borderColor: 'rgb(var(--border))' }}
+                >
                   {h}
                 </th>
               ))}
@@ -129,28 +179,46 @@ export default function Detections() {
             {!loading && data?.items.map(row => (
               <tr
                 key={row.id}
-                className="border-b transition-colors hover:bg-[rgb(var(--surface-2)/0.5)]"
+                className="border-b transition-colors"
                 style={{ borderColor: 'rgb(var(--border))' }}
+                onMouseEnter={e => (e.currentTarget.style.background = 'rgb(var(--surface-2))')}
+                onMouseLeave={e => (e.currentTarget.style.background = '')}
               >
-                <td className="px-4 py-2 whitespace-nowrap tabular-nums">{fmtTime(row.detectionTime)}</td>
-                <td className="px-4 py-2"><SeverityBadge severity={row.severity} /></td>
+                <td className="px-4 py-2 whitespace-nowrap tabular-nums" style={{ color: 'rgb(var(--fg))' }}>
+                  {fmtTime(row.detectionTime)}
+                </td>
+                <td className="px-4 py-2">
+                  <SeverityBadge severity={row.severity} />
+                </td>
                 <td className="px-4 py-2 whitespace-nowrap" style={{ color: 'rgb(var(--muted))' }}>
                   {row.status}
                 </td>
-                <td className="px-4 py-2 whitespace-nowrap">{row.source}</td>
+                <td className="px-4 py-2 whitespace-nowrap" style={{ color: 'rgb(var(--fg))' }}>
+                  {SOURCE_LABELS[row.source] ?? row.source}
+                </td>
                 <td className="px-4 py-2">
-                  <div className="font-medium">{row.processName || '—'}</div>
-                  <div className="truncate max-w-[200px]" style={{ color: 'rgb(var(--muted))' }} title={row.exePath}>
+                  <div className="font-medium" style={{ color: 'rgb(var(--fg))' }}>{row.processName || '—'}</div>
+                  <div
+                    className="truncate max-w-[200px]"
+                    style={{ color: 'rgb(var(--muted))' }}
+                    title={row.exePath}
+                  >
                     {row.exePath}
                   </div>
                 </td>
                 <td className="px-4 py-2">
-                  <div className="truncate max-w-[220px]" title={row.targetPath}>{row.targetPath || '—'}</div>
+                  <div className="truncate max-w-[220px]" style={{ color: 'rgb(var(--fg))' }} title={row.targetPath}>
+                    {row.targetPath || '—'}
+                  </div>
                   {row.ruleId && (
-                    <div className="text-[10px]" style={{ color: 'rgb(var(--muted))' }}>{row.ruleId}</div>
+                    <div className="text-[10px] font-mono" style={{ color: 'rgb(var(--muted))' }}>
+                      {row.ruleId}
+                    </div>
                   )}
                 </td>
-                <td className="px-4 py-2 tabular-nums text-right">{row.dedupCount || 1}</td>
+                <td className="px-4 py-2 tabular-nums text-right" style={{ color: 'rgb(var(--fg))' }}>
+                  {row.dedupCount || 1}
+                </td>
               </tr>
             ))}
             {!loading && !data?.items?.length && (

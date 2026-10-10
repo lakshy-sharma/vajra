@@ -28,22 +28,54 @@ func main() {
 
 	app := NewApp(cfgPath)
 
+	// UI5: derive window background from the configured theme so the native
+	// window colour matches what the HTML will render — prevents a flash of
+	// mismatched colour between the OS window draw and the first HTML paint.
+	// The blocking <script> in index.html also sets data-theme before the
+	// bundle loads; this just makes the window chrome consistent.
+	bgColour := &options.RGBA{R: 10, G: 10, B: 10, A: 255} // dark default
+
+	// UI6: read window dimensions from config.
+	width, height := 1280, 800
+	minWidth, minHeight := 900, 600
+
+	if app.cfg != nil {
+		ui := app.cfg.UISettings
+		switch ui.DefaultTheme {
+		case "light":
+			bgColour = &options.RGBA{R: 255, G: 255, B: 255, A: 255}
+			// "dark" and "system" both use the dark background above — for "system"
+			// the blocking script in index.html corrects it before first paint.
+		}
+		if ui.WindowWidth > 0 {
+			width = ui.WindowWidth
+		}
+		if ui.WindowHeight > 0 {
+			height = ui.WindowHeight
+		}
+		if ui.MinWindowWidth > 0 {
+			minWidth = ui.MinWindowWidth
+		}
+		if ui.MinWindowHeight > 0 {
+			minHeight = ui.MinWindowHeight
+		}
+	}
+
 	err := wails.Run(&options.App{
-		Title:  "Vajra EDR",
-		Width:  1280,
-		Height: 800,
+		Title:            "Vajra EDR",
+		Width:            width,
+		Height:           height,
+		MinWidth:         minWidth,  // UI6
+		MinHeight:        minHeight, // UI6
+		BackgroundColour: bgColour,  // UI5
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},
-		BackgroundColour: &options.RGBA{R: 18, G: 18, B: 18, A: 1},
-		OnStartup:        app.startup,
-		OnShutdown:       app.shutdown,
-		Bind:             []interface{}{app},
-		LogLevel:         logger.WARNING,
+		OnStartup:  app.startup,
+		OnShutdown: app.shutdown,
+		Bind:       []interface{}{app},
+		LogLevel:   logger.WARNING,
 		Linux: &linux.Options{
-			// Use the system WebKit; ships with most distros via libwebkit2gtk.
-			// WindowIsTranslucent is false — solid background avoids compositor
-			// artefacts on compositors that don't support alpha on app windows.
 			ProgramName:         "vajra-ui",
 			Icon:                nil,
 			WindowIsTranslucent: false,

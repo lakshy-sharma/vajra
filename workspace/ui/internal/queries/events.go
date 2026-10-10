@@ -24,13 +24,19 @@ type SecurityEventRow struct {
 }
 
 func (q *Queries) SecurityEvents(page, perPage int) ([]SecurityEventRow, int64, error) {
+	tx, err := q.db.BeginTx(bg(), nil)
+	if err != nil {
+		return nil, 0, fmt.Errorf("security_events.begin: %w", err)
+	}
+	defer tx.Rollback()
+
 	var total int64
-	if err := q.db.SQL().QueryRow("SELECT COUNT(*) FROM security_events").Scan(&total); err != nil {
+	if err := tx.QueryRowContext(bg(), "SELECT COUNT(*) FROM security_events").Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("security_events.count: %w", err)
 	}
 
 	offset := (page - 1) * perPage
-	rows, err := q.db.SQL().Query(`
+	rows, err := tx.QueryContext(bg(), `
 		SELECT id, event_time, event_type, event_name, pid, uid,
 		       process_name, target_path, details, severity, status
 		FROM security_events
@@ -75,13 +81,19 @@ type NetworkEventRow struct {
 }
 
 func (q *Queries) NetworkEvents(page, perPage int) ([]NetworkEventRow, int64, error) {
+	tx, err := q.db.BeginTx(bg(), nil)
+	if err != nil {
+		return nil, 0, fmt.Errorf("network_events.begin: %w", err)
+	}
+	defer tx.Rollback()
+
 	var total int64
-	if err := q.db.SQL().QueryRow("SELECT COUNT(*) FROM network_events").Scan(&total); err != nil {
+	if err := tx.QueryRowContext(bg(), "SELECT COUNT(*) FROM network_events").Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("network_events.count: %w", err)
 	}
 
 	offset := (page - 1) * perPage
-	rows, err := q.db.SQL().Query(`
+	rows, err := tx.QueryContext(bg(), `
 		SELECT id, event_time, event_type, pid, uid,
 		       process_name, src_addr, dst_addr, src_port, dst_port,
 		       protocol, severity, status
@@ -126,13 +138,19 @@ type MemoryEventRow struct {
 }
 
 func (q *Queries) MemoryEvents(page, perPage int) ([]MemoryEventRow, int64, error) {
+	tx, err := q.db.BeginTx(bg(), nil)
+	if err != nil {
+		return nil, 0, fmt.Errorf("memory_events.begin: %w", err)
+	}
+	defer tx.Rollback()
+
 	var total int64
-	if err := q.db.SQL().QueryRow("SELECT COUNT(*) FROM memory_events").Scan(&total); err != nil {
+	if err := tx.QueryRowContext(bg(), "SELECT COUNT(*) FROM memory_events").Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("memory_events.count: %w", err)
 	}
 
 	offset := (page - 1) * perPage
-	rows, err := q.db.SQL().Query(`
+	rows, err := tx.QueryContext(bg(), `
 		SELECT id, event_time, event_type, pid, uid,
 		       process_name, address, length, protection, file_path,
 		       severity, status

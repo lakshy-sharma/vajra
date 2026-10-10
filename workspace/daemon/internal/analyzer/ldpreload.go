@@ -16,32 +16,29 @@ import (
 	"strings"
 
 	"github.com/rs/zerolog"
+	"vajra/internal/utilities"
+	sharedconfig "vajra/shared/config"
 	"vajra/shared/models"
 )
 
-// standardLibPaths are the directories LD_PRELOAD and LD_LIBRARY_PATH
-// entries must reside in to be considered legitimate.
-var standardLibPaths = []string{
-	"/lib",
-	"/lib64",
-	"/usr/lib",
-	"/usr/lib64",
-	"/usr/local/lib",
-	"/usr/local/lib64",
-	"/snap/",
-	"/var/lib/snapd/",
-}
-
 // LDPreloadAnalyzer checks /proc/PID/environ for LD_PRELOAD or
-// LD_LIBRARY_PATH entries pointing outside standard library paths.
-// Catches runtime injection that the autorun scanner misses because
-// autorun only checks /etc/ld.so.preload at rest.
+// LD_LIBRARY_PATH entries pointing outside the operator-configured
+// trusted library path whitelist.
+//
+// A whitelist is the correct model here: the set of legitimate library
+// directories is small and stable, while the set of attacker-controlled
+// paths (tmpfs, /dev/shm, home directories, arbitrary overlays) is
+// unbounded and grows with each new technique.
 type LDPreloadAnalyzer struct {
-	logger *zerolog.Logger
+	logger       *zerolog.Logger
+	trustedPaths []string // from AlertPolicySettings.TrustedLDPaths
 }
 
-func NewLDPreloadAnalyzer(logger *zerolog.Logger) *LDPreloadAnalyzer {
-	return &LDPreloadAnalyzer{logger: logger}
+func NewLDPreloadAnalyzer(logger *zerolog.Logger, policy sharedconfig.AlertPolicySettings) *LDPreloadAnalyzer {
+	return &LDPreloadAnalyzer{
+		logger:       logger,
+		trustedPaths: policy.TrustedLDPaths,
+	}
 }
 
 func (a *LDPreloadAnalyzer) Name() string { return "ldpreload" }
@@ -59,7 +56,7 @@ func (a *LDPreloadAnalyzer) Analyze(ctx context.Context, path string) (Result, e
 	}
 
 	sc := bufio.NewScanner(bytes.NewReader(data))
-	sc.Split(splitOnNull)
+	sc.Split(utilities.NullScanner)
 
 	var findings []string
 	for sc.Scan() {
@@ -74,7 +71,7 @@ func (a *LDPreloadAnalyzer) Analyze(ctx context.Context, path string) (Result, e
 		}
 		for _, libPath := range strings.Split(value, ":") {
 			libPath = strings.TrimSpace(libPath)
-			if libPath == "" || isStandardLibPath(libPath) {
+			if libPath == "" || a.isTrusted(libPath) {
 				continue
 			}
 			findings = append(findings, fmt.Sprintf("%s=%s", key, libPath))
@@ -83,7 +80,7 @@ func (a *LDPreloadAnalyzer) Analyze(ctx context.Context, path string) (Result, e
 				Str("exe", path).
 				Str("key", key).
 				Str("value", libPath).
-				Msg("ldpreload: non-standard library path")
+				Msg("ldpreload: library path outside trusted whitelist")
 		}
 	}
 
@@ -96,25 +93,13 @@ func (a *LDPreloadAnalyzer) Analyze(ctx context.Context, path string) (Result, e
 	}, nil
 }
 
-func isStandardLibPath(p string) bool {
-	for _, std := range standardLibPaths {
-		if strings.HasPrefix(p, std) {
+// isTrusted reports whether libPath begins with a known-good library
+// directory. Uses utilities.HasPathPrefix to prevent /usr/lib.evil matching /usr/lib.
+func (a *LDPreloadAnalyzer) isTrusted(libPath string) bool {
+	for _, trusted := range a.trustedPaths {
+		if utilities.HasPathPrefix(libPath, trusted) {
 			return true
 		}
 	}
 	return false
-}
-
-// splitOnNull is a bufio.SplitFunc for null-delimited /proc/PID/environ.
-func splitOnNull(data []byte, atEOF bool) (advance int, token []byte, err error) {
-	if atEOF && len(data) == 0 {
-		return 0, nil, nil
-	}
-	if i := bytes.IndexByte(data, 0); i >= 0 {
-		return i + 1, data[:i], nil
-	}
-	if atEOF {
-		return len(data), data, nil
-	}
-	return 0, nil, nil
 }

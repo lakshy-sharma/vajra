@@ -38,11 +38,9 @@ type dupDedupEntry struct {
 }
 
 // DupWatcher detects reverse shells by watching dup2/dup3 onto stdio.
-// Writes through FindingWriter to detections — not to security_events.
-// Reverse shell is a detection, not raw telemetry.
-//
-// No process name filtering — any process redirecting a network socket
-// onto fd 0/1/2 is suspicious regardless of comm.
+// Writes through FindingWriter — reverse shell is a detection, not raw telemetry.
+// No process name filtering: any process redirecting a network socket onto
+// fd 0/1/2 is suspicious regardless of comm.
 type DupWatcher struct {
 	logger  *zerolog.Logger
 	writer  *findings.FindingWriter
@@ -93,7 +91,7 @@ func (dw *DupWatcher) handle(ctx context.Context, event ebpf.DupEvent, dedup map
 
 	target, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/%d", event.PID, event.OldFd))
 	if err != nil {
-		// Process exited before check — not unusual.
+		// Process exited before check — not unusual under heavy load.
 		return
 	}
 
@@ -102,7 +100,6 @@ func (dw *DupWatcher) handle(ctx context.Context, event ebpf.DupEvent, dedup map
 		return
 	}
 
-	// Dedup before the /proc/net read — most dup2 calls are not sockets.
 	key := dupDedupKey{pid: event.PID, inode: inode}
 	now := time.Now()
 	if entry, seen := dedup[key]; seen && now.Sub(entry.lastSeen) < dupDedupWindow {
@@ -119,7 +116,7 @@ func (dw *DupWatcher) handle(ctx context.Context, event ebpf.DupEvent, dedup map
 
 	conn, found := netSockets[inode]
 	if !found {
-		// Not an inet socket — AF_UNIX and pipes correctly excluded
+		// Not an inet socket — AF_UNIX and pipes are correctly excluded
 		// because their inodes never appear in /proc/net/tcp* or udp*.
 		return
 	}
@@ -144,11 +141,15 @@ func (dw *DupWatcher) handle(ctx context.Context, event ebpf.DupEvent, dedup map
 		UID:         event.UID,
 		ProcessName: comm,
 		RuleID:      "reverse_shell",
-		Notes:       fmt.Sprintf("reverse_shell: comm=%s %s→%s(inode=%d,remote=%s:%d)", comm, fdLabel, conn.proto, inode, conn.remoteAddr, conn.remotePort),
+		// W1: ASCII only in machine-written strings
+		Notes:       fmt.Sprintf("reverse_shell: comm=%s %s->%s inode=%d remote=%s:%d", comm, fdLabel, conn.proto, inode, conn.remoteAddr, conn.remotePort),
 		RemoteAddr:  conn.remoteAddr,
 		RemotePort:  conn.remotePort,
 		Protocol:    conn.proto,
 		SocketInode: inode,
+		// W2: copy fd fields from the dup event
+		OldFd: int32(event.OldFd),
+		NewFd: int32(event.NewFd),
 	}
 
 	if _, err := dw.writer.Write(ctx, f); err != nil {
@@ -177,8 +178,12 @@ func parseSocketInode(target string) (uint64, bool) {
 	return inode, true
 }
 
+// readNetSockets parses all /proc/net/{tcp,tcp6,udp,udp6} files into a map
+// keyed by inode. Returns an error only when no file could be read at all —
+// missing ipv6 files are expected on kernels without ipv6 support.
 func readNetSockets() (map[uint64]netConn, error) {
 	result := make(map[uint64]netConn)
+	var lastErr error
 	for _, entry := range []struct {
 		path  string
 		proto string
@@ -189,7 +194,14 @@ func readNetSockets() (map[uint64]netConn, error) {
 		{"/proc/net/udp", "udp", false},
 		{"/proc/net/udp6", "udp6", true},
 	} {
-		_ = parseNetFile(entry.path, entry.proto, entry.ipv6, result)
+		if err := parseNetFile(entry.path, entry.proto, entry.ipv6, result); err != nil {
+			lastErr = err
+		}
+	}
+	// Only surface an error when we got nothing — a subset of failures is
+	// expected (ipv6 absent, permission, etc).
+	if len(result) == 0 && lastErr != nil {
+		return nil, lastErr
 	}
 	return result, nil
 }

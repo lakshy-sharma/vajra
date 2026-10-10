@@ -1,6 +1,6 @@
 // cmd/rules.go
 //
-// Copyright © 2025 Lakshy Sharma lakshy.d.sharma@gmail.com
+// Copyright © 2026 Lakshy Sharma lakshy.d.sharma@gmail.com
 // AGPL-3.0 License
 
 package cmd
@@ -8,6 +8,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+
 	"vajra/internal/job"
 	"vajra/internal/utilities"
 
@@ -16,14 +17,12 @@ import (
 	sharedconfig "vajra/shared/config"
 )
 
-// rulesCmd is the parent command for rule management operations.
 var rulesCmd = &cobra.Command{
 	Use:   "rules",
 	Short: "Manage YARA rules",
 	Long:  "Commands for managing the YARA ruleset used by Vajra.",
 }
 
-// rulesUpdateCmd triggers an immediate rule sync cycle.
 var rulesUpdateCmd = &cobra.Command{
 	Use:   "update",
 	Short: "Check for and download updated YARA rules",
@@ -34,27 +33,30 @@ archives the current rules, and restarts the agent via systemd.
 Safe to run while the agent is running — the agent will be
 restarted automatically after a successful update.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		// J10: read the persistent flag via cmd.Flags() — no local configPath
+		// variable that could shadow the flag value set by the root command.
 		configPath, _ := cmd.Flags().GetString("config")
 		cfg, err := sharedconfig.LoadConfig(configPath)
 		if err != nil {
 			return fmt.Errorf("rules update: load config: %w", err)
 		}
 
-		logger := utilities.GetLogger(&cfg)
-		syncer := job.NewRuleSyncer(logger, cfg.RulesSettings)
+		logger, err := utilities.GetLogger(&cfg)
+		if err != nil {
+			return fmt.Errorf("rules update: setup logger: %w", err)
+		}
 
+		syncer := job.NewRuleSyncer(logger, cfg.RulesSettings)
 		fmt.Println("Checking for rule updates...")
 		if err := syncer.RunOnce(); err != nil {
 			fmt.Fprintf(os.Stderr, "Rule update failed: %v\n", err)
 			return err
 		}
-
 		fmt.Println("Rule sync complete.")
 		return nil
 	},
 }
 
-// rulesStatusCmd shows the current rules state.
 var rulesStatusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show current rules status",
@@ -66,10 +68,12 @@ var rulesStatusCmd = &cobra.Command{
 			return fmt.Errorf("rules status: load config: %w", err)
 		}
 
-		// Hash the current rules file.
-		logger := utilities.GetLogger(&cfg)
-		syncer := job.NewRuleSyncer(logger, cfg.RulesSettings)
+		logger, err := utilities.GetLogger(&cfg)
+		if err != nil {
+			return fmt.Errorf("rules status: setup logger: %w", err)
+		}
 
+		syncer := job.NewRuleSyncer(logger, cfg.RulesSettings)
 		hash, err := syncer.LocalHash()
 		if err != nil {
 			fmt.Printf("Rules file : %s\n", cfg.RulesSettings.RulesFilepath)
@@ -79,7 +83,6 @@ var rulesStatusCmd = &cobra.Command{
 			fmt.Printf("Hash       : %s\n", hash)
 		}
 
-		// Count archives.
 		entries, err := os.ReadDir(cfg.RulesSettings.RulesArchiveDir)
 		if err != nil {
 			fmt.Printf("Archives   : unavailable (%v)\n", err)
@@ -93,7 +96,6 @@ var rulesStatusCmd = &cobra.Command{
 			fmt.Printf("Archives   : %d / %d\n", count, cfg.RulesSettings.RulesArchiveCount)
 			fmt.Printf("Archive dir: %s\n", cfg.RulesSettings.RulesArchiveDir)
 		}
-
 		return nil
 	},
 }

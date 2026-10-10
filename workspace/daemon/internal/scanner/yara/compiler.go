@@ -19,16 +19,27 @@ import (
 )
 
 // Compiler handles extraction and compilation of YARA rule bundles.
+// maxFileSizeBytes caps individual rule file sizes during extraction
+// to prevent zip bomb expansion.
 type Compiler struct {
-	logger *zerolog.Logger
+	logger           *zerolog.Logger
+	maxFileSizeBytes int64
 }
 
-func NewCompiler(logger *zerolog.Logger) *Compiler {
-	return &Compiler{logger: logger}
+func NewCompiler(logger *zerolog.Logger, maxFileSizeBytes int64) *Compiler {
+	if maxFileSizeBytes <= 0 {
+		maxFileSizeBytes = 100 * 1024 * 1024 // 100 MiB safe default
+	}
+	return &Compiler{logger: logger, maxFileSizeBytes: maxFileSizeBytes}
 }
 
-// ExtractRules unzips a rules bundle into extractionPath,
-// guarding against path traversal.
+// ExtractRules unzips a rules bundle into extractionPath.
+// E9: removes stale files before extracting so rules deleted from a new
+// bundle do not persist into the next compilation pass. The directory is
+// cleaned AFTER the zip is confirmed readable to avoid wiping good rules
+// on a corrupted download.
+// E10: individual files are capped at maxFileSizeBytes via io.LimitReader
+// to prevent a crafted zip from expanding unboundedly.
 func (c *Compiler) ExtractRules(zipPath, extractionPath string) error {
 	c.logger.Info().Str("zip", zipPath).Str("dest", extractionPath).Msg("extracting YARA rules")
 
@@ -37,6 +48,12 @@ func (c *Compiler) ExtractRules(zipPath, extractionPath string) error {
 		return fmt.Errorf("yara: extract: open zip: %w", err)
 	}
 	defer r.Close()
+
+	// E9: clean after verifying the zip is valid — avoids deleting good rules
+	// if the downloaded archive is corrupt.
+	if err := os.RemoveAll(extractionPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("yara: extract: clean old rules: %w", err)
+	}
 
 	if err := os.MkdirAll(extractionPath, 0o755); err != nil {
 		return fmt.Errorf("yara: extract: mkdir: %w", err)
@@ -57,7 +74,7 @@ func (c *Compiler) ExtractRules(zipPath, extractionPath string) error {
 		if err := os.MkdirAll(filepath.Dir(fpath), 0o755); err != nil {
 			return fmt.Errorf("yara: extract: mkdir parent: %w", err)
 		}
-		if err := writeZipEntry(f, fpath); err != nil {
+		if err := c.writeZipEntry(f, fpath); err != nil {
 			return err
 		}
 		extracted++
@@ -67,8 +84,8 @@ func (c *Compiler) ExtractRules(zipPath, extractionPath string) error {
 	return nil
 }
 
-// CompileRules walks rulesDir and compiles all .yar/.yara files
-// into a single *goyara.Rules object. Bad rules are skipped, not fatal.
+// CompileRules walks rulesDir and compiles all .yar/.yara files.
+// Bad rules are skipped, not fatal.
 func (c *Compiler) CompileRules(rulesDir string) (*goyara.Rules, error) {
 	compiler, err := goyara.NewCompiler()
 	if err != nil {
@@ -91,11 +108,13 @@ func (c *Compiler) CompileRules(rulesDir string) (*goyara.Rules, error) {
 			skipped++
 			return nil
 		}
-		if !c.validateRule(string(content), path) {
+		// E11: convert once — was calling string(content) twice (validate + AddString).
+		ruleStr := string(content)
+		if !c.validateRule(ruleStr, path) {
 			skipped++
 			return nil
 		}
-		if err := compiler.AddString(string(content), path); err != nil {
+		if err := compiler.AddString(ruleStr, path); err != nil {
 			c.logger.Error().Err(err).Str("file", path).Msg("unexpected compile error after validation")
 			skipped++
 			return nil
@@ -116,8 +135,6 @@ func (c *Compiler) CompileRules(rulesDir string) (*goyara.Rules, error) {
 	return rules, nil
 }
 
-// validateRule compiles a rule in an isolated throwaway compiler.
-// A syntax error must never corrupt the main compiler state.
 func (c *Compiler) validateRule(content, path string) bool {
 	check, err := goyara.NewCompiler()
 	if err != nil {
@@ -131,18 +148,23 @@ func (c *Compiler) validateRule(content, path string) bool {
 	return true
 }
 
-func writeZipEntry(f *zip.File, dest string) error {
+// writeZipEntry extracts one zip entry to dest.
+// E10: io.LimitReader caps extraction size at maxFileSizeBytes to prevent
+// a zip bomb from filling the filesystem.
+func (c *Compiler) writeZipEntry(f *zip.File, dest string) error {
 	out, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
 	if err != nil {
 		return fmt.Errorf("yara: write entry: create: %w", err)
 	}
 	defer out.Close()
+
 	in, err := f.Open()
 	if err != nil {
 		return fmt.Errorf("yara: write entry: open: %w", err)
 	}
 	defer in.Close()
-	if _, err := io.Copy(out, in); err != nil {
+
+	if _, err := io.Copy(out, io.LimitReader(in, c.maxFileSizeBytes)); err != nil {
 		return fmt.Errorf("yara: write entry: copy: %w", err)
 	}
 	return nil

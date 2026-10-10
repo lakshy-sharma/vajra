@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"golang.org/x/sync/errgroup"
 	"vajra/internal/db/queries"
 	"vajra/internal/findings"
 	"vajra/internal/utilities"
@@ -26,13 +27,14 @@ type Source interface {
 // Scanner orchestrates all persistence sources, diffs against DB state,
 // and writes new or removed entries through FindingWriter.
 type Scanner struct {
-	logger   *zerolog.Logger
-	autorunQ *queries.AutorunQueries
-	writer   *findings.FindingWriter
-	sysInfo  utilities.SystemInfo
-	interval time.Duration
-	mu       sync.RWMutex
-	state    map[string]*models.AutorunEntry
+	logger      *zerolog.Logger
+	autorunQ    *queries.AutorunQueries
+	writer      *findings.FindingWriter
+	sysInfo     utilities.SystemInfo
+	interval    time.Duration
+	concurrency int // W21: caps goroutines per scan pass
+	mu          sync.RWMutex
+	state       map[string]*models.AutorunEntry
 }
 
 func NewScanner(
@@ -41,17 +43,22 @@ func NewScanner(
 	writer *findings.FindingWriter,
 	sysInfo utilities.SystemInfo,
 	intervalMin int,
+	concurrency int,
 ) *Scanner {
 	if intervalMin <= 0 {
 		intervalMin = 30
 	}
+	if concurrency <= 0 {
+		concurrency = 2
+	}
 	return &Scanner{
-		logger:   logger,
-		autorunQ: autorunQ,
-		writer:   writer,
-		sysInfo:  sysInfo,
-		interval: time.Duration(intervalMin) * time.Minute,
-		state:    make(map[string]*models.AutorunEntry),
+		logger:      logger,
+		autorunQ:    autorunQ,
+		writer:      writer,
+		sysInfo:     sysInfo,
+		interval:    time.Duration(intervalMin) * time.Minute,
+		concurrency: concurrency,
+		state:       make(map[string]*models.AutorunEntry),
 	}
 }
 
@@ -60,7 +67,7 @@ func (s *Scanner) Name() string { return "autorun_scanner" }
 func (s *Scanner) Run(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	if err := s.loadState(); err != nil {
+	if err := s.loadState(ctx); err != nil {
 		s.logger.Error().Err(err).Msg("autorun: failed to load initial state")
 	}
 
@@ -81,7 +88,7 @@ func (s *Scanner) Run(ctx context.Context, wg *sync.WaitGroup) {
 }
 
 func (s *Scanner) runOnce(ctx context.Context) {
-	entries, err := s.scan()
+	entries, err := s.scan(ctx)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("autorun: scan failed")
 		return
@@ -89,11 +96,11 @@ func (s *Scanner) runOnce(ctx context.Context) {
 	s.diff(ctx, entries)
 }
 
-func (s *Scanner) loadState() error {
+func (s *Scanner) loadState(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	entries, err := s.autorunQ.LoadActive()
+	entries, err := s.autorunQ.LoadActive(ctx)
 	if err != nil {
 		return err
 	}
@@ -105,32 +112,36 @@ func (s *Scanner) loadState() error {
 	return nil
 }
 
-func (s *Scanner) scan() ([]*models.AutorunEntry, error) {
-	sources := GetSources()
+// scan collects entries from all sources with bounded concurrency.
+// W21: replaced unbounded goroutine-per-source with errgroup + semaphore.
+func (s *Scanner) scan(ctx context.Context) ([]*models.AutorunEntry, error) {
+	srcs := GetSources()
 
-	var (
-		mu  sync.Mutex
-		all []*models.AutorunEntry
-		wg  sync.WaitGroup
-	)
+	var mu sync.Mutex
+	var all []*models.AutorunEntry
 
-	for _, src := range sources {
+	g, _ := errgroup.WithContext(ctx)
+	sem := make(chan struct{}, s.concurrency)
+
+	for _, src := range srcs {
 		src := src
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		g.Go(func() error {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
 			entries, err := src.Collect()
 			if err != nil {
 				s.logger.Error().Err(err).Str("source", src.Name()).Msg("autorun: source error")
-				return
+				return nil // non-fatal — one failing source must not abort others
 			}
 			mu.Lock()
 			all = append(all, entries...)
 			mu.Unlock()
-		}()
+			return nil
+		})
 	}
 
-	wg.Wait()
+	_ = g.Wait()
 	s.logger.Info().Int("entries", len(all)).Msg("autorun: scan complete")
 	return all, nil
 }
@@ -146,10 +157,9 @@ func (s *Scanner) diff(ctx context.Context, fresh []*models.AutorunEntry) {
 		freshMap[e.UniqueKey()] = e
 	}
 
-	// Mark removed entries inactive.
 	for key, old := range s.state {
 		if _, exists := freshMap[key]; !exists {
-			if err := s.autorunQ.MarkInactive(old, now); err != nil {
+			if err := s.autorunQ.MarkInactive(ctx, old, now); err != nil {
 				s.logger.Error().Err(err).Str("key", key).Msg("autorun: mark inactive failed")
 				continue
 			}
@@ -162,19 +172,17 @@ func (s *Scanner) diff(ctx context.Context, fresh []*models.AutorunEntry) {
 		}
 	}
 
-	// Insert new entries, bump last_seen for existing ones.
 	for key, e := range freshMap {
 		if _, exists := s.state[key]; !exists {
 			e.FirstSeen = now
 			e.LastSeen = now
 			e.IsActive = true
 
-			if err := s.autorunQ.Insert(e); err != nil {
+			if err := s.autorunQ.Insert(ctx, e, now); err != nil {
 				s.logger.Error().Err(err).Str("key", key).Msg("autorun: insert failed")
 				continue
 			}
 
-			// New persistence entry is a detection.
 			f := findings.Finding{
 				Source:     findings.SourceAutorunScanner,
 				Severity:   models.SeverityMedium,
@@ -202,7 +210,7 @@ func (s *Scanner) diff(ctx context.Context, fresh []*models.AutorunEntry) {
 				Msg("NEW AUTORUN DETECTED")
 			s.state[key] = e
 		} else {
-			if err := s.autorunQ.UpdateLastSeen(s.state[key], now); err != nil {
+			if err := s.autorunQ.UpdateLastSeen(ctx, s.state[key], now); err != nil {
 				s.logger.Error().Err(err).Str("key", key).Msg("autorun: update last_seen failed")
 			}
 		}

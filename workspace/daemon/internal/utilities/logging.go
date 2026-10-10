@@ -6,71 +6,54 @@
 package utilities
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path"
 
 	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 	"gopkg.in/natefinch/lumberjack.v2"
 	sharedconfig "vajra/shared/config"
 )
 
-// newRollingFile generates a rolling file lumberjack writer.
-func newRollingFile(config *sharedconfig.Config) io.Writer {
-	if err := os.MkdirAll(config.Logging.Directory, 0o744); err != nil {
-		log.Error().Err(err).Str("path", config.Logging.Directory).Msg("can't create log directory")
-		return nil
+// newRollingFile creates the log directory and returns a rotating file writer.
+// Returns an error rather than nil so callers cannot silently lose log output.
+func newRollingFile(cfg *sharedconfig.Config) (io.Writer, error) {
+	// 0o700 — log files contain detection data; no group/other read.
+	if err := os.MkdirAll(cfg.LogSettings.Directory, 0o700); err != nil {
+		return nil, fmt.Errorf("logging: create log dir %s: %w", cfg.LogSettings.Directory, err)
 	}
-
 	return &lumberjack.Logger{
-		Filename:   path.Join(config.Logging.Directory, config.Logging.Filename),
-		MaxBackups: config.Logging.MaxBackups,
-		MaxSize:    config.Logging.MaxSizeMB,
-		MaxAge:     config.Logging.MaxAgeDays,
-	}
+		Filename:   path.Join(cfg.LogSettings.Directory, cfg.LogSettings.Filename),
+		MaxBackups: cfg.LogSettings.MaxBackups,
+		MaxSize:    cfg.LogSettings.MaxSizeMB,
+		MaxAge:     cfg.LogSettings.MaxAgeDays,
+		Compress:   cfg.LogSettings.Compress,
+	}, nil
 }
 
 // GetLogger returns a zerolog Logger configured from cfg.
-func GetLogger(config *sharedconfig.Config) *zerolog.Logger {
-	var writers []io.Writer
-
-	if config.Logging.EnableConsole {
-		writers = append(writers, zerolog.ConsoleWriter{Out: os.Stderr})
-	}
-	if config.Logging.EnableFileLogging {
-		writers = append(writers, newRollingFile(config))
-	}
-	mw := io.MultiWriter(writers...)
-
-	if config.Logging.LogLevel != "" {
-		level, err := zerolog.ParseLevel(config.Logging.LogLevel)
-		if err == nil {
-			zerolog.SetGlobalLevel(level)
-		} else {
-			zerolog.SetGlobalLevel(zerolog.InfoLevel)
-			log.Error().Err(err).Str("log_level", config.Logging.LogLevel).Msg("Invalid log level specified, defaulting to INFO")
-		}
-	} else {
-		zerolog.SetGlobalLevel(zerolog.InfoLevel)
+// Returns an error so callers cannot silently proceed with no log output.
+func GetLogger(cfg *sharedconfig.Config) (*zerolog.Logger, error) {
+	file, err := newRollingFile(cfg)
+	if err != nil {
+		return nil, err
 	}
 
-	if config.Logging.TimeFormat != "" {
-		zerolog.TimeFieldFormat = config.Logging.TimeFormat
-	} else {
-		zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
+	level, err := zerolog.ParseLevel(cfg.LogSettings.Level)
+	if err != nil {
+		// Unknown level strings fail loud — a misconfigured daemon must not
+		// silently drop events by defaulting to a higher level.
+		return nil, fmt.Errorf("logging: invalid level %q: %w", cfg.LogSettings.Level, err)
 	}
 
-	logger := zerolog.New(mw).With().Timestamp().Caller().Stack().Logger()
-	logger.Info().
-		Bool("file_logging", config.Logging.EnableFileLogging).
-		Bool("json_output", config.Logging.UseJSON).
-		Str("log_directory", config.Logging.Directory).
-		Str("filename", config.Logging.Filename).
-		Int("max_size_mb", config.Logging.MaxSizeMB).
-		Int("max_backups", config.Logging.MaxBackups).
-		Int("max_age_days", config.Logging.MaxAgeDays).
-		Msg("logging configured")
+	// zerolog.TimeFieldFormat is package-global state; set it once at startup.
+	// Unix epoch seconds keep log timestamps consistent with all DB and event
+	// structs in this project which also use int64 Unix epoch.
+	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 
-	return &logger
+	// Use .Level() on the instance — zerolog.SetGlobalLevel() would silently
+	// alter any other zerolog logger created in the same process.
+	logger := zerolog.New(file).Level(level).With().Timestamp().Caller().Stack().Logger()
+	return &logger, nil
 }

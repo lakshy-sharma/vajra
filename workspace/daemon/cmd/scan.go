@@ -50,7 +50,10 @@ func runScan(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("scan: load config: %w", err)
 	}
 
-	logger := utilities.GetLogger(&cfg)
+	logger, err := utilities.GetLogger(&cfg)
+	if err != nil {
+		return fmt.Errorf("scan: setup logger: %w", err)
+	}
 
 	sysInfo, err := utilities.LoadSystemInfo()
 	if err != nil {
@@ -73,7 +76,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 	defer database.Close()
 	logger.Info().Str("path", dbPath).Msg("database ready")
 
-	compiler := yara.NewCompiler(logger)
+	compiler := yara.NewCompiler(logger, cfg.ScanSettings.MaxFileSizeBytes)
 	extractDir := filepath.Join(cfg.GenericSettings.WorkDirectory, "rules-extracted")
 	if err := compiler.ExtractRules(cfg.RulesSettings.RulesFilepath, extractDir); err != nil {
 		return fmt.Errorf("scan: extract rules: %w", err)
@@ -89,14 +92,20 @@ func runScan(cmd *cobra.Command, args []string) error {
 		cfg.PerformanceSettings.MaxAllowedThreads,
 		cfg.PerformanceSettings.ScanQueueSize,
 		cfg.TimingSettings.SingleFileScanTimeoutSec,
+		cfg.ScanSettings.YaraSnapshotBytes,
 		logger,
 	)
 	defer pool.Stop()
 
-	cache := analyzer.NewResultCache()
+	cache, err := analyzer.NewResultCache(cfg.PerformanceSettings.ResultCacheSize)
+	if err != nil {
+		return fmt.Errorf("scan: create result cache: %w", err)
+	}
+
 	pipeline := analyzer.NewPipeline(
 		[]analyzer.Analyzer{analyzer.NewYARAAnalyzer(pool, logger)},
 		analyzer.WithCache(cache),
+		analyzer.WithLogger(logger),
 	)
 
 	filter := utilities.NewExclusionFilter(&cfg)
@@ -120,6 +129,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 	go func() {
 		<-sigCh
 		fmt.Println("\nscan interrupted, finishing current file...")
@@ -138,6 +148,8 @@ func runScan(cmd *cobra.Command, args []string) error {
 		fw,
 		sysInfo,
 		logger,
+		cfg.ScanSettings.MaxFileSizeBytes,
+		cfg.AlertPolicy.Interpreters,
 	)
 	if err != nil {
 		return fmt.Errorf("scan: %w", err)

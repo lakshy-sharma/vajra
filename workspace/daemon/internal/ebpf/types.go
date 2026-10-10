@@ -1,6 +1,6 @@
 // internal/ebpf/types.go
 //
-// Copyright © 2025 Lakshy Sharma lakshy.d.sharma@gmail.com
+// Copyright © 2026 Lakshy Sharma lakshy.d.sharma@gmail.com
 // AGPL-3.0 License
 
 //go:build linux
@@ -19,7 +19,7 @@ const (
 	EventTypeProcessMmap     uint32 = 9
 	EventTypeProcessMprotect uint32 = 10
 	EventTypeProcessCapset   uint32 = 11
-	EventTypeProcessDupStdio uint32 = 12 // dup2/dup3 onto fd 0/1/2
+	EventTypeProcessDupStdio uint32 = 12
 
 	// File events
 	EventTypeFileOpen   uint32 = 20
@@ -42,9 +42,59 @@ const (
 	EventTypeNamespaceEnter  uint32 = 71
 )
 
+// eventTypeNames is the lookup table for EventTypeName.
+// E1: was allocated on every call as a map literal — moved to package level.
+var eventTypeNames = map[uint32]string{
+	1:  "execve",
+	4:  "setuid",
+	5:  "setgid",
+	6:  "ptrace",
+	8:  "memfd_create",
+	9:  "mmap",
+	10: "mprotect",
+	11: "capset",
+	12: "dup_stdio",
+	20: "file_open",
+	22: "file_delete",
+	23: "file_rename",
+	24: "file_chmod",
+	40: "net_connect",
+	41: "net_bind",
+	46: "net_dns",
+	47: "net_raw_sock",
+	48: "net_packet",
+	60: "module_load",
+	70: "ns_create",
+	71: "ns_enter",
+}
+
+func EventTypeName(t uint32) string {
+	if name, ok := eventTypeNames[t]; ok {
+		return name
+	}
+	return "unknown"
+}
+
+// RawEvent carries a deserialized eBPF event from the perf buffer to the
+// dispatcher. Exactly one field (matching Type) is populated per event.
+//
+// E2: replaced Data interface{} with a concrete union struct. interface{}
+// forces a heap allocation per event in the perf read hot path. The union
+// struct keeps all fields inline at the cost of a larger channel element
+// (~2600 bytes). DNS stays a pointer because its Questions/Answers slices
+// heap-allocate regardless of how we wrap the outer struct.
 type RawEvent struct {
-	Type uint32
-	Data interface{}
+	Type      uint32
+	Process   ProcessEvent
+	File      FileEvent
+	Network   NetworkEvent
+	Memory    MmapEvent
+	Ptrace    PtraceEvent
+	Capset    CapsetEvent
+	Dup       DupEvent
+	Namespace NamespaceEvent
+	Module    ModuleEvent
+	DNS       *DNSEvent
 }
 
 // ProcessEvent mirrors struct process_event.
@@ -146,11 +196,7 @@ type CapsetEvent struct {
 }
 
 // DupEvent mirrors struct dup_event.
-// Emitted when dup2 or dup3 redirects any fd onto stdin, stdout, or stderr.
-// OldFd is the source — if it resolves to a network socket inode in
-// /proc/net/tcp* the combination is a reverse shell.
-// NewFd is always 0, 1, or 2 — kernel-side filter enforces this.
-// Size: 4+4+4+4+16+4+4+8 = 48 bytes
+// OldFd → source fd (socket); NewFd → destination stdio fd (0/1/2).
 type DupEvent struct {
 	Type      uint32
 	PID       uint32
@@ -197,8 +243,8 @@ type dnsEventRaw struct {
 	Payload    [256]byte
 }
 
-// SecurityEvent consolidates ptrace, capset, namespace, and dup_stdio
-// events into a single type for the security_events table.
+// SecurityEvent consolidates ptrace, capset, namespace, and module events
+// into a single type for the security_events table.
 type SecurityEvent struct {
 	Type      uint32
 	EventName string
@@ -260,34 +306,4 @@ func CStringToGo(b []byte) string {
 		n = len(b)
 	}
 	return string(b[:n])
-}
-
-func EventTypeName(t uint32) string {
-	names := map[uint32]string{
-		1:  "execve",
-		4:  "setuid",
-		5:  "setgid",
-		6:  "ptrace",
-		8:  "memfd_create",
-		9:  "mmap",
-		10: "mprotect",
-		11: "capset",
-		12: "dup_stdio",
-		20: "file_open",
-		22: "file_delete",
-		23: "file_rename",
-		24: "file_chmod",
-		40: "net_connect",
-		41: "net_bind",
-		46: "net_dns",
-		47: "net_raw_sock",
-		48: "net_packet",
-		60: "module_load",
-		70: "ns_create",
-		71: "ns_enter",
-	}
-	if name, ok := names[t]; ok {
-		return name
-	}
-	return "unknown"
 }

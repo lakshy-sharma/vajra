@@ -6,6 +6,7 @@
 package queries
 
 import (
+	"context"
 	"fmt"
 
 	sq "github.com/Masterminds/squirrel"
@@ -14,16 +15,15 @@ import (
 )
 
 type AuditLogQueries struct {
-	db *shareddb.DB
+	db shareddb.DBConn
 }
 
-func NewAuditLogQueries(d *shareddb.DB) *AuditLogQueries {
+func NewAuditLogQueries(d shareddb.DBConn) *AuditLogQueries {
 	return &AuditLogQueries{db: d}
 }
 
-// Insert appends one audit event. Audit log is append-only —
-// no update or delete methods exist by design.
-func (q *AuditLogQueries) Insert(e *models.AuditLog) error {
+// Insert appends one audit event. Audit log is append-only by design.
+func (q *AuditLogQueries) Insert(ctx context.Context, e *models.AuditLog) error {
 	sqlStr, args, err := sq.
 		Insert("audit_log").
 		Columns(
@@ -38,12 +38,11 @@ func (q *AuditLogQueries) Insert(e *models.AuditLog) error {
 	if err != nil {
 		return fmt.Errorf("auditlog.Insert: build: %w", err)
 	}
-	_, err = q.db.SQL().Exec(sqlStr, args...)
+	_, err = q.db.ExecContext(ctx, sqlStr, args...)
 	return err
 }
 
-// ListByComponent returns recent audit events for one component.
-func (q *AuditLogQueries) ListByComponent(component string, limit uint64) ([]models.AuditLog, error) {
+func (q *AuditLogQueries) ListByComponent(ctx context.Context, component string, limit uint64) ([]models.AuditLog, error) {
 	builder := sq.
 		Select(
 			"id", "machine_id", "logged_at", "component", "event_type",
@@ -59,11 +58,11 @@ func (q *AuditLogQueries) ListByComponent(component string, limit uint64) ([]mod
 	if err != nil {
 		return nil, fmt.Errorf("auditlog.ListByComponent: build: %w", err)
 	}
-	return q.scanRows(sqlStr, args...)
+	return q.scanRows(ctx, sqlStr, args...)
 }
 
-func (q *AuditLogQueries) scanRows(sqlStr string, args ...interface{}) ([]models.AuditLog, error) {
-	rows, err := q.db.SQL().Query(sqlStr, args...)
+func (q *AuditLogQueries) scanRows(ctx context.Context, sqlStr string, args ...interface{}) ([]models.AuditLog, error) {
+	rows, err := q.db.QueryContext(ctx, sqlStr, args...)
 	if err != nil {
 		return nil, err
 	}

@@ -1,11 +1,12 @@
 // internal/db/queries/network_detection.go
 //
-// Copyright © 2025 Lakshy Sharma lakshy.d.sharma@gmail.com
+// Copyright © 2026 Lakshy Sharma lakshy.d.sharma@gmail.com
 // AGPL-3.0 License
 
 package queries
 
 import (
+	"context"
 	"fmt"
 
 	sq "github.com/Masterminds/squirrel"
@@ -14,14 +15,14 @@ import (
 )
 
 type DetectionNetworkQueries struct {
-	db *shareddb.DB
+	db shareddb.DBConn
 }
 
-func NewDetectionNetworkQueries(d *shareddb.DB) *DetectionNetworkQueries {
+func NewDetectionNetworkQueries(d shareddb.DBConn) *DetectionNetworkQueries {
 	return &DetectionNetworkQueries{db: d}
 }
 
-func (q *DetectionNetworkQueries) Insert(e *models.DetectionNetwork) error {
+func (q *DetectionNetworkQueries) Insert(ctx context.Context, e *models.DetectionNetwork) error {
 	sqlStr, args, err := sq.
 		Insert("detection_network").
 		Columns(
@@ -36,11 +37,11 @@ func (q *DetectionNetworkQueries) Insert(e *models.DetectionNetwork) error {
 	if err != nil {
 		return fmt.Errorf("network_detection.Insert: build: %w", err)
 	}
-	_, err = q.db.SQL().Exec(sqlStr, args...)
+	_, err = q.db.ExecContext(ctx, sqlStr, args...)
 	return err
 }
 
-func (q *DetectionNetworkQueries) GetByDetectionID(detectionID int64) (*models.DetectionNetwork, error) {
+func (q *DetectionNetworkQueries) GetByDetectionID(ctx context.Context, detectionID int64) (*models.DetectionNetwork, error) {
 	sqlStr, args, err := sq.
 		Select(
 			"id", "detection_id", "remote_addr", "remote_port", "protocol",
@@ -52,8 +53,7 @@ func (q *DetectionNetworkQueries) GetByDetectionID(detectionID int64) (*models.D
 	if err != nil {
 		return nil, fmt.Errorf("network_detection.GetByDetectionID: build: %w", err)
 	}
-
-	row := q.db.SQL().QueryRow(sqlStr, args...)
+	row := q.db.QueryRowContext(ctx, sqlStr, args...)
 	var e models.DetectionNetwork
 	if err := row.Scan(
 		&e.ID, &e.DetectionID, &e.RemoteAddr, &e.RemotePort, &e.Protocol,

@@ -19,15 +19,13 @@ const (
 	SourceFullScan       Source = "full_scan"
 )
 
-// Finding is the unified detection output produced by every watcher
-// and scanner. FindingWriter is the only component that writes to
-// the detections table — all detection sources produce a Finding
-// and hand it off, never writing to DB directly.
+// Finding is the unified detection output from every watcher and scanner.
+// FindingWriter is the only component that writes to the DB — all sources
+// produce a Finding and hand it off.
 type Finding struct {
 	Source     Source
 	Severity   models.EventSeverity
 	Status     models.EventStatus
-	MachineID  string
 	DetectedAt int64 // Unix timestamp
 
 	// Process context — zero values when not applicable.
@@ -44,10 +42,10 @@ type Finding struct {
 
 	// Detection detail.
 	TargetPath string // file path, script path, or persistence location
-	RuleID     string // first matching rule name — used for dedup key
+	RuleID     string // first matching rule name — dedup key
 	Notes      string
 
-	// Artifacts — populated depending on source.
+	// Artifacts — populated by file/process scanners.
 	FileHash    string
 	FileSize    int64
 	YaraMatches []models.YaraMatch
@@ -57,16 +55,18 @@ type Finding struct {
 	RemotePort  uint16
 	Protocol    string
 	SocketInode uint64
+	OldFd       int32 // dup2/dup3 source fd
+	NewFd       int32 // dup2/dup3 destination fd
 
 	// Secret detail — populated by SecretsScanner.
 	SecretRuleID      string
-	SecretHash        string // sha256(secret) — never the value itself
-	SecretFingerprint string // betterleaks match fingerprint for ignore list
+	SecretHash        string // sha256(secret) — never the plaintext value
+	SecretFingerprint string // betterleaks fingerprint for ignore list
 	SecretStartLine   int
 	SecretEndLine     int
-	SecretContext     string // surrounding line with secret redacted
-	// Extension — arbitrary key/value for future fields.
-	// Avoids schema migrations for source-specific detail that
-	// doesn't warrant a dedicated column.
+	SecretContext     string // surrounding line with value redacted
+
+	// Extensions hold source-specific detail that doesn't warrant a column.
+	// Avoids schema migrations for uncommon fields.
 	Extensions map[string]string
 }

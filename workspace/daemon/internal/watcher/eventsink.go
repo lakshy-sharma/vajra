@@ -9,6 +9,7 @@ package watcher
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"sync"
@@ -18,13 +19,9 @@ import (
 	"vajra/internal/db/queries"
 	"vajra/internal/ebpf"
 	"vajra/internal/utilities"
+	sharedconfig "vajra/shared/config"
 	"vajra/shared/models"
 )
-
-var highValuePorts = map[uint16]bool{
-	22: true, 23: true, 3389: true,
-	5900: true, 4444: true, 4445: true, 31337: true,
-}
 
 type memDedupKey struct {
 	pid  uint32
@@ -38,15 +35,16 @@ type memDedupEntry struct {
 const memDedupWindow = 30 * time.Second
 
 // EventSink records raw kernel telemetry — network, memory, security,
-// module events. No analysis, no detection logic. Heuristic severity
-// only. Detection logic lives in watchers and scanners that produce
-// Finding values through FindingWriter.
+// module events. No detection logic; heuristic severity only.
+// Detection logic lives in watchers and scanners that write Finding values.
 type EventSink struct {
-	logger  *zerolog.Logger
-	netQ    *queries.NetworkQueries
-	memQ    *queries.MemoryQueries
-	secQ    *queries.SecurityQueries
-	sysInfo utilities.SystemInfo
+	logger        *zerolog.Logger
+	netQ          *queries.NetworkQueries
+	memQ          *queries.MemoryQueries
+	secQ          *queries.SecurityQueries
+	sysInfo       utilities.SystemInfo
+	inboundPorts  map[uint16]bool // W4: driven by AlertPolicySettings
+	outboundPorts map[uint16]bool
 }
 
 func NewEventSink(
@@ -55,20 +53,29 @@ func NewEventSink(
 	memQ *queries.MemoryQueries,
 	secQ *queries.SecurityQueries,
 	sysInfo utilities.SystemInfo,
+	policy sharedconfig.AlertPolicySettings,
 ) *EventSink {
+	inbound := make(map[uint16]bool, len(policy.HighValueInboundPorts))
+	for _, p := range policy.HighValueInboundPorts {
+		inbound[p] = true
+	}
+	outbound := make(map[uint16]bool, len(policy.HighValueOutboundPorts))
+	for _, p := range policy.HighValueOutboundPorts {
+		outbound[p] = true
+	}
 	return &EventSink{
-		logger:  logger,
-		netQ:    netQ,
-		memQ:    memQ,
-		secQ:    secQ,
-		sysInfo: sysInfo,
+		logger:        logger,
+		netQ:          netQ,
+		memQ:          memQ,
+		secQ:          secQ,
+		sysInfo:       sysInfo,
+		inboundPorts:  inbound,
+		outboundPorts: outbound,
 	}
 }
 
 func (es *EventSink) Name() string { return "event_sink" }
 
-// Run spawns one goroutine per channel. Each goroutine counts against
-// the caller's WaitGroup — Run itself does not block.
 func (es *EventSink) Run(ctx context.Context, wg *sync.WaitGroup, ch *ebpf.Channels) {
 	wg.Add(1)
 	go es.consumeNetwork(ctx, wg, ch.Network)
@@ -91,29 +98,41 @@ func (es *EventSink) consumeNetwork(ctx context.Context, wg *sync.WaitGroup, ch 
 			if !ok {
 				return
 			}
-			es.handleNetwork(event)
+			es.handleNetwork(ctx, event, time.Now().Unix())
 		}
 	}
 }
 
-func (es *EventSink) handleNetwork(event ebpf.NetworkEvent) {
+func (es *EventSink) handleNetwork(ctx context.Context, event ebpf.NetworkEvent, now int64) {
+	// W5: unknown address family is logged and dropped, not silently defaulted.
+	srcAddr, err := formatIP(event.SrcAddr, event.Family)
+	if err != nil {
+		es.logger.Warn().Err(err).Uint32("pid", event.PID).Msg("event sink: unknown address family, skipping network event")
+		return
+	}
+	dstAddr, err := formatIP(event.DstAddr, event.Family)
+	if err != nil {
+		es.logger.Warn().Err(err).Uint32("pid", event.PID).Msg("event sink: unknown address family, skipping network event")
+		return
+	}
+
 	record := &models.NetworkEvent{
 		EventTime:   es.sysInfo.EBPFTimestampToUnix(event.Timestamp),
 		EventType:   event.Type,
 		PID:         event.PID,
 		UID:         event.UID,
 		ProcessName: ebpf.CStringToGo(event.Comm[:]),
-		SrcAddr:     formatIP(event.SrcAddr, event.Family),
-		DstAddr:     formatIP(event.DstAddr, event.Family),
+		SrcAddr:     srcAddr,
+		DstAddr:     dstAddr,
 		SrcPort:     event.SrcPort,
 		DstPort:     event.DstPort,
 		Protocol:    protocolName(event.Protocol),
-		Severity:    classifyNetworkSeverity(event.DstPort),
+		Severity:    es.classifyNetworkSeverity(event.DstPort),
 		Status:      models.StatusNew,
 		MachineID:   es.sysInfo.MachineID,
 	}
 
-	if err := es.netQ.Insert(record); err != nil {
+	if err := es.netQ.Insert(ctx, record, now); err != nil {
 		es.logger.Error().Err(err).Uint32("pid", event.PID).Msg("event sink: network insert failed")
 		return
 	}
@@ -151,21 +170,21 @@ func (es *EventSink) consumeMemory(ctx context.Context, wg *sync.WaitGroup, ch <
 			if !ok {
 				return
 			}
-			es.handleMemory(event, dedup)
+			es.handleMemory(ctx, event, dedup, time.Now().Unix())
 		}
 	}
 }
 
-func (es *EventSink) handleMemory(event ebpf.MmapEvent, dedup map[memDedupKey]memDedupEntry) {
+func (es *EventSink) handleMemory(ctx context.Context, event ebpf.MmapEvent, dedup map[memDedupKey]memDedupEntry, now int64) {
 	severity := classifyMemorySeverity(event.Prot)
 
 	if severity != models.SeverityCritical {
 		key := memDedupKey{pid: event.PID, prot: event.Prot}
-		now := time.Now()
-		if entry, seen := dedup[key]; seen && now.Sub(entry.lastSeen) < memDedupWindow {
+		t := time.Now()
+		if entry, seen := dedup[key]; seen && t.Sub(entry.lastSeen) < memDedupWindow {
 			return
 		}
-		dedup[key] = memDedupEntry{lastSeen: now}
+		dedup[key] = memDedupEntry{lastSeen: t}
 	}
 
 	record := &models.MemoryEvent{
@@ -184,7 +203,7 @@ func (es *EventSink) handleMemory(event ebpf.MmapEvent, dedup map[memDedupKey]me
 		MachineID:   es.sysInfo.MachineID,
 	}
 
-	if err := es.memQ.Insert(record); err != nil {
+	if err := es.memQ.Insert(ctx, record, now); err != nil {
 		es.logger.Error().Err(err).Uint32("pid", event.PID).Msg("event sink: memory insert failed")
 		return
 	}
@@ -210,12 +229,12 @@ func (es *EventSink) consumeSecurity(ctx context.Context, wg *sync.WaitGroup, ch
 			if !ok {
 				return
 			}
-			es.handleSecurity(event)
+			es.handleSecurity(ctx, event, time.Now().Unix())
 		}
 	}
 }
 
-func (es *EventSink) handleSecurity(event ebpf.SecurityEvent) {
+func (es *EventSink) handleSecurity(ctx context.Context, event ebpf.SecurityEvent, now int64) {
 	record := &models.SecurityEvent{
 		EventTime:   es.sysInfo.EBPFTimestampToUnix(event.Timestamp),
 		EventType:   event.Type,
@@ -230,7 +249,7 @@ func (es *EventSink) handleSecurity(event ebpf.SecurityEvent) {
 		MachineID:   es.sysInfo.MachineID,
 	}
 
-	if err := es.secQ.Insert(record); err != nil {
+	if err := es.secQ.Insert(ctx, record, now); err != nil {
 		es.logger.Error().Err(err).Uint32("pid", event.PID).Msg("event sink: security insert failed")
 		return
 	}
@@ -255,13 +274,25 @@ func (es *EventSink) consumeModule(ctx context.Context, wg *sync.WaitGroup, ch <
 			if !ok {
 				return
 			}
-			es.handleModule(event)
+			es.handleModule(ctx, event, time.Now().Unix())
 		}
 	}
 }
 
-func (es *EventSink) handleModule(event ebpf.ModuleEvent) {
+// moduleDetails is used for JSON encoding of the module name.
+// W6: replaced fmt.Sprintf JSON construction with encoding/json.
+type moduleDetails struct {
+	ModuleName string `json:"module_name"`
+}
+
+func (es *EventSink) handleModule(ctx context.Context, event ebpf.ModuleEvent, now int64) {
 	moduleName := ebpf.CStringToGo(event.Name[:])
+
+	details, err := json.Marshal(moduleDetails{ModuleName: moduleName})
+	if err != nil {
+		details = []byte("{}") // json.Marshal on a string field cannot fail in practice
+	}
+
 	record := &models.SecurityEvent{
 		EventTime:   es.sysInfo.EBPFTimestampToUnix(event.Timestamp),
 		EventType:   event.Type,
@@ -269,13 +300,13 @@ func (es *EventSink) handleModule(event ebpf.ModuleEvent) {
 		PID:         event.PID,
 		UID:         event.UID,
 		ProcessName: ebpf.CStringToGo(event.Comm[:]),
-		Details:     fmt.Sprintf(`{"module_name":%q}`, moduleName),
+		Details:     string(details),
 		Severity:    models.SeverityCritical,
 		Status:      models.StatusNew,
 		MachineID:   es.sysInfo.MachineID,
 	}
 
-	if err := es.secQ.Insert(record); err != nil {
+	if err := es.secQ.Insert(ctx, record, now); err != nil {
 		es.logger.Error().Err(err).Uint32("pid", event.PID).Msg("event sink: module insert failed")
 		return
 	}
@@ -289,11 +320,13 @@ func (es *EventSink) handleModule(event ebpf.ModuleEvent) {
 
 // ── Severity classifiers ──────────────────────────────────────
 
-func classifyNetworkSeverity(dstPort uint16) models.EventSeverity {
+// classifyNetworkSeverity checks the destination port against both inbound
+// and outbound high-value port sets from config. W4: was a hardcoded map.
+func (es *EventSink) classifyNetworkSeverity(dstPort uint16) models.EventSeverity {
 	if dstPort == 0 {
 		return models.SeverityMedium
 	}
-	if highValuePorts[dstPort] {
+	if es.inboundPorts[dstPort] || es.outboundPorts[dstPort] {
 		return models.SeverityHigh
 	}
 	return models.SeverityLow
@@ -328,18 +361,21 @@ func classifySecuritySeverity(eventName string) models.EventSeverity {
 
 // ── Network helpers ───────────────────────────────────────────
 
-func formatIP(addr [16]byte, family uint8) string {
+// formatIP converts a kernel address buffer to a string.
+// W5: returns an error for unknown address families instead of silently
+// defaulting to IPv4, which would produce a meaningless address.
+func formatIP(addr [16]byte, family uint8) (string, error) {
 	const (
 		AF_INET  = 2
 		AF_INET6 = 10
 	)
 	switch family {
 	case AF_INET:
-		return net.IP(addr[:4]).String()
+		return net.IP(addr[:4]).String(), nil
 	case AF_INET6:
-		return net.IP(addr[:16]).String()
+		return net.IP(addr[:16]).String(), nil
 	default:
-		return net.IP(addr[:4]).String()
+		return "", fmt.Errorf("unknown address family %d", family)
 	}
 }
 

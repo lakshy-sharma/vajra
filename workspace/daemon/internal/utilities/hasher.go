@@ -6,10 +6,7 @@
 package utilities
 
 import (
-	"crypto/md5"
-	"crypto/sha1"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -18,9 +15,13 @@ import (
 
 const quickHashBytes = 8192
 
-// QuickHash hashes the first 8KB, last 8KB, and mtime of a file.
-// Fast enough for dedup — not suitable as a forensic hash.
-// Catches both prepend/append injection and in-place replacement.
+// QuickHash hashes the first and last 8 KiB of a file.
+// Fast enough for scan dedup; not a forensic hash.
+//
+// mtime is intentionally excluded: an attacker replacing a binary can
+// restore mtime with touch -t, making mtime inclusion a false sense of
+// security. Content (head + tail) is sufficient to catch prepend/append
+// injection and in-place binary replacement.
 func QuickHash(filePath string) (string, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -54,14 +55,10 @@ func QuickHash(filePath string) (string, error) {
 		h.Write(tail[:n])
 	}
 
-	var mtimeBuf [8]byte
-	binary.LittleEndian.PutUint64(mtimeBuf[:], uint64(info.ModTime().Unix()))
-	h.Write(mtimeBuf[:])
-
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// FullSHA256 returns the SHA256 of the entire file.
+// FullSHA256 returns the SHA256 digest of the entire file.
 func FullSHA256(filePath string) (string, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -73,27 +70,6 @@ func FullSHA256(filePath string) (string, error) {
 		return "", fmt.Errorf("sha256: hash: %w", err)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
-}
-
-// HashFile computes SHA256, SHA1, and MD5 in a single pass.
-func HashFile(filePath string) (sha256Hash, sha1Hash, md5Hash string, err error) {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return "", "", "", fmt.Errorf("hashfile: open: %w", err)
-	}
-	defer f.Close()
-
-	h256 := sha256.New()
-	h1 := sha1.New()
-	hmd5 := md5.New()
-
-	if _, err := io.Copy(io.MultiWriter(h256, h1, hmd5), f); err != nil {
-		return "", "", "", fmt.Errorf("hashfile: hash: %w", err)
-	}
-	return hex.EncodeToString(h256.Sum(nil)),
-		hex.EncodeToString(h1.Sum(nil)),
-		hex.EncodeToString(hmd5.Sum(nil)),
-		nil
 }
 
 // FileInfo bundles stat values used by scanners to decide whether to rehash.

@@ -20,12 +20,13 @@ type AutorunRow struct {
 	LastSeen  int64  `json:"lastSeen"`
 }
 
-// Autoruns returns all autorun entries ordered by category then image name.
+// Autoruns returns all active autorun entries ordered by category then image name.
+// Q9: table is `autoruns`, not `autorun_entries`.
 func (q *Queries) Autoruns() ([]AutorunRow, error) {
-	rows, err := q.db.SQL().Query(`
+	rows, err := q.db.QueryContext(bg(), `
 		SELECT id, category, location, image_path, image_name,
 		       arguments, sha256, is_active, first_seen, last_seen
-		FROM autorun_entries
+		FROM autoruns
 		ORDER BY category ASC, image_name ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("autoruns.query: %w", err)

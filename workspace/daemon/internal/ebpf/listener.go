@@ -1,6 +1,6 @@
 // internal/ebpf/listener.go
 //
-// Copyright © 2025 Lakshy Sharma lakshy.d.sharma@gmail.com
+// Copyright © 2026 Lakshy Sharma lakshy.d.sharma@gmail.com
 // AGPL-3.0 License
 
 //go:build linux
@@ -28,18 +28,15 @@ import (
 )
 
 // Listener loads the BPF program, attaches all tracepoints,
-// and streams deserialized RawEvents into the channel passed
-// to Start. It owns the perf reader and all link handles.
+// and streams deserialized RawEvents into the channel passed to Start.
 type Listener struct {
 	logger *zerolog.Logger
 	objs   bpfObjects
 	links  []link.Link
 	reader *perf.Reader
-	once   sync.Once // guards Stop
+	once   sync.Once
 }
 
-// NewListener removes the memlock rlimit and loads BPF objects
-// into the kernel. It does not attach tracepoints yet.
 func NewListener(logger *zerolog.Logger) (*Listener, error) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return nil, fmt.Errorf("ebpf.NewListener: remove memlock: %w", err)
@@ -58,10 +55,10 @@ func NewListener(logger *zerolog.Logger) (*Listener, error) {
 	return l, nil
 }
 
-// Start attaches tracepoints, opens the perf reader, and launches
-// the read loop as a background goroutine. rawCh is owned by the
-// caller — Listener never closes it.
-func (l *Listener) Start(ctx context.Context, rawCh chan<- RawEvent) error {
+// Start attaches tracepoints, opens the perf reader, and launches the read
+// loop. perfRingPages must be a power of two — config validation enforces this.
+// E3: was hardcoded to os.Getpagesize()*64.
+func (l *Listener) Start(ctx context.Context, rawCh chan<- RawEvent, perfRingPages int) error {
 	l.attachTracepoints()
 
 	if len(l.links) == 0 {
@@ -69,7 +66,7 @@ func (l *Listener) Start(ctx context.Context, rawCh chan<- RawEvent) error {
 	}
 
 	var err error
-	l.reader, err = perf.NewReader(l.objs.Events, os.Getpagesize()*64)
+	l.reader, err = perf.NewReader(l.objs.Events, os.Getpagesize()*perfRingPages)
 	if err != nil {
 		return fmt.Errorf("ebpf.Listener.Start: perf reader: %w", err)
 	}
@@ -78,13 +75,12 @@ func (l *Listener) Start(ctx context.Context, rawCh chan<- RawEvent) error {
 
 	l.logger.Info().
 		Int("tracepoints", len(l.links)).
+		Int("perf_ring_pages", perfRingPages).
 		Msg("ebpf listener started")
 
 	return nil
 }
 
-// Stop detaches tracepoints, closes the perf reader, and frees
-// BPF objects. Safe to call more than once.
 func (l *Listener) Stop() {
 	l.once.Do(func() {
 		if l.reader != nil {
@@ -98,9 +94,6 @@ func (l *Listener) Stop() {
 	})
 }
 
-// attachTracepoints attaches every tracepoint we care about.
-// Individual failures are logged and skipped — a kernel compiled
-// without a particular syscall degrades gracefully.
 func (l *Listener) attachTracepoints() {
 	type entry struct {
 		group string
@@ -109,7 +102,6 @@ func (l *Listener) attachTracepoints() {
 	}
 
 	points := []entry{
-		// Process
 		{"syscalls", "sys_enter_execve", l.objs.TraceExecve},
 		{"syscalls", "sys_enter_setuid", l.objs.TraceSetuid},
 		{"syscalls", "sys_enter_setgid", l.objs.TraceSetgid},
@@ -120,21 +112,17 @@ func (l *Listener) attachTracepoints() {
 		{"syscalls", "sys_enter_capset", l.objs.TraceCapset},
 		{"syscalls", "sys_enter_dup2", l.objs.TraceDup2},
 		{"syscalls", "sys_enter_dup3", l.objs.TraceDup3},
-		// File
 		{"syscalls", "sys_enter_openat", l.objs.TraceOpenat},
 		{"syscalls", "sys_enter_unlinkat", l.objs.TraceUnlinkat},
 		{"syscalls", "sys_enter_renameat2", l.objs.TraceRenameat2},
 		{"syscalls", "sys_enter_fchmodat", l.objs.TraceFchmodat},
-		// Network
 		{"syscalls", "sys_enter_connect", l.objs.TraceConnect},
 		{"syscalls", "sys_enter_bind", l.objs.TraceBind},
 		{"syscalls", "sys_enter_socket", l.objs.TraceSocket},
 		{"syscalls", "sys_enter_sendto", l.objs.TraceSendto},
 		{"syscalls", "sys_enter_sendmsg", l.objs.TraceSendmsg},
-		// Module
 		{"syscalls", "sys_enter_init_module", l.objs.TraceInitModule},
 		{"syscalls", "sys_enter_finit_module", l.objs.TraceFinitModule},
-		// Namespace
 		{"syscalls", "sys_enter_unshare", l.objs.TraceUnshare},
 		{"syscalls", "sys_enter_setns", l.objs.TraceSetns},
 	}
@@ -149,14 +137,10 @@ func (l *Listener) attachTracepoints() {
 			continue
 		}
 		l.links = append(l.links, lnk)
-		l.logger.Debug().
-			Str("tracepoint", p.group+"/"+p.name).
-			Msg("tracepoint attached")
+		l.logger.Debug().Str("tracepoint", p.group+"/"+p.name).Msg("tracepoint attached")
 	}
 }
 
-// readLoop reads records from the perf buffer until ctx is
-// cancelled or the reader is closed.
 func (l *Listener) readLoop(ctx context.Context, rawCh chan<- RawEvent) {
 	for {
 		select {
@@ -175,34 +159,25 @@ func (l *Listener) readLoop(ctx context.Context, rawCh chan<- RawEvent) {
 		}
 
 		if record.LostSamples > 0 {
-			l.logger.Warn().
-				Uint64("lost", record.LostSamples).
-				Msg("perf ring full — samples dropped by kernel")
+			l.logger.Warn().Uint64("lost", record.LostSamples).Msg("perf ring full — samples dropped by kernel")
 		}
 
 		event, err := l.deserialize(record.RawSample)
 		if err != nil {
-			// Unknown or malformed event — debug only, not an error.
 			l.logger.Debug().Err(err).Msg("deserialize skipped")
 			continue
 		}
 
-		// Non-blocking send. If the dispatcher channel is full
-		// we drop here rather than stall the perf reader, which
-		// would cause the kernel ring to overflow and lose more.
 		select {
 		case rawCh <- event:
 		default:
-			l.logger.Warn().
-				Uint32("type", event.Type).
-				Msg("raw channel full — event dropped")
+			l.logger.Warn().Uint32("type", event.Type).Msg("raw channel full — event dropped")
 		}
 	}
 }
 
-// deserialize reads the event type from the first 4 bytes then
-// binary.Read the matching struct. Fields must exactly match the
-// C struct layout including all pad fields.
+// deserialize reads the event type and fills the matching field of a RawEvent.
+// E2: sets one concrete field instead of boxing into Data interface{}.
 func (l *Listener) deserialize(raw []byte) (RawEvent, error) {
 	if len(raw) < 4 {
 		return RawEvent{}, fmt.Errorf("record too short (%d bytes)", len(raw))
@@ -210,106 +185,88 @@ func (l *Listener) deserialize(raw []byte) (RawEvent, error) {
 
 	eventType := binary.LittleEndian.Uint32(raw[0:4])
 	r := bytes.NewReader(raw)
+	var evt RawEvent
+	evt.Type = eventType
 
 	switch eventType {
 
-	// ── Process events ────────────────────────────────────────
 	case EventTypeProcessExec,
 		EventTypeProcessSetuid,
 		EventTypeProcessSetgid,
 		EventTypeProcessMemfd:
-		var e ProcessEvent
-		if err := binary.Read(r, binary.LittleEndian, &e); err != nil {
+		if err := binary.Read(r, binary.LittleEndian, &evt.Process); err != nil {
 			return RawEvent{}, fmt.Errorf("ProcessEvent decode: %w", err)
 		}
-		return RawEvent{Type: eventType, Data: e}, nil
 
 	case EventTypeProcessPtrace:
-		var e PtraceEvent
-		if err := binary.Read(r, binary.LittleEndian, &e); err != nil {
+		if err := binary.Read(r, binary.LittleEndian, &evt.Ptrace); err != nil {
 			return RawEvent{}, fmt.Errorf("PtraceEvent decode: %w", err)
 		}
-		return RawEvent{Type: eventType, Data: e}, nil
 
 	case EventTypeProcessMmap,
 		EventTypeProcessMprotect:
-		var e MmapEvent
-		if err := binary.Read(r, binary.LittleEndian, &e); err != nil {
+		if err := binary.Read(r, binary.LittleEndian, &evt.Memory); err != nil {
 			return RawEvent{}, fmt.Errorf("MmapEvent decode: %w", err)
 		}
-		return RawEvent{Type: eventType, Data: e}, nil
 
 	case EventTypeProcessCapset:
-		var e CapsetEvent
-		if err := binary.Read(r, binary.LittleEndian, &e); err != nil {
+		if err := binary.Read(r, binary.LittleEndian, &evt.Capset); err != nil {
 			return RawEvent{}, fmt.Errorf("CapsetEvent decode: %w", err)
 		}
-		return RawEvent{Type: eventType, Data: e}, nil
 
 	case EventTypeProcessDupStdio:
-		var e DupEvent
-		if err := binary.Read(r, binary.LittleEndian, &e); err != nil {
+		if err := binary.Read(r, binary.LittleEndian, &evt.Dup); err != nil {
 			return RawEvent{}, fmt.Errorf("DupEvent decode: %w", err)
 		}
-		return RawEvent{Type: eventType, Data: e}, nil
-	// ── File events ───────────────────────────────────────────
+
 	case EventTypeFileOpen,
 		EventTypeFileDelete,
 		EventTypeFileRename,
 		EventTypeFileChmod:
-		var e FileEvent
-		if err := binary.Read(r, binary.LittleEndian, &e); err != nil {
+		if err := binary.Read(r, binary.LittleEndian, &evt.File); err != nil {
 			return RawEvent{}, fmt.Errorf("FileEvent decode: %w", err)
 		}
-		return RawEvent{Type: eventType, Data: e}, nil
 
-	// ── Network events ────────────────────────────────────────
 	case EventTypeNetConnect,
 		EventTypeNetBind,
 		EventTypeNetRawSock,
 		EventTypeNetPacket:
-		var e NetworkEvent
-		if err := binary.Read(r, binary.LittleEndian, &e); err != nil {
+		if err := binary.Read(r, binary.LittleEndian, &evt.Network); err != nil {
 			return RawEvent{}, fmt.Errorf("NetworkEvent decode: %w", err)
 		}
-		return RawEvent{Type: eventType, Data: e}, nil
 
 	case EventTypeNetDNS:
-		var raw dnsEventRaw
-		if err := binary.Read(r, binary.LittleEndian, &raw); err != nil {
+		var rawDNS dnsEventRaw
+		if err := binary.Read(r, binary.LittleEndian, &rawDNS); err != nil {
 			return RawEvent{}, fmt.Errorf("dnsEventRaw decode: %w", err)
 		}
-		dns, err := l.parseDNS(raw)
+		dns, err := parseDNS(rawDNS)
 		if err != nil {
 			return RawEvent{}, fmt.Errorf("DNS parse: %w", err)
 		}
-		return RawEvent{Type: eventType, Data: dns}, nil
+		evt.DNS = &dns
 
-	// ── Module events ─────────────────────────────────────────
 	case EventTypeModuleLoad:
-		var e ModuleEvent
-		if err := binary.Read(r, binary.LittleEndian, &e); err != nil {
+		if err := binary.Read(r, binary.LittleEndian, &evt.Module); err != nil {
 			return RawEvent{}, fmt.Errorf("ModuleEvent decode: %w", err)
 		}
-		return RawEvent{Type: eventType, Data: e}, nil
 
-	// ── Namespace events ──────────────────────────────────────
 	case EventTypeNamespaceCreate,
 		EventTypeNamespaceEnter:
-		var e NamespaceEvent
-		if err := binary.Read(r, binary.LittleEndian, &e); err != nil {
+		if err := binary.Read(r, binary.LittleEndian, &evt.Namespace); err != nil {
 			return RawEvent{}, fmt.Errorf("NamespaceEvent decode: %w", err)
 		}
-		return RawEvent{Type: eventType, Data: e}, nil
 
 	default:
 		return RawEvent{}, fmt.Errorf("unknown event type %d", eventType)
 	}
+
+	return evt, nil
 }
 
-// parseDNS parses a raw DNS payload using gopacket and returns
-// a structured DNSEvent. Called only for EventTypeNetDNS records.
-func (l *Listener) parseDNS(raw dnsEventRaw) (DNSEvent, error) {
+// parseDNS is a package-level function so the dispatcher can call it
+// without holding a Listener reference.
+func parseDNS(raw dnsEventRaw) (DNSEvent, error) {
 	event := DNSEvent{
 		PID:       raw.PID,
 		UID:       raw.UID,
@@ -349,10 +306,7 @@ func (l *Listener) parseDNS(raw dnsEventRaw) (DNSEvent, error) {
 	}
 
 	for _, a := range dns.Answers {
-		ans := DNSAnswer{
-			Name: string(a.Name),
-			TTL:  a.TTL,
-		}
+		ans := DNSAnswer{Name: string(a.Name), TTL: a.TTL}
 		if a.IP != nil {
 			ans.IP = a.IP.String()
 		}

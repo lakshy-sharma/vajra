@@ -1,27 +1,28 @@
 // internal/db/queries/secrets.go
 //
-// Copyright © 2025 Lakshy Sharma lakshy.d.sharma@gmail.com
+// Copyright © 2026 Lakshy Sharma lakshy.d.sharma@gmail.com
 // AGPL-3.0 License
 
 package queries
 
 import (
+	"context"
 	"fmt"
-	"vajra/shared/models"
 
 	sq "github.com/Masterminds/squirrel"
 	shareddb "vajra/shared/db"
+	"vajra/shared/models"
 )
 
 type SecretQueries struct {
-	db *shareddb.DB
+	db shareddb.DBConn
 }
 
-func NewSecretQueries(d *shareddb.DB) *SecretQueries {
+func NewSecretQueries(d shareddb.DBConn) *SecretQueries {
 	return &SecretQueries{db: d}
 }
 
-func (q *SecretQueries) Insert(e *models.DetectionSecret) error {
+func (q *SecretQueries) Insert(ctx context.Context, e *models.DetectionSecret) error {
 	sqlStr, args, err := sq.
 		Insert("detection_secrets").
 		Columns(
@@ -36,11 +37,11 @@ func (q *SecretQueries) Insert(e *models.DetectionSecret) error {
 	if err != nil {
 		return fmt.Errorf("secrets.Insert: build: %w", err)
 	}
-	_, err = q.db.SQL().Exec(sqlStr, args...)
+	_, err = q.db.ExecContext(ctx, sqlStr, args...)
 	return err
 }
 
-func (q *SecretQueries) GetByDetectionID(detectionID int64) ([]models.DetectionSecret, error) {
+func (q *SecretQueries) GetByDetectionID(ctx context.Context, detectionID int64) ([]models.DetectionSecret, error) {
 	sqlStr, args, err := sq.
 		Select(
 			"id", "detection_id", "rule_id", "secret_hash",
@@ -52,8 +53,7 @@ func (q *SecretQueries) GetByDetectionID(detectionID int64) ([]models.DetectionS
 	if err != nil {
 		return nil, fmt.Errorf("secrets.GetByDetectionID: build: %w", err)
 	}
-
-	rows, err := q.db.SQL().Query(sqlStr, args...)
+	rows, err := q.db.QueryContext(ctx, sqlStr, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -73,19 +73,23 @@ func (q *SecretQueries) GetByDetectionID(detectionID int64) ([]models.DetectionS
 	return results, rows.Err()
 }
 
-// ListIgnoredFingerprints returns the betterleaks fingerprints for all
-// detection_secrets whose parent detection has status = IGNORED.
-// Used by `vajra secrets export-ignore` to write the ignore file.
-func (q *SecretQueries) ListIgnoredFingerprints() ([]string, error) {
-	sqlStr := `
-		SELECT ds.fingerprint
-		FROM detection_secrets ds
-		JOIN detections d ON d.id = ds.detection_id
-		WHERE d.status = ?
-		  AND ds.fingerprint != ''
-		ORDER BY ds.fingerprint`
-
-	rows, err := q.db.SQL().Query(sqlStr, string(models.StatusIgnored))
+// ListIgnoredFingerprints returns betterleaks fingerprints for all secrets
+// whose parent detection is IGNORED — used by `vajra secrets export-ignore`.
+func (q *SecretQueries) ListIgnoredFingerprints(ctx context.Context) ([]string, error) {
+	sqlStr, args, err := sq.
+		Select("ds.fingerprint").
+		From("detection_secrets ds").
+		Join("detections d ON d.id = ds.detection_id").
+		Where(sq.And{
+			sq.Eq{"d.status": string(models.StatusIgnored)},
+			sq.NotEq{"ds.fingerprint": ""},
+		}).
+		OrderBy("ds.fingerprint").
+		ToSql()
+	if err != nil {
+		return nil, fmt.Errorf("secrets.ListIgnoredFingerprints: build: %w", err)
+	}
+	rows, err := q.db.QueryContext(ctx, sqlStr, args...)
 	if err != nil {
 		return nil, fmt.Errorf("secrets.ListIgnoredFingerprints: %w", err)
 	}

@@ -7,10 +7,9 @@ package queries
 
 import "fmt"
 
-// StatRow mirrors models.EventStatistic but uses only the fields the UI
-// needs for charts and summary panels.
+// StatRow mirrors models.EventStatistic for the UI chart panels.
 type StatRow struct {
-	Date           string `json:"date"`
+	Date           int64  `json:"date"` // Unix epoch of day start UTC
 	EventType      uint32 `json:"eventType"`
 	EventName      string `json:"eventName"`
 	TotalCount     int64  `json:"totalCount"`
@@ -22,7 +21,7 @@ type StatRow struct {
 func (q *Queries) Totals() ([]StatRow, error) {
 	const sql = `
 		SELECT
-			'' AS date,
+			0 AS date,
 			event_type,
 			event_name,
 			SUM(total_count)     AS total_count,
@@ -34,18 +33,19 @@ func (q *Queries) Totals() ([]StatRow, error) {
 	return q.scanStats(sql)
 }
 
-// StatsByDateRange returns per-day rows within [start, end] ("YYYY-MM-DD").
-func (q *Queries) StatsByDateRange(start, end string) ([]StatRow, error) {
+// StatsByDateRange returns per-day rows within the given Unix epoch range.
+// Q7: uses int64 epoch comparison — was an unvalidated string date comparison.
+func (q *Queries) StatsByDateRange(startUnix, endUnix int64) ([]StatRow, error) {
 	const sql = `
 		SELECT date, event_type, event_name, total_count, malicious_count, clean_count
 		FROM event_statistics
 		WHERE date >= ? AND date <= ?
 		ORDER BY date ASC, event_type ASC`
-	return q.scanStats(sql, start, end)
+	return q.scanStats(sql, startUnix, endUnix)
 }
 
-func (q *Queries) scanStats(sqlStr string, args ...interface{}) ([]StatRow, error) {
-	rows, err := q.db.SQL().Query(sqlStr, args...)
+func (q *Queries) scanStats(sqlStr string, args ...any) ([]StatRow, error) {
+	rows, err := q.db.QueryContext(bg(), sqlStr, args...)
 	if err != nil {
 		return nil, fmt.Errorf("dashboard.scanStats: %w", err)
 	}
@@ -56,7 +56,7 @@ func (q *Queries) scanStats(sqlStr string, args ...interface{}) ([]StatRow, erro
 		var r StatRow
 		if err := rows.Scan(&r.Date, &r.EventType, &r.EventName,
 			&r.TotalCount, &r.MaliciousCount, &r.CleanCount); err != nil {
-			return nil, fmt.Errorf("dashboard.scanStats: scan: %w", err)
+			return nil, fmt.Errorf("dashboard.scanStats.scan: %w", err)
 		}
 		out = append(out, r)
 	}

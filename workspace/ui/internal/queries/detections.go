@@ -26,20 +26,25 @@ type DetectionRow struct {
 	Notes          string `json:"notes"`
 }
 
-// Detections returns a paginated list of detections with optional filters.
+// Detections returns a paginated list with optional filters.
 // severity, status, source may each be "" to skip that filter.
+// Q10: COUNT + SELECT wrapped in a read-only transaction to eliminate the
+// pagination race between the two queries.
 func (q *Queries) Detections(page, perPage int, severity, status, source string) ([]DetectionRow, int64, error) {
+	tx, err := q.db.BeginTx(bg(), nil)
+	if err != nil {
+		return nil, 0, fmt.Errorf("detections.begin: %w", err)
+	}
+	defer tx.Rollback()
+
 	where, args := buildDetectionFilter(severity, status, source)
 	offset := (page - 1) * perPage
 
-	// Count
-	countSQL := "SELECT COUNT(*) FROM detections" + where
 	var total int64
-	if err := q.db.SQL().QueryRow(countSQL, args...).Scan(&total); err != nil {
+	if err := tx.QueryRowContext(bg(), "SELECT COUNT(*) FROM detections"+where, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("detections.count: %w", err)
 	}
 
-	// Rows
 	rowSQL := fmt.Sprintf(`
 		SELECT id, detection_time, source, severity, status,
 		       process_name, exe_path, cmd_line, target_path,
@@ -47,9 +52,9 @@ func (q *Queries) Detections(page, perPage int, severity, status, source string)
 		FROM detections%s
 		ORDER BY detection_time DESC
 		LIMIT ? OFFSET ?`, where)
-	queryArgs := append(args, perPage, offset)
 
-	rows, err := q.db.SQL().Query(rowSQL, queryArgs...)
+	queryArgs := append(args, perPage, offset)
+	rows, err := tx.QueryContext(bg(), rowSQL, queryArgs...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("detections.query: %w", err)
 	}
@@ -70,9 +75,9 @@ func (q *Queries) Detections(page, perPage int, severity, status, source string)
 	return out, total, rows.Err()
 }
 
-func buildDetectionFilter(severity, status, source string) (string, []interface{}) {
+func buildDetectionFilter(severity, status, source string) (string, []any) {
 	var clauses []string
-	var args []interface{}
+	var args []any
 
 	if severity != "" {
 		clauses = append(clauses, "severity = ?")

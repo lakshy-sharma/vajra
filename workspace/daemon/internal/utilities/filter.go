@@ -25,10 +25,10 @@ type ExclusionFilter struct {
 }
 
 func NewExclusionFilter(cfg *sharedconfig.Config) *ExclusionFilter {
+	// Extensions and patterns have no config backing yet; they exist for
+	// runtime additions via AddExtension / AddPattern (future extension points).
 	return &ExclusionFilter{
-		paths:      cfg.ScanSettings.ExclusionRules.ExcludePaths,
-		extensions: cfg.ScanSettings.ExclusionRules.ExcludeExtensions,
-		patterns:   cfg.ScanSettings.ExclusionRules.ExcludePatterns,
+		paths: cfg.ScanSettings.ExcludedPaths,
 	}
 }
 
@@ -37,7 +37,9 @@ func (f *ExclusionFilter) ShouldScan(filePath string) bool {
 	defer f.mu.RUnlock()
 
 	for _, p := range f.paths {
-		if strings.Contains(filePath, p) {
+		// HasPathPrefix guards against /foo/bar matching /foo/barz —
+		// strings.Contains would allow that false positive.
+		if HasPathPrefix(filePath, p) {
 			return false
 		}
 	}
@@ -61,6 +63,19 @@ func (f *ExclusionFilter) AddPath(path string) {
 	f.paths = append(f.paths, path)
 }
 
+// HasPathPrefix reports whether filePath is equal to prefix or is a file
+// directly inside it. A plain strings.HasPrefix would match /foo/bar against
+// the prefix /foo/b, which is wrong — the check must land on a path separator.
+func HasPathPrefix(filePath, prefix string) bool {
+	// Normalise so callers need not worry about trailing slashes in config.
+	prefix = strings.TrimRight(prefix, "/")
+	if !strings.HasPrefix(filePath, prefix) {
+		return false
+	}
+	rest := filePath[len(prefix):]
+	return rest == "" || rest[0] == '/'
+}
+
 // ProcessFilter gates which processes receive the full content pipeline.
 // Trusted processes still run the runtime pipeline — a trusted name
 // exhibiting suspicious behaviour is more alarming, not less.
@@ -70,7 +85,7 @@ type ProcessFilter struct {
 }
 
 func NewProcessFilter(cfg *sharedconfig.Config) *ProcessFilter {
-	return &ProcessFilter{trusted: cfg.ScanSettings.ExclusionRules.ExcludeProcesses}
+	return &ProcessFilter{trusted: cfg.ScanSettings.ExcludedProcesses}
 }
 
 func (f *ProcessFilter) IsTrusted(processName string) bool {
@@ -86,12 +101,23 @@ type RecentScanTracker struct {
 	mu    sync.RWMutex
 	scans map[string]time.Time
 	ttl   time.Duration
+	done  chan struct{}
 }
 
 func NewRecentScanTracker(ttl time.Duration) *RecentScanTracker {
-	rst := &RecentScanTracker{scans: make(map[string]time.Time), ttl: ttl}
+	rst := &RecentScanTracker{
+		scans: make(map[string]time.Time),
+		ttl:   ttl,
+		done:  make(chan struct{}),
+	}
 	go rst.cleanup()
 	return rst
+}
+
+// Stop terminates the background cleanup goroutine.
+// Must be called when the tracker is no longer needed to avoid a goroutine leak.
+func (rst *RecentScanTracker) Stop() {
+	close(rst.done)
 }
 
 func (rst *RecentScanTracker) WasRecentlyScanned(filePath, fileHash string) bool {
@@ -116,16 +142,23 @@ func (rst *RecentScanTracker) MarkScanned(filePath, fileHash string) {
 }
 
 func (rst *RecentScanTracker) cleanup() {
-	ticker := time.NewTicker(5 * time.Minute)
+	// Run at the same cadence as the TTL window — entries expire after one
+	// cycle at most, and we avoid running more aggressively than needed.
+	ticker := time.NewTicker(rst.ttl)
 	defer ticker.Stop()
-	for range ticker.C {
-		rst.mu.Lock()
-		now := time.Now()
-		for k, t := range rst.scans {
-			if now.Sub(t) > rst.ttl {
-				delete(rst.scans, k)
+	for {
+		select {
+		case <-rst.done:
+			return
+		case <-ticker.C:
+			rst.mu.Lock()
+			now := time.Now()
+			for k, t := range rst.scans {
+				if now.Sub(t) > rst.ttl {
+					delete(rst.scans, k)
+				}
 			}
+			rst.mu.Unlock()
 		}
-		rst.mu.Unlock()
 	}
 }

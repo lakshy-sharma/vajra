@@ -6,6 +6,8 @@
 package yara
 
 import (
+	"encoding/hex"
+
 	"github.com/hillu/go-yara/v4"
 	"vajra/shared/models"
 )
@@ -20,14 +22,29 @@ type Match struct {
 func (m Match) RuleID() string     { return m.Rule }
 func (m Match) RuleTags() []string { return m.Tags }
 
-// ConvertMatches translates raw go-yara results into our model type
-// and wraps them as Match values for severity classification.
-func ConvertMatches(raw yara.MatchRules) []Match {
+// ConvertMatches translates raw go-yara results into our model type.
+// snapshotBytes controls the maximum number of match bytes captured as
+// a hex snapshot — comes from ScanSettings.YaraSnapshotBytes in config.
+//
+// E8: the previous implementation built []string losing the identifier and
+// offset. YaraStringMatch preserves all three forensic fields.
+func ConvertMatches(raw yara.MatchRules, snapshotBytes int) []Match {
+	if snapshotBytes <= 0 {
+		snapshotBytes = 128
+	}
 	out := make([]Match, 0, len(raw))
 	for _, m := range raw {
-		strs := make([]string, 0, len(m.Strings))
+		strs := make([]models.YaraStringMatch, 0, len(m.Strings))
 		for _, s := range m.Strings {
-			strs = append(strs, string(s.Data))
+			snap := s.Data
+			if len(snap) > snapshotBytes {
+				snap = snap[:snapshotBytes]
+			}
+			strs = append(strs, models.YaraStringMatch{
+				Identifier:  s.Name,
+				Offset:      uint64(s.Offset),
+				SnapshotHex: hex.EncodeToString(snap),
+			})
 		}
 		out = append(out, Match{
 			YaraMatch: models.YaraMatch{

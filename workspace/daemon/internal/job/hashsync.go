@@ -25,30 +25,29 @@ import (
 )
 
 const (
-	bazaarFullURL = "https://bazaar.abuse.ch/export/csv/full/"
-	csvName       = "full.csv"
-	sha256Col     = 1
-
-	// 5M capacity with 1% FP rate — covers current dataset with room to grow.
-	// FP means YARA runs on a file it didn't need to — acceptable overhead.
-	bloomCapacity = 5_000_000
-	bloomFPRate   = 0.01
+	bazaarDefaultURL = "https://bazaar.abuse.ch/export/csv/full/"
+	csvName          = "full.csv"
+	sha256Col        = 1
 )
+
+// hashClient is used exclusively for MalwareBazaar downloads.
+// J5: dedicated client with timeout — http.DefaultClient has no timeout.
+var hashClient = &http.Client{Timeout: 15 * time.Minute}
 
 // HashSyncer downloads the MalwareBazaar full CSV and builds a Bloom filter
 // at BloomFilterPath. The filter is loaded by HashAnalyzer at startup.
-// If no auth key is configured the job disables itself.
+// Disabled when APIKey is empty.
 type HashSyncer struct {
 	logger   *zerolog.Logger
 	cfg      sharedconfig.ThreatIntelSettings
 	interval time.Duration
 }
 
-func NewHashSyncer(logger *zerolog.Logger, cfg sharedconfig.ThreatIntelSettings) *HashSyncer {
+func NewHashSyncer(logger *zerolog.Logger, cfg sharedconfig.ThreatIntelSettings, intervalHour int) *HashSyncer {
 	return &HashSyncer{
 		logger:   logger,
 		cfg:      cfg,
-		interval: time.Duration(cfg.HashSyncIntervalHour) * time.Hour,
+		interval: time.Duration(intervalHour) * time.Hour,
 	}
 }
 
@@ -57,8 +56,8 @@ func (h *HashSyncer) Name() string { return "hash_syncer" }
 func (h *HashSyncer) Run(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	if h.cfg.MalwareBazaarAuthKey == "" {
-		h.logger.Warn().Msg("hash syncer: no auth key configured — disabled")
+	if h.cfg.APIKey == "" {
+		h.logger.Warn().Msg("hash syncer: no API key configured — disabled")
 		return
 	}
 
@@ -100,6 +99,12 @@ func (h *HashSyncer) runOnce(ctx context.Context) error {
 		return err
 	}
 
+	// J2: delete the zip after a successful build so the next sync cycle
+	// always downloads a fresh export rather than reusing a stale file.
+	if removeErr := os.Remove(zipPath); removeErr != nil {
+		h.logger.Warn().Err(removeErr).Str("path", zipPath).Msg("hash syncer: could not remove zip after build")
+	}
+
 	h.logger.Info().
 		Int("hashes", count).
 		Str("elapsed", time.Since(start).Round(time.Second).String()).
@@ -109,24 +114,25 @@ func (h *HashSyncer) runOnce(ctx context.Context) error {
 }
 
 // download fetches the full CSV zip from MalwareBazaar.
-// Skips the download if the zip already exists on disk.
 func (h *HashSyncer) download(ctx context.Context, zipPath string) error {
-	if _, err := os.Stat(zipPath); err == nil {
-		h.logger.Info().Str("path", zipPath).Msg("hash syncer: zip exists, skipping download")
-		return nil
-	}
-
 	if err := os.MkdirAll(filepath.Dir(zipPath), 0o755); err != nil {
 		return fmt.Errorf("download: mkdir: %w", err)
 	}
 
-	url := fmt.Sprintf("%s?auth_key=%s", bazaarFullURL, h.cfg.MalwareBazaarAuthKey)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	baseURL := h.cfg.MalwareBazaarURL
+	if baseURL == "" {
+		baseURL = bazaarDefaultURL
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL, nil)
 	if err != nil {
 		return fmt.Errorf("download: build request: %w", err)
 	}
+	// J4: auth key moved from URL query parameter to header — a query
+	// parameter is included in access logs and any logged error messages.
+	req.Header.Set("Auth-Key", h.cfg.APIKey)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := hashClient.Do(req) // J5: dedicated client, not http.DefaultClient
 	if err != nil {
 		return fmt.Errorf("download: request: %w", err)
 	}
@@ -136,7 +142,6 @@ func (h *HashSyncer) download(ctx context.Context, zipPath string) error {
 		return fmt.Errorf("download: unexpected status %d", resp.StatusCode)
 	}
 
-	// Write to a temp file then rename — avoids partial writes.
 	tmp := zipPath + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
@@ -162,8 +167,8 @@ func (h *HashSyncer) download(ctx context.Context, zipPath string) error {
 	return nil
 }
 
-// buildFilter reads the CSV from the zip, extracts sha256_hash, and writes
-// the bloom filter to BloomFilterPath.
+// buildFilter reads the CSV from the zip, extracts sha256 values, and writes
+// the bloom filter. Bloom parameters come from config — not hardcoded constants.
 func (h *HashSyncer) buildFilter(zipPath string) (int, error) {
 	zr, err := zip.OpenReader(zipPath)
 	if err != nil {
@@ -188,38 +193,14 @@ func (h *HashSyncer) buildFilter(zipPath string) (int, error) {
 	}
 	defer rc.Close()
 
-	filter := bloom.NewWithEstimates(bloomCapacity, bloomFPRate)
-	count := 0
+	// J3: csv.Reader.Comment removes comment lines natively — the previous
+	// goroutine+pipe workaround is dead code once Comment is set.
 	reader := csv.NewReader(bufio.NewReader(rc))
+	reader.Comment = '#'
 
-	// MalwareBazaar CSV has comment lines starting with #.
-	// csv.Reader does not handle comments — we wrap it with a line filter.
-	// Reopen with filtered reader.
-	rc.Close()
-	rc2, err := csvFile.Open()
-	if err != nil {
-		return 0, fmt.Errorf("buildFilter: reopen csv: %w", err)
-	}
-	defer rc2.Close()
-
-	scanner := bufio.NewScanner(rc2)
+	filter := bloom.NewWithEstimates(h.cfg.BloomCapacity, h.cfg.BloomFPRate)
+	count := 0
 	headerSeen := false
-	pr, pw := io.Pipe()
-	reader = csv.NewReader(pr)
-
-	// Feed non-comment lines into the pipe in a goroutine.
-	go func() {
-		defer pw.Close()
-		w := bufio.NewWriter(pw)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if strings.HasPrefix(line, "#") {
-				continue
-			}
-			w.WriteString(line + "\n")
-		}
-		w.Flush()
-	}()
 
 	for {
 		row, err := reader.Read()
@@ -227,7 +208,7 @@ func (h *HashSyncer) buildFilter(zipPath string) (int, error) {
 			break
 		}
 		if err != nil {
-			// Skip malformed rows — don't abort the whole build.
+			// Skip malformed rows — do not abort the whole build for one bad line.
 			continue
 		}
 		if !headerSeen {
@@ -237,7 +218,9 @@ func (h *HashSyncer) buildFilter(zipPath string) (int, error) {
 		if len(row) <= sha256Col {
 			continue
 		}
-		sha256 := strings.TrimSpace(strings.ToLower(row[sha256Col]))
+		// A10 (hash.go companion): lowercase at insert time so TestString in
+		// HashAnalyzer needs no conversion.
+		sha256 := strings.ToLower(strings.TrimSpace(row[sha256Col]))
 		if len(sha256) != 64 {
 			continue
 		}
@@ -251,7 +234,6 @@ func (h *HashSyncer) buildFilter(zipPath string) (int, error) {
 	return count, nil
 }
 
-// writeFilter serialises the bloom filter to BloomFilterPath atomically.
 func (h *HashSyncer) writeFilter(filter *bloom.BloomFilter) error {
 	if err := os.MkdirAll(filepath.Dir(h.cfg.BloomFilterPath), 0o755); err != nil {
 		return fmt.Errorf("writeFilter: mkdir: %w", err)

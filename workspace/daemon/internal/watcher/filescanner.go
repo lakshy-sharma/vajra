@@ -10,6 +10,7 @@ package watcher
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -24,12 +25,14 @@ import (
 // FileScanner watches eBPF file events and submits eligible files
 // through the analyzer pipeline. Writes through FindingWriter.
 type FileScanner struct {
-	logger   *zerolog.Logger
-	pipeline *analyzer.Pipeline
-	writer   *findings.FindingWriter
-	filter   *utilities.ExclusionFilter
-	tracker  *utilities.RecentScanTracker
-	sysInfo  utilities.SystemInfo
+	logger       *zerolog.Logger
+	pipeline     *analyzer.Pipeline
+	writer       *findings.FindingWriter
+	filter       *utilities.ExclusionFilter
+	tracker      *utilities.RecentScanTracker
+	sysInfo      utilities.SystemInfo
+	maxFileSize  int64
+	interpreters map[string]bool // basenames from AlertPolicy.Interpreters
 }
 
 func NewFileScanner(
@@ -38,14 +41,22 @@ func NewFileScanner(
 	writer *findings.FindingWriter,
 	filter *utilities.ExclusionFilter,
 	sysInfo utilities.SystemInfo,
+	maxFileSizeBytes int64,
+	interpreters []string,
 ) *FileScanner {
+	interpMap := make(map[string]bool, len(interpreters))
+	for _, interp := range interpreters {
+		interpMap[filepath.Base(interp)] = true
+	}
 	return &FileScanner{
-		logger:   logger,
-		pipeline: pipeline,
-		writer:   writer,
-		filter:   filter,
-		tracker:  utilities.NewRecentScanTracker(5 * time.Minute),
-		sysInfo:  sysInfo,
+		logger:       logger,
+		pipeline:     pipeline,
+		writer:       writer,
+		filter:       filter,
+		tracker:      utilities.NewRecentScanTracker(5 * time.Minute),
+		sysInfo:      sysInfo,
+		maxFileSize:  maxFileSizeBytes,
+		interpreters: interpMap,
 	}
 }
 
@@ -79,7 +90,14 @@ func (fs *FileScanner) handle(ctx context.Context, event ebpf.FileEvent) {
 		return
 	}
 
-	eligible, reason := isEligibleFile(filePath, comm)
+	// W9: open once, stat the open fd — prevents TOCTOU between stat and magic check.
+	f, err := os.Open(filePath)
+	if err != nil {
+		return
+	}
+
+	eligible, reason := isEligibleFile(f, comm, fs.maxFileSize, fs.interpreters)
+	f.Close()
 	if !eligible {
 		fs.logger.Debug().Str("file", filePath).Str("reason", reason).Msg("file scanner: ineligible")
 		return
@@ -106,13 +124,13 @@ func (fs *FileScanner) handle(ctx context.Context, event ebpf.FileEvent) {
 		return
 	}
 
-	fileSize := int64(0)
+	var fileSize int64
 	if info, err := os.Stat(filePath); err == nil {
 		fileSize = info.Size()
 	}
 
 	ruleID := utilities.RuleFromMatch(result.Notes, result.YaraMatches)
-	f := findings.Finding{
+	finding := findings.Finding{
 		Source:      findings.SourceFileScanner,
 		Severity:    result.Severity,
 		Status:      models.StatusNew,
@@ -128,7 +146,7 @@ func (fs *FileScanner) handle(ctx context.Context, event ebpf.FileEvent) {
 		YaraMatches: result.YaraMatches,
 	}
 
-	if _, err := fs.writer.Write(ctx, f); err != nil {
+	if _, err := fs.writer.Write(ctx, finding); err != nil {
 		fs.logger.Error().Err(err).Str("file", filePath).Msg("file scanner: write failed")
 		return
 	}
@@ -142,10 +160,12 @@ func (fs *FileScanner) handle(ctx context.Context, event ebpf.FileEvent) {
 		Msg("FILE DETECTION")
 }
 
-// isEligibleFile returns true if any one of three conditions passes.
-// Size bounds always apply regardless of condition.
-func isEligibleFile(filePath string, triggerComm string) (bool, string) {
-	info, err := os.Stat(filePath)
+// isEligibleFile checks whether a file warrants scanning.
+// W9: takes an already-open *os.File so stat and magic check share one fd.
+// W7: maxSize comes from ScanSettings.MaxFileSizeBytes, not a hardcoded constant.
+// W8: uses utilities.HasExecutableMagic instead of a local duplicate.
+func isEligibleFile(f *os.File, triggerComm string, maxSize int64, interpreters map[string]bool) (bool, string) {
+	info, err := f.Stat()
 	if err != nil {
 		return false, "stat_failed"
 	}
@@ -155,46 +175,19 @@ func isEligibleFile(filePath string, triggerComm string) (bool, string) {
 	if info.Size() < 10 {
 		return false, "too_small"
 	}
-	if info.Size() > 100*1024*1024 {
+	if maxSize > 0 && info.Size() > maxSize {
 		return false, "too_large"
 	}
 	if info.Mode()&0o111 != 0 {
 		return true, ""
 	}
-	if hasExecutableMagic(filePath) {
+	if utilities.HasExecutableMagic(f) {
 		return true, ""
 	}
-	if triggerComm != "" && utilities.KnownInterpreters[triggerComm] {
+	// A file opened by a known interpreter is worth scanning even without
+	// an executable bit — scripts are loaded, not executed directly.
+	if triggerComm != "" && interpreters[triggerComm] {
 		return true, ""
 	}
 	return false, "not_executable"
-}
-
-// hasExecutableMagic checks the first 4 bytes for known executable formats.
-// ELF: 7f 45 4c 46 — Shebang: 23 21 — MZ/PE: 4d 5a — Mach-O: ca fe ba be
-func hasExecutableMagic(filePath string) bool {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return false
-	}
-	defer f.Close()
-
-	magic := make([]byte, 4)
-	n, err := f.Read(magic)
-	if err != nil || n < 2 {
-		return false
-	}
-	if n >= 4 && magic[0] == 0x7f && magic[1] == 0x45 && magic[2] == 0x4c && magic[3] == 0x46 {
-		return true
-	}
-	if magic[0] == '#' && magic[1] == '!' {
-		return true
-	}
-	if magic[0] == 0x4d && magic[1] == 0x5a {
-		return true
-	}
-	if n >= 4 && magic[0] == 0xca && magic[1] == 0xfe && magic[2] == 0xba && magic[3] == 0xbe {
-		return true
-	}
-	return false
 }

@@ -5,6 +5,13 @@
 
 package models
 
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+)
+
 type EventSeverity string
 
 const (
@@ -33,262 +40,226 @@ const (
 	CategoryCronSystem    AutorunCategory = "cron_system"
 	CategoryCronUser      AutorunCategory = "cron_user"
 	CategoryShellProfile  AutorunCategory = "shell_profile"
+	CategoryLDPreload     AutorunCategory = "ld_preload"
+	CategoryPAM           AutorunCategory = "pam"
+	CategoryDesktopEntry  AutorunCategory = "desktop_entry"
 	CategorySysVInit      AutorunCategory = "sysv_init"
 	CategoryXDGAutostart  AutorunCategory = "xdg_autostart"
+	CategoryKernelModule  AutorunCategory = "kernel_module"
+	CategoryUdevRule      AutorunCategory = "udev_rule"
 	CategoryDBus          AutorunCategory = "dbus"
 	CategoryAtJob         AutorunCategory = "at_job"
 	CategoryAnacron       AutorunCategory = "anacron"
-	CategoryLDPreload     AutorunCategory = "ld_preload"
-	CategoryPAM           AutorunCategory = "pam"
 )
 
-func (e *AutorunEntry) UniqueKey() string {
-	if e.SHA256 != "" {
-		return e.SHA256
-	}
-	return string(e.Category) + "|" + e.Location + "|" + e.ImagePath
+type YaraStringMatch struct {
+	Identifier  string `json:"identifier"`
+	Offset      uint64 `json:"offset"`
+	SnapshotHex string `json:"snapshot_hex"`
 }
 
 type YaraMatch struct {
-	Rule      string   `json:"rule"`
-	Namespace string   `json:"namespace"`
-	Tags      []string `json:"tags"`
-	Strings   []string `json:"strings,omitempty"`
+	Rule      string            `json:"rule"`
+	Namespace string            `json:"namespace"`
+	Tags      []string          `json:"tags"`
+	Strings   []YaraStringMatch `json:"strings,omitempty"`
 }
 
-// ── Unified detection ─────────────────────────────────────────
-
-// Detection is the unified record written by FindingWriter for every
-// non-clean finding regardless of source. The UI, sync, and response
-// system all reference this table — not per-source tables.
 type Detection struct {
-	ID            int64
-	MachineID     string
-	DetectionTime int64
-	Source        string
-	Severity      EventSeverity
-	Status        EventStatus
-
-	// Process context — zero when not applicable.
-	PID         uint32
-	PPID        uint32
-	UID         uint32
-	GID         uint32
-	EUID        uint32
-	EGID        uint32
-	ProcessName string
-	ExePath     string
-	CmdLine     string
-	CWD         string
-
-	TargetPath     string
-	RuleID         string
-	MITRETechnique string
-	Notes          string
-	DedupCount     uint64
-	CreatedAt      string
-	UpdatedAt      string
+	ID             int64         `json:"id"`
+	MachineID      string        `json:"machine_id"`
+	DetectionTime  int64         `json:"detection_time"`
+	Source         string        `json:"source"`
+	Severity       EventSeverity `json:"severity"`
+	Status         EventStatus   `json:"status"`
+	PID            uint32        `json:"pid"`
+	PPID           uint32        `json:"ppid"`
+	UID            uint32        `json:"uid"`
+	GID            uint32        `json:"gid"`
+	EUID           uint32        `json:"euid"`
+	EGID           uint32        `json:"egid"`
+	ProcessName    string        `json:"process_name"`
+	ExePath        string        `json:"exe_path"`
+	CmdLine        string        `json:"cmd_line"`
+	CWD            string        `json:"cwd"`
+	TargetPath     string        `json:"target_path"`
+	RuleID         string        `json:"rule_id"`
+	MITRETechnique string        `json:"mitre_technique"`
+	DedupCount     uint64        `json:"dedup_count"`
+	Notes          string        `json:"notes"`
+	CreatedAt      int64         `json:"created_at"`
+	UpdatedAt      int64         `json:"updated_at"`
 }
 
-// DetectionArtifact holds file hash and YARA matches for detections
-// that involve file content analysis. Separated to avoid nulls on
-// detections that have no file content (e.g. reverse shell, secrets).
 type DetectionArtifact struct {
-	ID          int64
-	DetectionID int64
-	FileHash    string
-	FileSize    int64
-	YaraMatches []YaraMatch
+	ID          int64       `json:"id"`
+	DetectionID int64       `json:"detection_id"`
+	FileHash    string      `json:"file_hash"`
+	FileSize    int64       `json:"file_size"`
+	YaraMatches []YaraMatch `json:"yara_matches"`
 }
 
-// DetectionNetwork holds socket details for reverse shell detections.
 type DetectionNetwork struct {
-	ID          int64
-	DetectionID int64
-	RemoteAddr  string
-	RemotePort  uint16
-	Protocol    string
-	SocketInode uint64
-	OldFd       uint32
-	NewFd       uint32
+	ID          int64  `json:"id"`
+	DetectionID int64  `json:"detection_id"`
+	RemoteAddr  string `json:"remote_addr"`
+	RemotePort  uint16 `json:"remote_port"`
+	Protocol    string `json:"protocol"`
+	SocketInode uint64 `json:"socket_inode"`
+	OldFd       int32  `json:"old_fd"` // dup2/dup3 source fd — signed to match kernel syscall ABI
+	NewFd       int32  `json:"new_fd"` // dup2/dup3 destination stdio fd (0/1/2)
 }
 
-// DetectionSecret holds betterleaks finding detail.
-// SecretHash is sha256(secret) — the raw value is never stored.
-// Fingerprint is the betterleaks-computed match fingerprint used
-// to suppress known false positives via WithIgnoredFingerprints.
-type DetectionSecret struct {
-	ID           int64
-	DetectionID  int64
-	RuleID       string
-	SecretHash   string
-	Fingerprint  string
-	StartLine    int
-	EndLine      int
-	MatchContext string // surrounding line with secret redacted
-}
-
-// DetectionExtension is one key/value pair attached to a detection.
-// Used as a forward-compatible escape hatch for source-specific fields
-// that don't warrant a dedicated column. Each key gets its own row
-// so searches on key+value are index-assisted.
 type DetectionExtension struct {
-	ID          int64
-	DetectionID int64
-	Key         string
-	Value       string
+	ID          int64  `json:"id"`
+	DetectionID int64  `json:"detection_id"`
+	Key         string `json:"key"`
+	Value       string `json:"value"`
 }
 
-// EvidenceSnapshot captures live process state at the moment a
-// HIGH or CRITICAL detection fires. Process state goes stale within
-// seconds — the collector runs immediately on detection.
+type DetectionSecret struct {
+	ID           int64  `json:"id"`
+	DetectionID  int64  `json:"detection_id"`
+	RuleID       string `json:"rule_id"`
+	SecretHash   string `json:"secret_hash"`
+	Fingerprint  string `json:"fingerprint"`
+	StartLine    int    `json:"start_line"`
+	EndLine      int    `json:"end_line"`
+	MatchContext string `json:"match_context"`
+}
+
 type EvidenceSnapshot struct {
-	ID          int64
-	DetectionID int64
-	CapturedAt  int64
-	OpenFDs     string // JSON — /proc/PID/fd/* symlink targets
-	Maps        string // JSON — /proc/PID/maps entries
-	Environ     string // JSON — /proc/PID/environ key/value pairs
-	Status      string // raw /proc/PID/status content
-}
-
-// AuditLog records component lifecycle and health events.
-// Append-only — never updated or deleted by retention cleanup.
-type AuditLog struct {
-	ID        int64
-	MachineID string
-	LoggedAt  int64
-	Component string
-	EventType string // 'startup', 'shutdown', 'scan_completed',
-	// 'rules_updated', 'health_check', 'error'
-	Status         string // 'ok', 'warn', 'error'
-	Details        string // JSON — component-specific metrics
-	DurationMS     int64
-	ItemsProcessed int64
-}
-
-// ── Raw telemetry ─────────────────────────────────────────────
-// These tables record all kernel events including noise.
-// They feed the Sigma engine and behavioral correlation server-side.
-// Detection tables above hold only non-clean findings.
-
-type NetworkEvent struct {
-	ID          int64
-	MachineID   string
-	EventTime   int64
-	EventType   uint32
-	PID         uint32
-	UID         uint32
-	ProcessName string
-	SrcAddr     string
-	DstAddr     string
-	SrcPort     uint16
-	DstPort     uint16
-	Protocol    string
-	Severity    EventSeverity
-	Status      EventStatus
-	Notes       string
-	CreatedAt   string
-}
-
-type MemoryEvent struct {
-	ID          int64
-	MachineID   string
-	EventTime   int64
-	EventType   uint32
-	PID         uint32
-	UID         uint32
-	ProcessName string
-	Address     uint64
-	Length      uint64
-	Protection  uint32
-	Flags       uint32
-	FilePath    string
-	Severity    EventSeverity
-	Status      EventStatus
-	Notes       string
-	CreatedAt   string
+	ID          int64           `json:"id"`
+	DetectionID int64           `json:"detection_id"`
+	CapturedAt  int64           `json:"captured_at"`
+	OpenFDs     json.RawMessage `json:"open_fds"`
+	Maps        json.RawMessage `json:"maps"`
+	Environ     json.RawMessage `json:"environ"`
+	Status      string          `json:"status"`
 }
 
 type SecurityEvent struct {
-	ID          int64
-	MachineID   string
-	EventTime   int64
-	EventType   uint32
-	EventName   string
-	PID         uint32
-	UID         uint32
-	ProcessName string
-	TargetPID   uint32
-	TargetPath  string
-	Details     string
-	Severity    EventSeverity
-	Status      EventStatus
-	YaraMatches []YaraMatch
-	ActionTaken string
-	Notes       string
-	CreatedAt   string
-	UpdatedAt   string
+	ID          int64         `json:"id"`
+	MachineID   string        `json:"machine_id"`
+	EventTime   int64         `json:"event_time"`
+	EventType   uint32        `json:"event_type"`
+	EventName   string        `json:"event_name"`
+	PID         uint32        `json:"pid"`
+	UID         uint32        `json:"uid"`
+	ProcessName string        `json:"process_name"`
+	TargetPID   uint32        `json:"target_pid"`
+	TargetPath  string        `json:"target_path"`
+	Details     string        `json:"details"`
+	Severity    EventSeverity `json:"severity"`
+	Status      EventStatus   `json:"status"`
+	ActionTaken string        `json:"action_taken"`
+	Notes       string        `json:"notes"`
+	CreatedAt   int64         `json:"created_at"`
+	UpdatedAt   int64         `json:"updated_at"`
 }
 
-// ── Inventory ─────────────────────────────────────────────────
+type NetworkEvent struct {
+	ID          int64         `json:"id"`
+	MachineID   string        `json:"machine_id"`
+	EventTime   int64         `json:"event_time"`
+	EventType   uint32        `json:"event_type"`
+	PID         uint32        `json:"pid"`
+	UID         uint32        `json:"uid"`
+	ProcessName string        `json:"process_name"`
+	SrcAddr     string        `json:"src_addr"`
+	DstAddr     string        `json:"dst_addr"`
+	SrcPort     uint16        `json:"src_port"`
+	DstPort     uint16        `json:"dst_port"`
+	Protocol    string        `json:"protocol"`
+	Severity    EventSeverity `json:"severity"`
+	Status      EventStatus   `json:"status"`
+	Notes       string        `json:"notes"`
+	CreatedAt   int64         `json:"created_at"`
+	UpdatedAt   int64         `json:"updated_at"`
+}
+
+type MemoryEvent struct {
+	ID          int64         `json:"id"`
+	MachineID   string        `json:"machine_id"`
+	EventTime   int64         `json:"event_time"`
+	EventType   uint32        `json:"event_type"`
+	PID         uint32        `json:"pid"`
+	UID         uint32        `json:"uid"`
+	ProcessName string        `json:"process_name"`
+	Address     uint64        `json:"address"`
+	Length      uint64        `json:"length"`
+	Protection  uint32        `json:"protection"`
+	Flags       uint32        `json:"flags"`
+	FilePath    string        `json:"file_path"`
+	Severity    EventSeverity `json:"severity"`
+	Status      EventStatus   `json:"status"`
+	Notes       string        `json:"notes"`
+	CreatedAt   int64         `json:"created_at"`
+	UpdatedAt   int64         `json:"updated_at"`
+}
+
+type ProcessTreeEntry struct {
+	ID        int64  `json:"id"`
+	MachineID string `json:"machine_id"`
+	PID       uint32 `json:"pid"`
+	PPID      uint32 `json:"ppid"`
+	Comm      string `json:"comm"`
+	ExePath   string `json:"exe_path"`
+	CmdLine   string `json:"cmd_line"`
+	EventTime int64  `json:"event_time"`
+	CreatedAt int64  `json:"created_at"`
+}
 
 type AutorunEntry struct {
-	ID        int64
-	Category  AutorunCategory
-	Location  string
-	ImagePath string
-	ImageName string
-	Arguments string
-	MD5       string
-	SHA1      string
-	SHA256    string
-	IsActive  bool
-	FirstSeen int64
-	LastSeen  int64
-	CreatedAt string
-	UpdatedAt string
+	ID        int64           `json:"id"`
+	MachineID string          `json:"machine_id"`
+	Category  AutorunCategory `json:"category"`
+	Location  string          `json:"location"`
+	ImagePath string          `json:"image_path"`
+	ImageName string          `json:"image_name"`
+	Arguments string          `json:"arguments"`
+	SHA256    string          `json:"sha256"`
+	IsActive  bool            `json:"is_active"`
+	FirstSeen int64           `json:"first_seen"`
+	LastSeen  int64           `json:"last_seen"`
+	CreatedAt int64           `json:"created_at"`
+	UpdatedAt int64           `json:"updated_at"`
 }
 
-type QuarantinedFile struct {
-	ID             int64
-	OriginalPath   string
-	QuarantinePath string
-	FileHash       string
-	FileSize       int64
-	QuarantineTime int64
-	RelatedID      int64 // FK → detections.id
-	Severity       EventSeverity
-	Reason         string
-	Restored       bool
-	RestoredTime   int64
-	Notes          string
-	CreatedAt      string
+// UniqueKey returns a stable identity key for deduplication against DB state.
+// Null-byte separators prevent category+location+path tuple collisions.
+func (e *AutorunEntry) UniqueKey() string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s\x00%s\x00%s", e.Category, e.Location, e.ImagePath)
+	return hex.EncodeToString(h.Sum(nil))
 }
-
-// ── Aggregation ───────────────────────────────────────────────
 
 type EventStatistic struct {
-	ID             int64
-	Date           string
-	EventType      uint32
-	EventName      string
-	TotalCount     int64
-	MaliciousCount int64
-	CleanCount     int64
+	ID             int64  `json:"id"`
+	Date           int64  `json:"date"`
+	EventType      uint32 `json:"event_type"`
+	EventName      string `json:"event_name"`
+	TotalCount     int64  `json:"total_count"`
+	MaliciousCount int64  `json:"malicious_count"`
+	CleanCount     int64  `json:"clean_count"`
 }
 
-// ── Process tree ──────────────────────────────────────────────
+type AuditLog struct {
+	ID             int64  `json:"id"`
+	MachineID      string `json:"machine_id"`
+	LoggedAt       int64  `json:"logged_at"`
+	Component      string `json:"component"`
+	EventType      string `json:"event_type"`
+	Status         string `json:"status"`
+	Details        string `json:"details"`
+	DurationMS     int64  `json:"duration_ms"`
+	ItemsProcessed int64  `json:"items_processed"`
+}
 
-// ProcessTreeEntry is one row in the process_tree adjacency list.
-// Written on every execve regardless of scan outcome.
-type ProcessTreeEntry struct {
-	ID        int64
-	MachineID string
-	PID       uint32
-	PPID      uint32
-	Comm      string
-	ExePath   string
-	CmdLine   string
-	EventTime int64
+type AppConfig struct {
+	ID            int64  `json:"id"`
+	ConfigJSON    string `json:"config_json"`
+	SchemaVersion int    `json:"schema_version"`
+	YAMLPath      string `json:"yaml_path"`
+	UpdatedAt     int64  `json:"updated_at"`
 }

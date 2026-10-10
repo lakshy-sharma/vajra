@@ -8,7 +8,6 @@ package yara
 import (
 	"bufio"
 	"context"
-	"fmt"
 	"os"
 	"runtime"
 	"strconv"
@@ -35,12 +34,10 @@ type ScanResult struct {
 	Duration time.Duration
 }
 
-// Pool is a bounded worker pool for YARA scanning with load-aware
-// autotune. Workers scale between min and max based on queue depth
-// and system load average read from /proc/loadavg.
+// Pool is a bounded worker pool for YARA scanning with load-aware autotune.
 type Pool struct {
 	logger     *zerolog.Logger
-	scan       func(filePath string) ([]Match, error)
+	scan       func(f *os.File) ([]Match, error)
 	queue      chan ScanRequest
 	minWorkers int
 	maxWorkers int
@@ -48,15 +45,18 @@ type Pool struct {
 	current    atomic.Int32
 	rollingDur atomic.Int64
 	rollingN   atomic.Int64
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	mu         sync.Mutex
+	// E7: track whether we've already logged the "should shrink" state so
+	// the message fires once on entry rather than on every autotune tick.
+	shrinkLogged atomic.Bool
+	ctx          context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
+	mu           sync.Mutex
 }
 
 func NewPool(
 	rules *goyara.Rules,
-	minWorkers, maxWorkers, queueSize, scanTimeoutSec int,
+	minWorkers, maxWorkers, queueSize, scanTimeoutSec, yaraSnapshotBytes int,
 	logger *zerolog.Logger,
 ) *Pool {
 	if minWorkers < 1 {
@@ -86,12 +86,17 @@ func NewPool(
 		cancel:     cancel,
 	}
 
-	p.scan = func(filePath string) ([]Match, error) {
+	snapshotBytes := yaraSnapshotBytes
+
+	// E6: scan via file descriptor opened by execute() so the fd used for
+	// stat and the fd used for scanning are the same — eliminates the TOCTOU
+	// window between os.Stat and the previous rules.ScanFile(path) call.
+	p.scan = func(f *os.File) ([]Match, error) {
 		var raw goyara.MatchRules
-		if err := rules.ScanFile(filePath, 0, timeout, &raw); err != nil {
+		if err := rules.ScanFileDescriptor(uintptr(f.Fd()), 0, timeout, &raw); err != nil {
 			return nil, err
 		}
-		return ConvertMatches(raw), nil
+		return ConvertMatches(raw, snapshotBytes), nil
 	}
 
 	for i := 0; i < minWorkers; i++ {
@@ -109,7 +114,6 @@ func NewPool(
 	return p
 }
 
-// Submit queues a scan request. Returns false if the queue is full.
 func (p *Pool) Submit(filePath string, result chan<- ScanResult) bool {
 	select {
 	case p.queue <- ScanRequest{FilePath: filePath, Result: result}:
@@ -119,7 +123,6 @@ func (p *Pool) Submit(filePath string, result chan<- ScanResult) bool {
 	}
 }
 
-// Enqueue blocks until queue has space or ctx is cancelled.
 func (p *Pool) Enqueue(ctx context.Context, filePath string, result chan<- ScanResult) bool {
 	select {
 	case p.queue <- ScanRequest{FilePath: filePath, Result: result}:
@@ -157,19 +160,25 @@ func (p *Pool) spawnWorker() {
 	}()
 }
 
+// execute opens the target file once and passes the fd to YARA.
+// E6: opening here rather than in scan() ensures we hold the fd across
+// both the stat-equivalent check (Open returning an error) and the actual
+// scan, eliminating the TOCTOU race of stat-then-ScanFile(path).
 func (p *Pool) execute(req ScanRequest) {
-	if _, err := os.Stat(req.FilePath); err != nil {
+	f, err := os.Open(req.FilePath)
+	if err != nil {
 		req.Result <- ScanResult{FilePath: req.FilePath, Error: err}
 		return
 	}
+	defer f.Close()
 
 	start := time.Now()
-	matches, err := p.scan(req.FilePath)
+	matches, err := p.scan(f)
 	dur := time.Since(start)
 
 	n := p.rollingN.Add(1)
 	prev := p.rollingDur.Load()
-	alpha := int64(10)
+	const alpha = int64(10)
 	newAvg := (prev*(100-alpha) + dur.Nanoseconds()*alpha) / 100
 	if n == 1 {
 		newAvg = dur.Nanoseconds()
@@ -207,10 +216,12 @@ func (p *Pool) adjust() {
 
 	if load >= sat && load > 0 {
 		p.logger.Debug().Int("workers", current).Float64("load", load).Msg("autotune: saturated, holding")
+		p.shrinkLogged.Store(false)
 		return
 	}
 	if load >= high && load > 0 {
 		p.logger.Debug().Int("workers", current).Float64("load", load).Msg("autotune: high load, holding")
+		p.shrinkLogged.Store(false)
 		return
 	}
 
@@ -220,17 +231,24 @@ func (p *Pool) adjust() {
 			p.spawnWorker()
 			p.logger.Debug().Int("workers", current+1).Int("queue_depth", depth).Msg("autotune: low load, added worker")
 		}
+		p.shrinkLogged.Store(false)
 		return
 	}
 	if depth > current && canGrow {
 		p.spawnWorker()
 		p.logger.Debug().Int("workers", current+1).Int("queue_depth", depth).Msg("autotune: queue backed up, added worker")
+		p.shrinkLogged.Store(false)
 		return
 	}
 
-	fastThresholdNs := int64(500 * time.Millisecond)
+	const fastThresholdNs = int64(500 * time.Millisecond)
 	if depth == 0 && avgNs < fastThresholdNs && current > p.minWorkers {
-		p.logger.Debug().Int("workers", current).Msg("autotune: idle, would shrink (per-worker cancel not implemented)")
+		// E7: log once when entering the idle-should-shrink state, not every tick.
+		if p.shrinkLogged.CompareAndSwap(false, true) {
+			p.logger.Debug().Int("workers", current).Msg("autotune: idle, shrink pending (per-worker cancel not yet implemented)")
+		}
+	} else {
+		p.shrinkLogged.Store(false)
 	}
 }
 
@@ -255,10 +273,4 @@ func loadAverage() float64 {
 	return load
 }
 
-func loadAverageFormatted() string {
-	load := loadAverage()
-	if load < 0 {
-		return "unknown"
-	}
-	return fmt.Sprintf("%.2f", load)
-}
+// loadAverageFormatted was defined but never called — removed (dead code).
