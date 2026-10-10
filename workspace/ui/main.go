@@ -7,6 +7,7 @@ package main
 
 import (
 	"embed"
+	"flag"
 	"log"
 	"os"
 
@@ -21,12 +22,18 @@ import (
 var assets embed.FS
 
 func main() {
-	cfgPath := os.Getenv("VAJRA_CONFIG")
-	if cfgPath == "" {
-		cfgPath = "/etc/vajra/config.yaml"
+	// Config path resolution order:
+	//   1. --config flag
+	//   2. VAJRA_CONFIG environment variable
+	//   3. /etc/vajra/config.yaml default
+	defaultCfg := os.Getenv("VAJRA_CONFIG")
+	if defaultCfg == "" {
+		defaultCfg = "/etc/vajra/config.yaml"
 	}
+	cfgPath := flag.String("config", defaultCfg, "path to config.yaml")
+	flag.Parse()
 
-	app := NewApp(cfgPath)
+	app := NewApp(*cfgPath)
 
 	// UI5: derive window background from the configured theme so the native
 	// window colour matches what the HTML will render — prevents a flash of
