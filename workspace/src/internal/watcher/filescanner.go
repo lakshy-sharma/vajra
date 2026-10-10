@@ -97,7 +97,7 @@ func (fs *FileScanner) handle(ctx context.Context, event ebpf.FileEvent) {
 		return
 	}
 
-	result, err := fs.pipeline.Run(ctx, filePath, fileHash)
+	result, err := fs.pipeline.Run(analyzer.CtxWithSHA256(ctx, fileHash), filePath, fileHash)
 	if err != nil {
 		fs.logger.Error().Err(err).Str("file", filePath).Msg("file scanner: pipeline error")
 		return

@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/rs/zerolog"
 	"vajra/internal/analyzer"
@@ -47,6 +46,7 @@ func NewProcessScanner(
 	writer *findings.FindingWriter,
 	treeQ *queries.ProcessTreeQueries,
 	filter *utilities.ProcessFilter,
+	tracker *utilities.RecentScanTracker, // injected — shared with RunProcWalk
 	sysInfo utilities.SystemInfo,
 ) *ProcessScanner {
 	return &ProcessScanner{
@@ -56,11 +56,10 @@ func NewProcessScanner(
 		writer:          writer,
 		treeQ:           treeQ,
 		filter:          filter,
-		tracker:         utilities.NewRecentScanTracker(10 * time.Minute),
+		tracker:         tracker,
 		sysInfo:         sysInfo,
 	}
 }
-
 func (ps *ProcessScanner) Name() string { return "process_scanner" }
 
 func (ps *ProcessScanner) Run(ctx context.Context, wg *sync.WaitGroup, ch <-chan ebpf.ProcessEvent) {
@@ -126,7 +125,7 @@ func (ps *ProcessScanner) handle(ctx context.Context, event ebpf.ProcessEvent) {
 		if err != nil {
 			ps.logger.Debug().Err(err).Str("exe", exePath).Msg("process scanner: hash failed, skipping content pipeline")
 		} else {
-			contentResult, err = ps.contentPipeline.Run(pCtx, exePath, fileHash)
+			contentResult, err = ps.contentPipeline.Run(analyzer.CtxWithSHA256(pCtx, fileHash), exePath, fileHash)
 			if err != nil {
 				ps.logger.Error().Err(err).Str("exe", exePath).Msg("process scanner: content pipeline error")
 			}

@@ -1,46 +1,79 @@
-# Generic settings
+# /etc/vajra/config.yaml
+
 generic_settings:
-  operation_mode: "monitor"
-  work_directory: "/tmp/vajra"
-  db_directory: "./database"
-  db_filename: "vajra.db"
+  operation_mode: monitor
+  work_directory: /var/lib/vajra
+  db_directory: /var/lib/vajra
+  db_filename: vajra.db
 
 api_settings:
-  host: "localhost"
+  host: localhost
   port: 8086
 
 timing_settings:
-  autorun_scan_time_min: 30
+  autorun_scan_time_min: 15
   database_cleanup_time_hour: 24
-  database_retention_days: 90
+  database_retention_days: 30
   shutdown_timeout_sec: 30
   single_file_scan_timeout_sec: 30
   dedup_window_min: 5
 
 performance_settings:
-  default_threads: 1
-  max_allowed_threads: 3
+  default_threads: 2
+  max_allowed_threads: 4
   scan_queue_size: 1000
   file_scan_buffer_size: 100
 
 rules_settings:
-  rules_filepath: "./deb_skel/opt/vajra/rules.zip"
-  rules_archive_dir: "/opt/vajra/rules-archive"
-  rules_remote_url: "https://github.com/YARAHQ/yara-forge/releases/latest/download/yara-forge-rules-core.zip"
-  rules_remote_hash_url: "https://github.com/YARAHQ/yara-forge/releases/latest/download/yara-forge-rules-core.zip.sha256"
+  rules_filepath: /opt/vajra/rules.zip
+  rules_archive_dir: /opt/vajra/rules-archive
+  rules_remote_url: https://github.com/YARAHQ/yara-forge/releases/latest/download/yara-forge-rules-core.zip
+  rules_remote_hash_url: https://github.com/YARAHQ/yara-forge/releases/latest/download/yara-forge-rules-core.zip.sha256
   rules_sync_interval_hour: 24
   rules_archive_count: 7
 
+threat_intel_settings:
+  malware_bazaar_auth_key: ""
+  bloom_filter_path: /opt/vajra/hashes.bloom
+  hash_sync_interval_hour: 24
+
 scan_settings:
-  target_directory: "/home/lakshy-sharma"
+  target_directory: /
+
+  secrets:
+    target_directories:
+      - /home
+      - /root
+      - /etc
+      - /opt
+      - /var
+      - /srv
+      - /run
+      - /tmp
+    exclude_browser_cache: true
+    exclude_segments:
+      - /miniconda/
+      - /.local/share/flatpak/
+      - /run/flatpak/
+      - /proc/
+      - /sys/
+      - /dev/
+
   exclusion_rules:
     exclude_paths:
+      - /proc
+      - /sys
+      - /dev
+      - /run/user
+
     exclude_extensions:
       - .swp
       - .lock
       - .pid
       - .socket
+
     exclude_patterns:
+
     exclude_processes:
       - gopls
       - pylsp
@@ -53,13 +86,13 @@ scan_settings:
       - pulseaudio
 
 logging:
-  enable_console: true
+  enable_console: false
   use_json: true
   enable_file_logging: true
-  log_directory: "./logs"
-  log_filename: "vajra.log"
+  log_directory: /var/log/vajra
+  log_filename: vajra.log
   max_size_mb: 50
-  max_age_days: 1
+  max_age_days: 30
   max_backups: 5
-  log_level: "info"
-  time_format: "UNIXMS"
+  log_level: info
+  time_format: UNIXMS

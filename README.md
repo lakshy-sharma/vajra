@@ -12,42 +12,45 @@ Build a modern, production-grade endpoint detection and response system with rou
 
 **What makes us different?**
 
-1. Reduced memory and CPU footprint through careful engineering and load-aware autotune.
-2. Alert fatigue addressed at the architecture level — unified dedup, result caching, and a single Finding writer across all detection sources.
-3. eBPF-based monitoring — no kernel modules, no polling, no missed events.
-4. Normalized detection schema — all findings from all sources land in one table, making the UI, sync, and response system simple.
-5. Composable analyzer pipeline — YARA, hash lookup, LD_PRELOAD, capability abuse, and LOLBin checks run as independent stages. Adding a new analyzer is one struct and one line in service.go.
+1. Minimal resource footprint — careful engineering and load-aware tuning keep CPU and memory usage low even under heavy workloads.
+2. Alert fatigue addressed at the architecture level — unified deduplication and a single detection writer across all sources mean your team sees signal, not noise.
+3. eBPF-based monitoring — hooks directly into the Linux kernel with no kernel modules, no polling, and no missed events.
+4. Normalized detection schema — every finding from every source lands in one table, making dashboards, sync, and response straightforward.
+5. Composable detection pipeline — hash lookup, YARA scanning, and behavioral checks run as independent stages. Adding a new detection is one struct and one line.
 
 ## Current Features
 
-- eBPF syscall monitoring — process execution, file creation, network connections, memory events, dup2/dup3 stdio redirection, namespace operations, kernel module loads
-- Reverse shell detection via dup2/dup3 tracepoints — catches `bash -i >& /dev/tcp/...` that exec-time inspection misses
-- YARA file and process scanning via an autotuning worker pool with load-average awareness
-- Three-condition file eligibility — execute bit, magic bytes, or triggered by known interpreter
-- Runtime process analysis — LD_PRELOAD injection, dangerous capability detection
-- Autorun/persistence scanner — all major Linux persistence categories (systemd, cron, shell profiles, PAM, LD_PRELOAD, XDG, D-Bus, at jobs, anacron, SysV init)
-- Unified detection schema — all sources write through FindingWriter to a single detections table with normalized extension tables
-- Evidence snapshots — /proc state captured immediately on HIGH/CRITICAL detections
-- Process tree — every execve written as adjacency list for server-side recursive CTE traversal
-- SQLite persistence — WAL mode, retention-based cleanup, append-only audit log
-- Intelligent deduplication — TTL-based scan cache, QuickHash (head+tail+mtime), alert dedup with count tracking
-- Automatic YARA rule updates from YARA Forge with 7-generation archive rotation
-- CLI — `vajra scan [dir]`, `vajra rules update/status`
+- **Real-time kernel monitoring** — tracks process launches, file writes, network connections, memory operations, and privilege changes as they happen
+- **Reverse shell detection** — catches attackers redirecting a shell over the network, including techniques that bypass traditional exec-time inspection
+- **YARA scanning** — scans files and running processes against a community ruleset via a self-tuning worker pool that backs off under system load
+- **Malware hash detection** — checks file hashes against a known-bad dataset before running YARA, short-circuiting the pipeline on confirmed malware
+- **Behavioral process analysis** — detects library injection and dangerous Linux capability abuse at runtime
+- **Persistence scanner** — monitors all major Linux persistence locations: systemd units, cron jobs, shell profiles, PAM modules, XDG autostart, D-Bus services, SysV init scripts, and more
+- **Secrets scanner** — finds credentials, API keys, and tokens left in files across the filesystem using the betterleaks engine, with a fingerprint-based ignore list for known false positives
+- **Evidence snapshots** — captures live process state immediately on high-severity detections, before the process can exit or clean up
+- **Process tree** — records every process launch as an ancestry chain for forensic investigation
+- **Intelligent deduplication** — suppresses repeated alerts for the same finding within a configurable window, keeping alert volume manageable
+- **Automatic rule updates** — pulls the latest YARA rules from YARA Forge on a schedule with archive rotation
+- **CLI** — on-demand scanning, rule management, hash database updates, and secrets ignore list management
 
 ## Architecture
 
+```
 eBPF Kernel Events
 │
 ▼
 Listener → Dispatcher (typed channel fan-out)
 │
-├── File chan → FileScanner → Analyzer Pipeline → FindingWriter → detections
-├── Process chan → ProcessScanner → Content + Runtime Pipelines → FindingWriter → detections
-├── Dup chan → DupWatcher → socket check → FindingWriter → detections
-├── Network/Memory/Security/Module → EventSink → raw telemetry tables
+├── File events → FileScanner → Analyzer Pipeline → FindingWriter → detections
+├── Process events → ProcessScanner → Content + Runtime Pipelines → FindingWriter → detections
+├── Network events → Reverse Shell Detector → FindingWriter → detections
+├── All other events → EventSink → raw telemetry tables
 │
-└── (pull-based, periodic)
+└── (periodic)
 AutorunScanner → FindingWriter → detections + autoruns
+SecretsScanner → FindingWriter → detections
+
+```
 
 ## Resources Required
 
@@ -78,10 +81,14 @@ Configuration: `/etc/vajra/config.yaml` — Logs: `/var/log/vajra/` — Database
 ## CLI
 
 ```bash
-vajra -c /etc/vajra/config.yaml    # start in monitor mode
-vajra scan [directory]             # blocking full filesystem scan
-vajra rules update                 # check and download updated YARA rules
-vajra rules status                 # show current rules version and archive count
+vajra -c /etc/vajra/config.yaml       # start in monitor mode
+vajra scan [directory]                 # run a full on-demand scan
+vajra rules update                     # download latest YARA rules
+vajra rules status                     # show current rules version
+vajra hashes update                    # rebuild malware hash database
+vajra hashes status                    # show hash database status
+vajra secrets ignore <detection_id>    # mark a secrets finding as noise
+vajra secrets export-ignore            # write ignore list for next scan
 ```
 
 ## Build
@@ -101,10 +108,8 @@ clang llvm libbpf-devel kernel-devel bpftool yara-devel
 ### First-time setup
 
 ```bash
-make generate-ebpf   # generate vmlinux.h and compile BPF program
+make generate-ebpf   # compile the kernel instrumentation — only needed once
 ```
-
-Only needed once, or when `ebpf_events.c` changes.
 
 ### Build
 
@@ -124,13 +129,24 @@ generic_settings:
 
 rules_settings:
   rules_filepath: /opt/vajra/rules.zip
-  rules_archive_dir: /var/lib/vajra/rules-archive
+  rules_archive_dir: /opt/vajra/rules-archive
   rules_remote_url: https://github.com/YARAHQ/yara-forge/releases/latest/download/yara-forge-rules-core.zip
   rules_sync_interval_hour: 24
   rules_archive_count: 7
 
+threat_intel_settings:
+  malware_bazaar_auth_key: ""
+  bloom_filter_path: /opt/vajra/hashes.bloom
+  hash_sync_interval_hour: 24
+
 scan_settings:
   target_directory: /
+  secrets:
+    target_directories:
+      - /home
+      - /root
+      - /etc
+      - /opt
   exclusion_rules:
     exclude_paths:
       - /proc

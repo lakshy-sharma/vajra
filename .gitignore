@@ -33,7 +33,7 @@ go.work.sum
 
 **.zip
 workspace/release
-workspace/database
+workspace/work_deb_skel
 workspace/logs
 **.db
 **.o

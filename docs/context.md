@@ -10,7 +10,7 @@ The original flat `jobs/` package mixed three fundamentally different execution 
 
 - **Watcher** — push-based, blocks on a channel, reacts to kernel events. FileScanner, ProcessScanner, DupWatcher, EventSink.
 - **Scanner** — pull-based, walks a data source on a timer or at startup. AutorunScanner, SecretsScanner, RunningProcessScanner, UserProfileScanner.
-- **Job** — utility goroutine with no detection role. DBCleanup, RuleSyncer, AggregationJob.
+- **Job** — utility goroutine with no detection role. DBCleanup, RuleSyncer, AggregationJob, HashSyncer.
 
 Separating them means `service.go` wires each category uniformly. Adding a new detection component is one constructor call and one `go x.Run(ctx, wg)`. Nothing in service.go needs to know what the component does internally.
 
@@ -85,6 +85,20 @@ EventSink records everything including noise. Network events include every DNS q
 
 Running them through FindingWriter would create millions of CLEAN detection rows that serve no purpose locally. The distinction is: FindingWriter is for anomalies. EventSink is for forensic completeness.
 
+### Why HashAnalyzer uses a Bloom filter, not SQLite
+
+The content pipeline runs on every file event. A SQLite lookup per file under vajra's single-connection model would create lock contention and disk I/O on the hot path. A Bloom filter with 5M capacity at 1% false positive rate is ~4MB in memory, loaded once at startup, and answers in microseconds with zero disk I/O.
+
+False positives mean YARA runs on a file it didn't need to — acceptable overhead. False negatives are impossible. This matches how production EDR agents handle hash-based detection. The Bloom filter is built offline from the MalwareBazaar CSV by HashSyncer and written to disk; the daemon loads it at startup.
+
+### Why SecretsScanner uses path segment exclusions, not regex
+
+betterleaks' `prefilter.Options.ExcludedPaths` does exact matching after `filepath.Clean` — useless for matching path segments inside longer paths. A custom `sources.PrefilterFunc` using `strings.Contains` per segment is simpler, faster, and correct. The segment list is assembled by `SecretsSettings.AllExcludeSegments()` combining built-in structural excludes, optional browser cache excludes, and operator-supplied entries. No regex required.
+
+### Why the secrets ignore list is file-based, not DB-only
+
+betterleaks' `scan.WithIgnoredFingerprints` must be passed at scanner construction time — there is no way to add fingerprints to a running scanner. The ignore file is loaded once at `NewSecretsScanner`. The operator workflow is: mark detections IGNORED in the DB via `vajra secrets ignore`, export fingerprints to `secrets.ignore` via `vajra secrets export-ignore`, restart the daemon. In the future UI this becomes a single button.
+
 ## eBPF Tracepoints
 
 | Tracepoint | Event | Notes |
@@ -120,7 +134,7 @@ Running them through FindingWriter would create millions of CLEAN detection rows
 detections
 ├── detection_artifacts FK → detections.id (file hash, YARA matches)
 ├── detection_network FK → detections.id (socket details)
-├── detection_secrets FK → detections.id (betterleaks, sha256(secret) only)
+├── detection_secrets FK → detections.id (betterleaks, sha256(secret) + fingerprint)
 ├── detection_extensions FK → detections.id (key/value escape hatch, indexed)
 └── evidence_snapshots FK → detections.id (live /proc state at detection time)
 
@@ -135,7 +149,13 @@ process_tree (never pruned)
 
 autoruns
 user_inventory (planned)
-known_bad_hashes (planned — HashAnalyzer + MalwareBazaar seed)
+
+### Threat intelligence
+
+hashes.bloom — Bloom filter on disk, loaded by HashAnalyzer at startup
+built by HashSyncer from MalwareBazaar full CSV
+replaced by server-side push in Phase 3
+secrets.ignore — betterleaks fingerprint ignore file, written by vajra secrets export-ignore
 
 ### Operational
 
@@ -160,12 +180,16 @@ sync_state (remote sync watermarks, Phase 3)
 
 7. **DupWatcher misses pre-exec socket inheritance** — inetd-style socket handoff produces no DupEvent. Acceptable tradeoff given the false positive it prevented.
 
+8. **Bloom filter not reloaded on update** — HashSyncer writes a new filter file but the daemon must restart to load it. Signal-based reload deferred to Phase 3.
+
+9. **Secrets ignore list requires restart** — betterleaks WithIgnoredFingerprints is set at construction time. Live reload deferred to Phase 4 UI.
+
 ## Next Session
 
 Priority order:
 
-1. **HashAnalyzer** — `internal/analyzer/hash.go`; `known_bad_hashes` table; slots before YARA in content pipeline; short-circuits on CRITICAL
-2. **MalwareBazaar seed** — `vajra hashes update` CLI; CSV download; bulk insert
-3. **LOLBin analyzer** — `internal/analyzer/lolbin.go`; cmdline patterns; parent lookup via process_tree
-4. **Running process scanner** — `internal/detect/procwalk.go`; /proc/PID/exe walk on startup
-5. **Secrets scanner** — `internal/detect/secrets.go`; betterleaks v2 SDK
+1. **LOLBin analyzer** — `internal/analyzer/lolbin.go`; cmdline patterns; parent lookup via process_tree
+2. **Running process scanner** — `internal/detect/procwalk.go`; /proc/PID/exe walk on startup
+3. **Container tagging** — parse /proc/PID/cgroup on execve; container_id + container_runtime on detections
+4. **EventStatistic aggregation job** — hourly ticker; needed before dashboard is useful
+5. **User profile scanner** — `internal/detect/userprofile.go`; passwd/shadow/sudoers/ssh keys

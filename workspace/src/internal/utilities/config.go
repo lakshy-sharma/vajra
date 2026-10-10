@@ -1,4 +1,8 @@
 // internal/utilities/config.go
+//
+// Copyright © 2026 Lakshy Sharma lakshy.d.sharma@gmail.com
+// AGPL-3.0 License
+
 package utilities
 
 import (
@@ -8,12 +12,40 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
+var defaultSecretDirs = []string{
+	"/home",
+	"/root",
+	"/etc",
+	"/tmp",
+	"/opt",
+	"/var",
+	"/srv",
+	"/run",
+}
+
+var defaultExcludeSegments = []string{
+	"/.git/objects/",
+	"/node_modules/",
+	"/go/pkg/mod/",
+	"/.cache/go-build/",
+}
+
+var defaultBrowserCacheSegments = []string{
+	"/cache2/entries/",
+	"/.cache/mozilla/",
+	"/.cache/chromium/",
+	"/snap/firefox/",
+	"/snap/chromium/",
+	"/.cache/tracker",
+}
+
 type Config struct {
 	GenericSettings     GenericSettings     `yaml:"generic_settings"`
 	APIServerSettings   APIServerSettings   `yaml:"api_settings"`
 	TimingSettings      TimingSettings      `yaml:"timing_settings"`
 	PerformanceSettings PerformanceSettings `yaml:"performance_settings"`
 	RulesSettings       RulesSettings       `yaml:"rules_settings"`
+	ThreatIntelSettings ThreatIntelSettings `yaml:"threat_intel_settings"`
 	ScanSettings        ScanSettings        `yaml:"scan_settings"`
 	Logging             LoggingSettings     `yaml:"logging"`
 }
@@ -46,33 +78,63 @@ type PerformanceSettings struct {
 	FileScanBufferSize int `yaml:"file_scan_buffer_size"`
 }
 
-// RulesSettings controls YARA rule storage and remote sync.
 type RulesSettings struct {
-	// RulesFilepath is the active rules archive loaded on startup.
-	RulesFilepath string `yaml:"rules_filepath"`
+	RulesFilepath         string `yaml:"rules_filepath"`
+	RulesArchiveDir       string `yaml:"rules_archive_dir"`
+	RulesRemoteURL        string `yaml:"rules_remote_url"`
+	RulesRemoteHashURL    string `yaml:"rules_remote_hash_url"`
+	RulesSyncIntervalHour int    `yaml:"rules_sync_interval_hour"`
+	RulesArchiveCount     int    `yaml:"rules_archive_count"`
+}
 
-	// RulesArchiveDir holds the previous N rule archives for audit.
-	RulesArchiveDir string `yaml:"rules_archive_dir"`
+// ThreatIntelSettings controls hash-based threat intelligence.
+// BloomFilterPath is loaded by HashAnalyzer at startup — if absent
+// the analyzer disables itself gracefully.
+type ThreatIntelSettings struct {
+	MalwareBazaarAuthKey string `yaml:"malware_bazaar_auth_key"`
+	BloomFilterPath      string `yaml:"bloom_filter_path"`
+	HashSyncIntervalHour int    `yaml:"hash_sync_interval_hour"`
+}
 
-	// RulesRemoteURL is the download URL for the latest rules zip.
-	RulesRemoteURL string `yaml:"rules_remote_url"`
+type SecretsSettings struct {
+	TargetDirectories   []string `yaml:"target_directories"`
+	ExcludeSegments     []string `yaml:"exclude_segments"`
+	ExcludeBrowserCache *bool    `yaml:"exclude_browser_cache"`
+}
 
-	// RulesRemoteHashURL is the URL of the SHA256 manifest file.
-	// Used to check whether a download is needed before fetching
-	// the full archive.
-	RulesRemoteHashURL string `yaml:"rules_remote_hash_url"`
+func (s SecretsSettings) IsDefaultConfig() bool {
+	if len(s.TargetDirectories) != len(defaultSecretDirs) {
+		return false
+	}
+	for i, d := range s.TargetDirectories {
+		if d != defaultSecretDirs[i] {
+			return false
+		}
+	}
+	return true
+}
 
-	// RulesSyncIntervalHour is how often the sync job runs.
-	RulesSyncIntervalHour int `yaml:"rules_sync_interval_hour"`
+func (s SecretsSettings) BrowserCacheExcluded() bool {
+	if s.ExcludeBrowserCache == nil {
+		return true
+	}
+	return *s.ExcludeBrowserCache
+}
 
-	// RulesArchiveCount is how many old archives to retain.
-	// Oldest archives are deleted when count is exceeded.
-	RulesArchiveCount int `yaml:"rules_archive_count"`
+func (s SecretsSettings) AllExcludeSegments(dbDirectory string) []string {
+	segments := []string{dbDirectory}
+	segments = append(segments, defaultExcludeSegments...)
+	if s.BrowserCacheExcluded() {
+		segments = append(segments, defaultBrowserCacheSegments...)
+	}
+	segments = append(segments, s.ExcludeSegments...)
+	return segments
 }
 
 type ScanSettings struct {
-	TargetDirectory string         `yaml:"target_directory"`
-	ExclusionRules  ExclusionRules `yaml:"exclusion_rules"`
+	TargetDirectory string          `yaml:"target_directory"`
+	Secrets         SecretsSettings `yaml:"secrets"`
+	ExclusionRules  ExclusionRules  `yaml:"exclusion_rules"`
 }
 
 type ExclusionRules struct {
@@ -153,5 +215,15 @@ func applyDefaults(c *Config) {
 	}
 	if c.RulesSettings.RulesArchiveCount == 0 {
 		c.RulesSettings.RulesArchiveCount = 7
+	}
+	if c.ThreatIntelSettings.BloomFilterPath == "" {
+		c.ThreatIntelSettings.BloomFilterPath = "/opt/vajra/hashes.bloom"
+	}
+	if c.ThreatIntelSettings.HashSyncIntervalHour == 0 {
+		c.ThreatIntelSettings.HashSyncIntervalHour = 24
+	}
+	if len(c.ScanSettings.Secrets.TargetDirectories) == 0 {
+		c.ScanSettings.Secrets.TargetDirectories = make([]string, len(defaultSecretDirs))
+		copy(c.ScanSettings.Secrets.TargetDirectories, defaultSecretDirs)
 	}
 }

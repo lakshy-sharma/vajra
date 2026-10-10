@@ -20,6 +20,7 @@ import (
 	"vajra/internal/analyzer"
 	"vajra/internal/db"
 	"vajra/internal/db/queries"
+	"vajra/internal/detect"
 	"vajra/internal/detect/autorun"
 	"vajra/internal/ebpf"
 	"vajra/internal/findings"
@@ -94,6 +95,12 @@ func wireAll(
 	resultCache := analyzer.NewResultCache()
 	dedupWindow := time.Duration(cfg.TimingSettings.DedupWindowMin) * time.Minute
 
+	// Shared tracker — injected into both ProcessScanner and RunProcWalk so
+	// a binary scanned at startup is not re-evaluated when it later execves.
+	processTracker := utilities.NewRecentScanTracker(
+		time.Duration(cfg.TimingSettings.DedupWindowMin) * time.Minute,
+	)
+
 	// ── FindingWriter — single DB insertion point ─────────────
 	fw := findings.NewFindingWriter(
 		logger,
@@ -108,10 +115,17 @@ func wireAll(
 	)
 
 	// ── Analyzer pipelines ────────────────────────────────────
+
+	hashAnalyzer, err := analyzer.NewHashAnalyzer(cfg.ThreatIntelSettings.BloomFilterPath, logger)
+	if err != nil {
+		logger.Fatal().Err(err).Msg("failed to load hash analyzer")
+	}
+
 	contentPipeline := analyzer.NewPipeline(
-		[]analyzer.Analyzer{analyzer.NewYARAAnalyzer(pool, logger)},
+		[]analyzer.Analyzer{hashAnalyzer, analyzer.NewYARAAnalyzer(pool, logger)},
 		analyzer.WithCache(resultCache),
 	)
+
 	runtimePipeline := analyzer.NewPipeline(
 		[]analyzer.Analyzer{
 			analyzer.NewLDPreloadAnalyzer(logger),
@@ -160,8 +174,6 @@ func wireAll(
 	}()
 
 	// ── Watchers ──────────────────────────────────────────────
-	// EventSink consumes multiple channels simultaneously —
-	// Run() spawns its own goroutines internally.
 	watcher.NewEventSink(
 		logger,
 		queries.NewNetworkQueries(database),
@@ -182,8 +194,31 @@ func wireAll(
 	go watcher.NewProcessScanner(
 		logger, contentPipeline, runtimePipeline, fw,
 		queries.NewProcessTreeQueries(database),
-		processFilter, sysInfo,
+		processFilter,
+		processTracker, // shared with RunProcWalk below
+		sysInfo,
 	).Run(ctx, wg, channels.Process)
+
+	// ── Startup process walk ──────────────────────────────────
+	// Runs once immediately to catch processes that pre-date agent startup.
+	// Shares processTracker with ProcessScanner — binaries scanned here are
+	// not re-scanned when they next execve.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, err := detect.RunProcWalk(
+			ctx,
+			contentPipeline,
+			fw,
+			processFilter,
+			processTracker,
+			sysInfo,
+			logger,
+		)
+		if err != nil && ctx.Err() == nil {
+			logger.Error().Err(err).Msg("procwalk: startup walk failed")
+		}
+	}()
 
 	// ── Scanners ──────────────────────────────────────────────
 	wg.Add(1)
@@ -195,8 +230,14 @@ func wireAll(
 		cfg.TimingSettings.AutorunScanTimeMin,
 	).Run(ctx, wg)
 
-	// ── Jobs ──────────────────────────────────────────────────
+	secretsScanner, err := detect.NewSecretsScanner(logger, fw, sysInfo, cfg)
+	if err != nil {
+		logger.Fatal().Err(err).Msg("failed to create secrets scanner")
+	}
 	wg.Add(1)
+	go secretsScanner.Run(ctx, wg)
+
+	// ── Jobs ──────────────────────────────────────────────────
 	go job.NewCleanup(
 		logger,
 		queries.NewCleanupQueries(database),
@@ -206,4 +247,7 @@ func wireAll(
 
 	wg.Add(1)
 	go job.NewRuleSyncer(logger, cfg.RulesSettings).Run(ctx, wg)
+
+	wg.Add(1)
+	go job.NewHashSyncer(logger, cfg.ThreatIntelSettings).Run(ctx, wg)
 }

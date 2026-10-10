@@ -115,11 +115,14 @@ type DetectionNetwork struct {
 
 // DetectionSecret holds betterleaks finding detail.
 // SecretHash is sha256(secret) — the raw value is never stored.
+// Fingerprint is the betterleaks-computed match fingerprint used
+// to suppress known false positives via WithIgnoredFingerprints.
 type DetectionSecret struct {
 	ID           int64
 	DetectionID  int64
 	RuleID       string
 	SecretHash   string
+	Fingerprint  string
 	StartLine    int
 	EndLine      int
 	MatchContext string // surrounding line with secret redacted
