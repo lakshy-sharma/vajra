@@ -26,9 +26,10 @@ import (
 
 var scanCmd = &cobra.Command{
 	Use:   "scan [directory]",
-	Short: "Run a full YARA scan on the filesystem",
+	Short: "Run a full YARA scan on the filesystem and running processes",
 	Long: `Walks the target directory, submits every eligible file through the
-YARA pipeline, and writes detections to the database.
+YARA pipeline, then scans all running processes. Detections are written
+to the database.
 
 If [directory] is omitted the target_directory from config is used.`,
 	Args: cobra.MaximumNArgs(1),
@@ -94,6 +95,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 	)
 
 	filter := utilities.NewExclusionFilter(&cfg)
+	processFilter := utilities.NewProcessFilter(&cfg)
 	dedupWindow := time.Duration(cfg.TimingSettings.DedupWindowMin) * time.Minute
 
 	fw := findings.NewFindingWriter(
@@ -122,7 +124,16 @@ func runScan(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Starting scan: %s\n\n", targetDir)
 	start := time.Now()
 
-	summary, err := detect.RunFullScan(ctx, targetDir, pipeline, filter, fw, sysInfo, logger)
+	summary, err := detect.RunFullScan(
+		ctx,
+		targetDir,
+		pipeline,
+		filter,
+		processFilter,
+		fw,
+		sysInfo,
+		logger,
+	)
 	if err != nil {
 		return fmt.Errorf("scan: %w", err)
 	}
@@ -133,12 +144,15 @@ func runScan(cmd *cobra.Command, args []string) error {
 		status = "Scan interrupted"
 	}
 
-	fmt.Printf("%s in %s: %s executable files scanned of ~%s candidates, %s hits found\n",
-		status,
-		elapsed,
+	fmt.Printf("\n%s in %s\n", status, elapsed)
+	fmt.Printf("  Files:     %s scanned of ~%s candidates, %s hits\n",
 		formatCount(summary.FilesScanned),
 		formatCount(summary.Candidates),
 		formatCount(summary.HitsFound),
+	)
+	fmt.Printf("  Processes: %s scanned, %s hits\n",
+		formatCount(summary.ProcessesScanned),
+		formatCount(summary.ProcessHits),
 	)
 
 	fw.LogMetrics(logger)

@@ -170,6 +170,7 @@ func (fw *FindingWriter) writeSecret(detectionID int64, f Finding) {
 		DetectionID:  detectionID,
 		RuleID:       f.SecretRuleID,
 		SecretHash:   f.SecretHash,
+		Fingerprint:  f.SecretFingerprint,
 		StartLine:    f.SecretStartLine,
 		EndLine:      f.SecretEndLine,
 		MatchContext: f.SecretContext,

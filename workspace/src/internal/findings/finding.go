@@ -59,12 +59,12 @@ type Finding struct {
 	SocketInode uint64
 
 	// Secret detail — populated by SecretsScanner.
-	SecretRuleID    string
-	SecretHash      string // sha256(secret) — never the value itself
-	SecretStartLine int
-	SecretEndLine   int
-	SecretContext   string // surrounding line with secret redacted
-
+	SecretRuleID      string
+	SecretHash        string // sha256(secret) — never the value itself
+	SecretFingerprint string // betterleaks match fingerprint for ignore list
+	SecretStartLine   int
+	SecretEndLine     int
+	SecretContext     string // surrounding line with secret redacted
 	// Extension — arbitrary key/value for future fields.
 	// Avoids schema migrations for source-specific detail that
 	// doesn't warrant a dedicated column.

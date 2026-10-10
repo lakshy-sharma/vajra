@@ -48,6 +48,17 @@ func PIDFromCtx(ctx context.Context) (uint32, bool) {
 	return pid, ok
 }
 
+const sha256Key ctxKey = 1
+
+func CtxWithSHA256(ctx context.Context, sha256 string) context.Context {
+	return context.WithValue(ctx, sha256Key, sha256)
+}
+
+func SHA256FromCtx(ctx context.Context) (string, bool) {
+	sha256, ok := ctx.Value(sha256Key).(string)
+	return sha256, ok
+}
+
 // ── Result cache ──────────────────────────────────────────────
 
 // ResultCache stores content-analysis results keyed on SHA256.

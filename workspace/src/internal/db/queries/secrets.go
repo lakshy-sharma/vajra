@@ -26,8 +26,8 @@ func NewSecretQueries(d *db.DB) *SecretQueries {
 func (q *SecretQueries) Insert(s *models.DetectionSecret) error {
 	sqlStr, args, err := sq.
 		Insert("detection_secrets").
-		Columns("detection_id", "rule_id", "secret_hash", "start_line", "end_line", "match_context").
-		Values(s.DetectionID, s.RuleID, s.SecretHash, s.StartLine, s.EndLine, s.MatchContext).
+		Columns("detection_id", "rule_id", "secret_hash", "fingerprint", "start_line", "end_line", "match_context").
+		Values(s.DetectionID, s.RuleID, s.SecretHash, s.Fingerprint, s.StartLine, s.EndLine, s.MatchContext).
 		ToSql()
 	if err != nil {
 		return fmt.Errorf("secrets.Insert: build: %w", err)
@@ -40,7 +40,7 @@ func (q *SecretQueries) Insert(s *models.DetectionSecret) error {
 // the credential spread query across machines and time.
 func (q *SecretQueries) ListBySecretHash(hash string) ([]models.DetectionSecret, error) {
 	sqlStr, args, err := sq.
-		Select("id", "detection_id", "rule_id", "secret_hash", "start_line", "end_line", "match_context").
+		Select("id", "detection_id", "rule_id", "secret_hash", "fingerprint", "start_line", "end_line", "match_context").
 		From("detection_secrets").
 		Where(sq.Eq{"secret_hash": hash}).
 		ToSql()
@@ -48,6 +48,46 @@ func (q *SecretQueries) ListBySecretHash(hash string) ([]models.DetectionSecret,
 		return nil, fmt.Errorf("secrets.ListBySecretHash: build: %w", err)
 	}
 	return q.scanRows(sqlStr, args...)
+}
+
+// ListIgnoredFingerprints returns all betterleaks fingerprints for
+// detections that have been marked IGNORED. Used by
+// `vajra secrets export-ignore` to write the ignore file that
+// NewSecretsScanner loads on the next scan.
+//
+// Only non-empty fingerprints are returned — findings written before
+// the fingerprint column was added will have an empty string and
+// cannot be suppressed via WithIgnoredFingerprints.
+func (q *SecretQueries) ListIgnoredFingerprints() ([]string, error) {
+	sqlStr, args, err := sq.
+		Select("ds.fingerprint").
+		From("detection_secrets ds").
+		Join("detections d ON d.id = ds.detection_id").
+		Where(sq.And{
+			sq.Eq{"d.status": string(models.StatusIgnored)},
+			sq.NotEq{"ds.fingerprint": ""},
+		}).
+		Distinct().
+		ToSql()
+	if err != nil {
+		return nil, fmt.Errorf("secrets.ListIgnoredFingerprints: build: %w", err)
+	}
+
+	rows, err := q.db.SQL().Query(sqlStr, args...)
+	if err != nil {
+		return nil, fmt.Errorf("secrets.ListIgnoredFingerprints: query: %w", err)
+	}
+	defer rows.Close()
+
+	var fingerprints []string
+	for rows.Next() {
+		var fp string
+		if err := rows.Scan(&fp); err != nil {
+			return nil, fmt.Errorf("secrets.ListIgnoredFingerprints: scan: %w", err)
+		}
+		fingerprints = append(fingerprints, fp)
+	}
+	return fingerprints, rows.Err()
 }
 
 func (q *SecretQueries) scanRows(sqlStr string, args ...interface{}) ([]models.DetectionSecret, error) {
@@ -62,7 +102,7 @@ func (q *SecretQueries) scanRows(sqlStr string, args ...interface{}) ([]models.D
 		var s models.DetectionSecret
 		if err := rows.Scan(
 			&s.ID, &s.DetectionID, &s.RuleID, &s.SecretHash,
-			&s.StartLine, &s.EndLine, &s.MatchContext,
+			&s.Fingerprint, &s.StartLine, &s.EndLine, &s.MatchContext,
 		); err != nil {
 			return nil, fmt.Errorf("secrets.scanRows: scan: %w", err)
 		}

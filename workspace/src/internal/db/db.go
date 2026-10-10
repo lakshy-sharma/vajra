@@ -151,6 +151,7 @@ func (d *DB) migrate() error {
 			detection_id  INTEGER NOT NULL REFERENCES detections(id),
 			rule_id       TEXT    NOT NULL,
 			secret_hash   TEXT    NOT NULL,
+			fingerprint   TEXT    NOT NULL DEFAULT '',
 			start_line    INTEGER NOT NULL,
 			end_line      INTEGER NOT NULL,
 			match_context TEXT
@@ -158,7 +159,7 @@ func (d *DB) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_ds_detection_id ON detection_secrets(detection_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_ds_secret_hash  ON detection_secrets(secret_hash)`,
 		`CREATE INDEX IF NOT EXISTS idx_ds_rule_id      ON detection_secrets(rule_id)`,
-
+		`CREATE INDEX IF NOT EXISTS idx_ds_fingerprint  ON detection_secrets(fingerprint)`,
 		// ── detection_extensions ──────────────────────────────
 		// Key/value escape hatch for source-specific fields that don't
 		// warrant a dedicated column. Each key is a separate row so
